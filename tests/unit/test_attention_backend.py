@@ -95,8 +95,8 @@ class _FakeWrapper:
         assert self.plans, "run() before plan() (contract violation)"
         self.runs.append((query, paged_kv))
         heads_dim = query.shape[-2:] if query.dim() >= 2 else (1, 1)
-        if query.dim() == 2:  # decode [H, D]
-            return torch.zeros(*heads_dim)
+        if query.dim() == 2:
+            raise AssertionError("FlashInfer decode.run expects [B, H, D]")
         return torch.zeros(query.shape[0], *heads_dim)
 
 
@@ -140,6 +140,8 @@ class TestFlashInferAdapterContract:
         backend.attend(query, pool, 0, [0, 1], seq_len=6, chunk_start=5)
         assert backend._decode.plans and not backend._prefill.plans
         assert backend._decode.use_tensor_cores is True
+        run_query, _ = backend._decode.runs[-1]
+        assert run_query.shape == (1, 4, 8)
 
     def test_plan_cached_across_layers(self, fake_flashinfer):
         backend = self._backend()
@@ -163,6 +165,22 @@ class TestFlashInferAdapterContract:
         _, paged_kv = backend._prefill.runs[-1]
         assert paged_kv[0].shape == (16, PAGE, 2, 8)  # pool.k[layer] NHD slice
         assert torch.equal(paged_kv[0], pool.k[1])
+
+    def test_attend_batched_matches_per_sequence_contract(self, fake_flashinfer):
+        backend = self._backend()
+        pool = _pool()
+        queries = [torch.randn(1, 4, 8), torch.randn(1, 4, 8)]
+        out = backend.attend_batched(
+            queries,
+            pool,
+            0,
+            page_tables=[[0, 1], [2, 3]],
+            seq_lens=[5, 7],
+            chunk_starts=[4, 6],
+        )
+        assert len(out) == 2
+        assert [tuple(t.shape) for t in out] == [(1, 32), (1, 32)]
+        assert len(backend._decode.runs) == 2
 
 
 class TestSelector:

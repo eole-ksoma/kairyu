@@ -1,5 +1,4 @@
-"""FlashInfer paged-attention adapter (m13 D4) — written locally, GPU-verified
-on deploy day (`pytest -m gpu`).
+"""FlashInfer paged-attention adapter (m13 D4).
 
 API pins (reviewed against docs.flashinfer.ai 0.6.x — the fake-module contract
 tests enforce every one of them):
@@ -126,7 +125,29 @@ class FlashInferBackend:
         paged_kv = (kv_pool.k[layer], kv_pool.v[layer])  # NHD tuple form
         wrapper = self._decode if is_decode else self._prefill
         if is_decode:
-            out = wrapper.run(query[0], paged_kv)  # decode: [H, D] query
+            out = wrapper.run(query, paged_kv)  # decode: [B=1, H, D] query
             return out.reshape(1, -1)
         out = wrapper.run(query, paged_kv)  # [T, H, D]
         return out.reshape(query.shape[0], -1)
+
+    def attend_batched(
+        self,
+        queries: list[torch.Tensor],
+        kv_pool: PagedKVPool,
+        layer: int,
+        page_tables: list[list[int]],
+        seq_lens: list[int],
+        chunk_starts: list[int],
+    ) -> list[torch.Tensor]:
+        """Per-sequence contexts, identical to per-sequence ``attend``.
+
+        This correctness-first loop satisfies the backend contract used by
+        batched decode. A later optimization can collapse it into one FlashInfer
+        batched plan/run over multi-row indptr arrays.
+        """
+        return [
+            self.attend(
+                queries[i], kv_pool, layer, page_tables[i], seq_lens[i], chunk_starts[i]
+            )
+            for i in range(len(queries))
+        ]

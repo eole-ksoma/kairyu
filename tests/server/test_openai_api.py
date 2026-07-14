@@ -3,6 +3,7 @@ import json
 import httpx
 import pytest
 
+from kairyu.engine.backend import GenerationRequest
 from kairyu.engine.mock import MockBackend
 from kairyu.entrypoints.server.app import create_app
 from kairyu.orchestration.orchestrator import Orchestrator
@@ -32,6 +33,14 @@ def _chat_body(content: str, **extra) -> dict:
     }
 
 
+class _FailingBackend:
+    async def generate(self, request: GenerationRequest):
+        raise RuntimeError("secret backend detail")
+
+    async def shutdown(self) -> None:
+        pass
+
+
 async def test_models_endpoint_lists_engines_and_auto(app):
     async with _client(app) as client:
         response = await client.get("/v1/models")
@@ -52,6 +61,22 @@ async def test_chat_completion_happy_path(app):
     assert data["choices"][0]["message"]["content"]
     assert data["choices"][0]["finish_reason"] == "stop"
     assert data["usage"]["total_tokens"] >= 0
+
+
+async def test_backend_error_logs_traceback_without_leaking_message(caplog):
+    app = create_app(engines={"boom": _FailingBackend()})
+    body = _chat_body("hello", model="boom")
+    async with _client(app) as client:
+        response = await client.post("/v1/chat/completions", json=body)
+
+    assert response.status_code == 502
+    message = response.json()["error"]["message"]
+    assert message == "upstream backend error (RuntimeError)"
+    assert "secret backend detail" not in message
+    assert any(
+        record.exc_info and record.getMessage() == "upstream backend error"
+        for record in caplog.records
+    )
 
 
 async def test_streaming_reassembles_to_full_answer(app):

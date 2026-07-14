@@ -1,7 +1,58 @@
 # GPU image (m19 D1): CUDA runtime + uv sync with the gpu extra.
 # Same one-image-per-role model as the CPU Dockerfile; the mounted
 # DeploymentSpec decides gateway vs replica.
-FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04 AS base
+#
+# Step B2 (production AOT): FlashInfer's SM120 (Blackwell) attention kernels are
+# compiled AHEAD-OF-TIME in a CUDA 13.0 -devel build stage (nvcc cross-compiles
+# for sm_120 without needing a GPU at build time), then the resulting
+# flashinfer-jit-cache wheel is dropped into the slim -runtime venv. The runtime
+# image carries NO nvcc and does NO first-request JIT (B1 measured ~20s of
+# first-request JIT on a -devel/runtime-JIT image; AOT removes it). CUDA is
+# pinned to 13.0 everywhere to match torch's cu13 runtime — see
+# docs/design/flashinfer-sm120-aot.md.
+
+# ---- Stage 1: AOT-compile FlashInfer SM120 kernels ----------------------------
+# No GPU is needed here: nvcc cross-compiles for the target arch. flashinfer
+# 0.6.14 itself is pure-python (py3-none-any), so `pip install .` is fast; only
+# the flashinfer-jit-cache build below runs nvcc (the slow step). Scope to
+# 12.0f (SM120) only — a full-arch build can trip unrelated FP4-kernel failures.
+FROM nvidia/cuda:13.0.1-devel-ubuntu24.04 AS flashinfer-build
+ARG FLASHINFER_REF=v0.6.14                 # keep in sync with uv.lock flashinfer-python
+ARG FLASHINFER_CUDA_ARCH_LIST=12.0f        # SM120-only (Blackwell / RTX PRO 6000)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.12 python3.12-dev python3.12-venv python3-pip git build-essential ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+# python3.12-dev provides Python.h: flashinfer's csrc (logging.cc etc.) is
+# compiled against the CPython C API during the AOT jit-cache build.
+RUN python3.12 -m venv /opt/fi-build
+ENV PATH="/opt/fi-build/bin:$PATH"
+# torch must match the runtime venv (2.12.1, cu13) so AOT kernels link the same
+# CUDA. The rest are flashinfer-jit-cache's build-system.requires: its build
+# backend is a LOCAL module (build_backend.py, backend-path=["."]) that imports
+# these at build time, and `python -m build --no-isolation` does NOT install
+# requires itself — so they must be present or the backend import fails.
+RUN pip install --no-cache-dir "torch==2.12.1" build \
+    "setuptools>=77" "packaging>=24" wheel tqdm ninja requests numpy nvidia-ml-py \
+    "apache-tvm-ffi>=0.1,<0.2"
+WORKDIR /src
+RUN git clone --recursive --depth 1 --branch ${FLASHINFER_REF} \
+    https://github.com/flashinfer-ai/flashinfer.git
+WORKDIR /src/flashinfer
+RUN pip install --no-cache-dir -v .        # pure-python package (fast); build_backend imports flashinfer
+# Scope the AOT op set to what kairyu actually uses: bf16/f16, head_dim 64, FA2
+# class, no sliding-window / logits-soft-cap. The default config compiles ~656
+# ops (all dtypes incl. FP8 e4m3/e5m2, head_dim 128/256, FA3) — kairyu only ever
+# JITs ONE kernel (batch_prefill bf16 head_dim_qk_64, which also serves
+# tensor-core decode). Scoping cuts the build from thousands of nvcc steps to a
+# handful AND avoids the SM120 FP4/FP8 kernel risks (plan §9/§12.3).
+RUN sed -i 's|config=None,  # Use default config|config={"fa2_head_dim": [(64, 64)], "fa3_head_dim": [], "f16_dtype": [__import__("torch").float16, __import__("torch").bfloat16], "f8_dtype": [], "use_sliding_window": [False], "use_logits_soft_cap": [False]},|' \
+    flashinfer-jit-cache/build_backend.py \
+ && grep -n 'fa2_head_dim' flashinfer-jit-cache/build_backend.py
+ENV FLASHINFER_CUDA_ARCH_LIST=${FLASHINFER_CUDA_ARCH_LIST}
+RUN cd flashinfer-jit-cache && python -m build --no-isolation --wheel && ls -la dist/
+
+# ---- Stage 2: slim runtime (no nvcc) -----------------------------------------
+FROM nvidia/cuda:13.0.1-runtime-ubuntu24.04 AS base
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.12 python3.12-venv curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -14,6 +65,11 @@ COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --frozen --no-install-project --no-dev --extra gpu --extra engine --extra fleet
 COPY kairyu ./kairyu
 RUN uv sync --frozen --no-dev --extra gpu --extra engine --extra fleet
+# Install the AOT FlashInfer kernel cache into the venv. NOT via `uv sync --frozen`
+# (it rejects lockfile drift); --no-deps keeps the frozen env intact (flashinfer-python
+# is already present from the sync above).
+COPY --from=flashinfer-build /src/flashinfer/flashinfer-jit-cache/dist/*.whl /tmp/fi/
+RUN uv pip install --python /app/.venv/bin/python --no-deps /tmp/fi/*.whl && rm -rf /tmp/fi
 ENV PATH="/app/.venv/bin:$PATH"
 EXPOSE 8000
 ENTRYPOINT ["kairyu", "serve"]

@@ -90,6 +90,8 @@ def build_engine_loop(
     default_stop_ids: tuple[int, ...] = ()
     num_kv_heads_for_tp = None
     if model_path is not None:
+        import torch
+
         from kairyu.engine.core.attention import select_backend
         from kairyu.engine.core.hw_profile import probe
         from kairyu.engine.core.kv_pool import PagedKVPool
@@ -97,10 +99,18 @@ def build_engine_loop(
         from kairyu.engine.core.sampler import Sampler
         from kairyu.models.loader import load_model
 
-        # deploy day is config-free: the probed profile picks the kernel
+        # deploy day is config-free: the probed profile picks the kernel AND the
+        # compute placement. GPU runs bf16 on-device (what the FlashInfer / FA2
+        # kernels require — fp32 has no such kernels); CPU keeps fp32 on host, so
+        # every CPU test path is byte-for-byte unchanged.
+        profile = probe()
+        gpu = profile.arch == "cuda"
+        compute_device = "cuda" if gpu else "cpu"
+        compute_dtype = torch.bfloat16 if gpu else torch.float32
         model, model_config, generation = load_model(
-            model_path, attention_backend=select_backend(probe())
+            model_path, dtype=compute_dtype, attention_backend=select_backend(profile)
         )
+        model = model.to(compute_device)
         default_eos = generation.eos_token_id
         default_stop_ids = generation.stop_token_ids
         num_kv_heads_for_tp = model_config.num_key_value_heads
@@ -126,7 +136,9 @@ def build_engine_loop(
         speculative_tokens=speculative_tokens if speculative else 0,
     )
     if model_path is not None:
-        pool = PagedKVPool.for_cache(cache, model_config)
+        pool = PagedKVPool.for_cache(
+            cache, model_config, dtype=compute_dtype, device=compute_device
+        )
         runner = PagedModelRunner(
             model, pool, sampler=Sampler(vocab_provider=resolved.vocab), cache=cache
         )

@@ -44,6 +44,9 @@ class PagedModelRunner:
         self._model = model
         self._pool = pool
         self._sampler = sampler
+        # Input tensors (token ids, positions) must be built on the model's device
+        # so the GPU forward never mixes CPU inputs with on-device weights/KV.
+        self._device = next(model.parameters()).device
 
     def release(self, request_id: str) -> None:
         """Drop per-request sampler state (seeds + grammar enforcer) on finish (E2)."""
@@ -88,8 +91,8 @@ class PagedModelRunner:
         end = state.computed_prompt
         start = end - chunk.num_tokens
         hidden = self._model.forward_tokens(
-            torch.tensor(prompt[start:end], dtype=torch.long),
-            torch.arange(start, end),
+            torch.tensor(prompt[start:end], dtype=torch.long, device=self._device),
+            torch.arange(start, end, device=self._device),
             self._pool, page_table, seq_len=end, write_from=cached,
         )
         if state.prefill_done and end == len(prompt):
@@ -108,8 +111,8 @@ class PagedModelRunner:
     def _execute_decode(self, chunk: ScheduledChunk, state, sampled: dict) -> None:
         input_token, absolute, page_table, cached = self._decode_inputs(chunk, state)
         hidden = self._model.forward_tokens(
-            torch.tensor([input_token], dtype=torch.long),
-            torch.tensor([absolute]),
+            torch.tensor([input_token], dtype=torch.long, device=self._device),
+            torch.tensor([absolute], device=self._device),
             self._pool, page_table, seq_len=absolute + 1, write_from=cached,
         )
         logits = self._model.logits(hidden[-1])
@@ -129,8 +132,8 @@ class PagedModelRunner:
             seq_lens.append(absolute + 1)
             write_from.append(cached)
         hidden = self._model.forward_decode_batch(
-            torch.tensor(tokens, dtype=torch.long),
-            torch.tensor(positions),
+            torch.tensor(tokens, dtype=torch.long, device=self._device),
+            torch.tensor(positions, device=self._device),
             self._pool, page_tables, seq_lens, write_from,
         )
         logits = self._model.logits(hidden)  # [B, vocab]

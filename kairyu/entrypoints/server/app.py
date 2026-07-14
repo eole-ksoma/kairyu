@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import time
 import uuid
@@ -63,6 +64,7 @@ from kairyu.sampling_params import SamplingParams
 
 AUTO_MODEL = "kairyu-auto"
 _TOOL_CALL_PATTERN = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+logger = logging.getLogger(__name__)
 
 
 def sampling_params_from(request: ChatCompletionRequest) -> SamplingParams:
@@ -170,6 +172,7 @@ def _upstream_error(error: Exception) -> JSONResponse:
     # only the exception CLASS name leaves the gateway (M3): str(error) can carry
     # connection strings, internal hostnames/ports, and file paths from arbitrary
     # backend failures — those must not reach the client
+    logger.exception("upstream backend error")
     return JSONResponse(
         status_code=502,
         content={
@@ -341,6 +344,7 @@ async def _stream_engine(
                     logprobs=chunk_logprobs,
                 )
     except Exception as error:  # surface backend failures inside the SSE stream
+        logger.exception("upstream backend error")
         payload = {  # M3: only the class name, no raw backend message
             "error": {
                 "message": f"upstream backend error ({type(error).__name__})",
@@ -396,6 +400,7 @@ async def _stream_orchestrator(
             else:
                 final_result = event.result
     except Exception as error:  # surface as an SSE error event, then close
+        logger.exception("orchestrator stream error")
         yield f"data: {{\"error\": {{\"message\": \"{type(error).__name__}\"}}}}\n\n"
         yield "data: [DONE]\n\n"
         return
@@ -515,6 +520,7 @@ async def _stream_completions(
                     [CompletionChoice(index=completion.index, text=delta, finish_reason=finish)]
                 )
     except Exception as error:
+        logger.exception("upstream backend error")
         payload = {  # M3: only the class name, no raw backend message
             "error": {
                 "message": f"upstream backend error ({type(error).__name__})",

@@ -62,6 +62,33 @@ E1's measured P2P matrix. Human sign-off pending on M2–M4 design reviews.
 
 ## Change Log
 
+### 2026-07-14 — [progress] FlashInfer SM120 (Blackwell) enabled end-to-end: GPU device placement + AOT packaging
+- What: The single-process GPU serve path had NO device placement — `build_engine_loop` loaded the
+  model and `PagedKVPool` in fp32 on CPU, so the "GPU" deployment actually ran inference on CPU via the
+  device-agnostic torch backend. FlashInfer (the SM120 default) surfaced this as `KeyError: torch.float32`
+  (its prefill `plan()` has no fp32 kernel). Fixes:
+  - probe-driven device/dtype in `build_engine_loop`: cuda → bf16 on device, cpu → fp32 on host (guarded,
+    so every CPU path is byte-identical). `load_model(dtype=…)` + `model.to(device)` +
+    `PagedKVPool.for_cache(dtype, device)`.
+  - device-correct input/index tensors in `PagedModelRunner` and `PagedKVPool._flat_indices`/`gather`.
+  - `Sampler` samples on CPU (seeded RNG + penalties/enforcer) so the m8-D2 determinism pins hold while
+    logits arrive on cuda.
+  - `FlashInferBackend.attend_batched` implemented; decode passes a 3D `[1,H,D]` query (0.6.14 contract).
+  - observability: backend-exception handlers log `logger.exception` (client still gets only the class name).
+  - `Dockerfile.cuda` → multi-stage AOT: CUDA 13.0 `-devel` build stage compiles `flashinfer-jit-cache`
+    scoped to `FLASHINFER_CUDA_ARCH_LIST=12.0f` + bf16/head_dim-64/FA2 (avoids FP4/FP8 SM120 kernel risk and
+    the full 3402-step build); slim `13.0.1-runtime` (no nvcc) installs the wheel `--no-deps`.
+- Why: run the FlashInfer paged-attention kernels on RTX PRO 6000 Blackwell (SM120). The torch backend was
+  a correct-but-slow interim and — as discovered — CPU-bound. AOT removes the ~20s first-request JIT so a
+  cold replica is not ejected by the gateway readiness probe.
+- Verified (stg-gpu-01, RTX PRO 6000 / CUDA 13.0): `pytest -m gpu` 7/7 (flashinfer == torch reference,
+  fp16/bf16 across prefill/chunk/decode/batched-decode); direct-replica + gateway `/v1/chat/completions`
+  200 with correct output; cold-start first request 0.996s (was 19.6s under runtime JIT); no `/readyz`
+  eject. torch backend now also runs on GPU/bf16.
+- Refs: docs/design/flashinfer-sm120-aot.md; kairyu/engine/kairyu_backend.py,
+  engine/core/{model_runner,kv_pool,sampler}.py, engine/core/attention/flashinfer_gpu.py,
+  entrypoints/server/app.py, Dockerfile.cuda.
+
 ### 2026-07-09 — [progress] Single-node GPU compose: dedicated gateway config + attention-backend env
 - What: `docker-compose.gpu.yaml` now mounts a new `deploy/compose/gateway-gpu.yaml`
   (single `replica` upstream, forwards `model: default`) instead of the shared

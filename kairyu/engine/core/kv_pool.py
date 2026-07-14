@@ -75,7 +75,11 @@ class PagedKVPool:
         return self.num_layers * self.num_kv_heads * per_head * element
 
     def _flat_indices(self, page_table: list[int], positions: torch.Tensor) -> torch.Tensor:
-        pages = torch.tensor(page_table, dtype=torch.long)[positions // self.page_size]
+        # index tensors must live on the pool's device: on GPU `positions` arrives
+        # on-device, so a CPU page-table tensor would raise on the gather. CPU pools
+        # keep the original behaviour (self.k.device == cpu).
+        table = torch.tensor(page_table, dtype=torch.long, device=self.k.device)
+        pages = table[positions // self.page_size]
         return pages * self.page_size + positions % self.page_size
 
     def write(
@@ -97,7 +101,7 @@ class PagedKVPool:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Returns (K, V) of shape [seq_len, num_kv_heads, head_dim]."""
         num_pages = -(-seq_len // self.page_size)
-        index = torch.tensor(page_table[:num_pages], dtype=torch.long)
+        index = torch.tensor(page_table[:num_pages], dtype=torch.long, device=self.k.device)
         keys = self.k[layer, index].reshape(-1, self.num_kv_heads, self.head_dim)[:seq_len]
         if self.v_head_dim:
             values = self.v[layer, index].reshape(-1, self.num_kv_heads, self.v_head_dim)[

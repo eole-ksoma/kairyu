@@ -101,7 +101,12 @@ class Sampler:
         eos_token_id: int | None = None,
     ) -> SampledToken:
         state = self._state_for(request_id, sampling, eos_token_id)
-        logits = logits.detach().to(torch.float32).clone()
+        # Sampling runs on CPU: the seeded torch.Generator + multinomial and the
+        # penalty/enforcer index tensors are all CPU, and the reproducibility pins
+        # (m8 D2, spec ≡ greedy) are defined by the CPU RNG stream — a CUDA
+        # generator would diverge. On GPU this pulls the [vocab] logits row to host
+        # (cheap); on CPU it is the pre-existing no-op + private clone.
+        logits = logits.detach().to(device="cpu", dtype=torch.float32).clone()
 
         raw_logsoftmax: torch.Tensor | None = None
         if sampling.logprobs is not None:

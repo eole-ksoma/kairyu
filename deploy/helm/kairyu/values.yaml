@@ -2,10 +2,54 @@ replicaCount: 1
 image:
   repository: kairyu
   tag: dev
+  digest: ""
   pullPolicy: IfNotPresent
+imagePullSecrets: []
+workloadRole: standalone
+podLabels: {}
+podAnnotations: {}
+# Kept true for backwards compatibility with EndpointSlice discovery. Static
+# pools should set this false, as the private-cloud PoC does.
+automountServiceAccountToken: true
+podSecurityContext:
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+terminationGracePeriodSeconds: 30
+strategyType: RollingUpdate
 service:
   type: ClusterIP
   port: 8000
+  labels: {}
+  annotations: {}
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s
+  labels: {}
+probes:
+  startup:
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 90
+  readiness:
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 3
+  liveness:
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+gracefulDrain:
+  enabled: false
+  propagationSeconds: 10
+  auth:
+    secretName: ""
+    secretKey: admin-key
 resources: {}
 nodeSelector: {}
 runtimeClassName: ""

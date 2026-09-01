@@ -5,7 +5,19 @@
   "required": [
     "replicaCount",
     "image",
+    "imagePullSecrets",
+    "workloadRole",
+    "podLabels",
+    "podAnnotations",
+    "automountServiceAccountToken",
+    "podSecurityContext",
+    "securityContext",
+    "terminationGracePeriodSeconds",
+    "strategyType",
     "service",
+    "serviceMonitor",
+    "probes",
+    "gracefulDrain",
     "resources",
     "nodeSelector",
     "runtimeClassName",
@@ -24,7 +36,7 @@
     "image": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["repository", "tag", "pullPolicy"],
+      "required": ["repository", "tag", "digest", "pullPolicy"],
       "properties": {
         "repository": {
           "type": "string",
@@ -34,16 +46,113 @@
           "type": "string",
           "minLength": 1
         },
+        "digest": {
+          "type": "string",
+          "pattern": "^$|^sha256:[a-f0-9]{64}$"
+        },
         "pullPolicy": {
           "type": "string",
           "enum": ["Always", "IfNotPresent", "Never"]
         }
       }
     },
+    "imagePullSecrets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 253
+          }
+        }
+      }
+    },
+    "workloadRole": {
+      "type": "string",
+      "enum": ["standalone", "gateway", "replica"]
+    },
+    "podLabels": {
+      "$ref": "#/definitions/customLabelMap"
+    },
+    "podAnnotations": {
+      "$ref": "#/definitions/podAnnotationMap"
+    },
+    "automountServiceAccountToken": {
+      "type": "boolean"
+    },
+    "podSecurityContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["seccompProfile"],
+      "properties": {
+        "seccompProfile": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type"],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": ["RuntimeDefault", "Localhost", "Unconfined"]
+            },
+            "localhostProfile": {
+              "type": "string"
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {"type": {"const": "Localhost"}},
+                "required": ["type"]
+              },
+              "then": {
+                "required": ["localhostProfile"],
+                "properties": {"localhostProfile": {"minLength": 1}}
+              },
+              "else": {
+                "not": {"required": ["localhostProfile"]}
+              }
+            }
+          ]
+        }
+      }
+    },
+    "securityContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowPrivilegeEscalation", "capabilities"],
+      "properties": {
+        "allowPrivilegeEscalation": {
+          "type": "boolean"
+        },
+        "capabilities": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["drop"],
+          "properties": {
+            "drop": {
+              "type": "array",
+              "items": {"type": "string"}
+            }
+          }
+        }
+      }
+    },
+    "terminationGracePeriodSeconds": {
+      "type": "integer",
+      "minimum": 10
+    },
+    "strategyType": {
+      "type": "string",
+      "enum": ["RollingUpdate", "Recreate"]
+    },
     "service": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "port"],
+      "required": ["type", "port", "labels", "annotations"],
       "properties": {
         "type": {
           "type": "string",
@@ -53,6 +162,61 @@
           "type": "integer",
           "minimum": 1,
           "maximum": 65535
+        },
+        "labels": {
+          "$ref": "#/definitions/customLabelMap"
+        },
+        "annotations": {
+          "$ref": "#/definitions/stringMap"
+        }
+      }
+    },
+    "serviceMonitor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "interval", "scrapeTimeout", "labels"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "interval": {"$ref": "#/definitions/duration"},
+        "scrapeTimeout": {"$ref": "#/definitions/duration"},
+        "labels": {"$ref": "#/definitions/customLabelMap"}
+      }
+    },
+    "probes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["startup", "readiness", "liveness"],
+      "properties": {
+        "startup": {"$ref": "#/definitions/probe"},
+        "readiness": {"$ref": "#/definitions/probe"},
+        "liveness": {"$ref": "#/definitions/probe"}
+      }
+    },
+    "gracefulDrain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "propagationSeconds", "auth"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "propagationSeconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "auth": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["secretName", "secretKey"],
+          "properties": {
+            "secretName": {
+              "type": "string",
+              "maxLength": 253,
+              "pattern": "^$|^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$"
+            },
+            "secretKey": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
         }
       }
     },
@@ -227,6 +391,55 @@
     }
   },
   "definitions": {
+    "stringMap": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "customLabelMap": {
+      "type": "object",
+      "propertyNames": {
+        "not": {
+          "enum": [
+            "app.kubernetes.io/name",
+            "app.kubernetes.io/instance",
+            "app.kubernetes.io/component",
+            "app.kubernetes.io/managed-by",
+            "helm.sh/chart",
+            "app"
+          ]
+        }
+      },
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "podAnnotationMap": {
+      "type": "object",
+      "propertyNames": {
+        "not": {
+          "enum": ["checksum/config"]
+        }
+      },
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "duration": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*(ms|s|m|h)$"
+    },
+    "probe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["periodSeconds", "timeoutSeconds", "failureThreshold"],
+      "properties": {
+        "periodSeconds": {"type": "integer", "minimum": 1},
+        "timeoutSeconds": {"type": "integer", "minimum": 1},
+        "failureThreshold": {"type": "integer", "minimum": 1}
+      }
+    },
     "resourceList": {
       "type": "object",
       "properties": {

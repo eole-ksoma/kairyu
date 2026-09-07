@@ -91,15 +91,23 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 - Frontier full-checkpoint 262K/1M correctness/performance evidence, DeepSeek EP4/EP8 topology lock, CUDA Graph pointer stability, MTP/DSpark selection, 30-minute soak, and failure recovery remain open
 - NVLink-profile gates blocked on H100/A100-class hardware; PCIe-switch chassis and ≥400 Gb/s RDMA NICs gate E4/E5
 - G6 remaining P-C gates still in progress
-- AsyncRequest v1 currently provides only the backend-neutral lifecycle and
-  in-memory reference store; PostgreSQL persistence, public API/worker wiring,
-  and multi-gateway failover evidence remain open.
+- AsyncRequest v1 has a backend-neutral lifecycle plus PostgreSQL DB-clock
+  leases/fencing; public API/worker wiring and multi-gateway failover evidence
+  remain open.
 - Human sign-off pending on M2–M4 design reviews
 
 ## Change Log
 
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
+
+### 2026-09-07 — [progress] PostgreSQL AsyncRequest persistence
+- What: added the production RequestStore schema and backend with tenant-scoped
+  idempotency, SKIP LOCKED claims, DB-clock renewal/takeover, fenced terminal
+  writes, deadline/cancel invalidation, lock-complete status lists, and
+  transactional claim audit events.
+- Refs: m10 A37; kairyu/async_requests/postgres_store.py;
+  tests/unit/test_postgres_request_store.py; scripts/postgres_integration.sh
 
 ### 2026-09-07 — [design] AsyncRequest v1 store and fencing contract
 - What: added a separate online async-request state model, tenant-scoped

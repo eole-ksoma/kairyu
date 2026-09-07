@@ -1158,3 +1158,27 @@ online learning or the M4 request-family bandit.
   it is not an HA or durable deployment option. The production backend remains
   PostgreSQL with database-clock leases and transactional terminal publication;
   Redis may later supply wake-up hints but cannot own request truth.
+
+- **A37 (2026-09-07)**: `PostgresRequestStore` is the production persistence
+  implementation of A36. Its normalized PostgreSQL schema independently checks
+  lifecycle state, claim shape, terminal payload shape, JSON object storage,
+  priority, attempts, and tenant-scoped idempotency. Schema initialization is
+  serialized by a transaction advisory lock and guarded by a per-store version.
+
+  Submission uses a partial unique index over `(store, owner, idempotency_key)`;
+  concurrent exact submissions converge on one row and conflicting normalized
+  intent fails. Claim selection uses `FOR UPDATE SKIP LOCKED`, descending
+  priority, deterministic age/ID ordering, and the database clock. Claim,
+  renewal, running transition, and terminal publication check worker identity,
+  fencing token, lease, and deadline in the mutating SQL statement. Takeover
+  increments both attempt and fencing token. Cancellation and deadline expiry
+  clear ownership and invalidate the old fence. Terminal state and its result
+  or structured error commit in the same transaction as the audit event.
+  Status lists use one database statement timestamp to project deadline state;
+  ordinary reads never skip locked rows, while bounded cleanup persists expired
+  rows opportunistically without delaying the caller.
+
+  Separate general and lease connections prevent unrelated reads/submissions
+  from starving worker heartbeats inside one process. The retained integration
+  suite runs against the CI-pinned PostgreSQL image and verifies cross-instance
+  races; Redis remains outside this consistency boundary.

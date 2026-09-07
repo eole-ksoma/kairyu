@@ -66,4 +66,7 @@ if [[ "$ready" != true ]]; then
 fi
 
 uv run --frozen pytest --fail-on-skip \
-  -m postgres tests/unit/test_postgres_batch_store.py -v --no-cov
+  -m postgres \
+  tests/unit/test_postgres_batch_store.py \
+  tests/unit/test_postgres_request_store.py \
+  -v --no-cov

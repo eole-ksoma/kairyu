@@ -36,10 +36,18 @@ protocol with shared durable storage and database-clock leases.
 - [x] Obtain an independent code review and resolve accepted findings; the final
   review has no remaining high- or medium-severity findings.
 
-## Deferred production slices
+## Task 4 — PostgreSQL durable backend
 
-- [ ] PostgreSQL implementation using `FOR UPDATE SKIP LOCKED`, database-clock
+- [x] Add a PostgreSQL implementation using `FOR UPDATE SKIP LOCKED`, database-clock
   leases, transactional terminal publication, and claim audit events.
+- [x] Enforce lifecycle, lease shape, terminal payload, tenant idempotency, and
+  JSON object constraints in the database schema.
+- [x] Verify cross-instance submission, claim exclusivity, renewal, takeover,
+  stale-fence rejection, deadline precedence, terminal races, and audit order
+  against a real PostgreSQL server.
+
+## Following production slices
+
 - [ ] `/v1/requests` submit/status/list/cancel API and shared chat dispatch worker.
 - [ ] Redis wake-up hints, queue-age/admission metrics, and multi-gateway failover
   drills. Redis must not become the source of truth.

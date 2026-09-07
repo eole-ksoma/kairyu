@@ -1139,3 +1139,22 @@ online learning or the M4 request-family bandit.
   joins, no old-UID placement after the deadline, no eligibility reappearance,
   the five-second absolute bound, and all fail-closed replay checks remain
   mandatory.
+
+- **A36 (2026-09-07)**: durable online work receives its own AsyncRequest state
+  and `RequestStoreProtocol`; it does not reuse OpenAI Batch jobs or their file
+  lifecycle. Caller-visible, top-level-frozen snapshots are deep-copy isolated
+  from store state and move through `queued`,
+  `claimed`, `running`, and exactly one terminal state (`succeeded`, `failed`,
+  `cancelled`, or `expired`). Worker ownership is a separate, expiring claim.
+  Every claim or takeover increments a fencing token, and terminal publication
+  requires the current worker identity, token, and unexpired lease.
+
+  Request bodies and results are restricted to JSON values so every backend can
+  preserve the same contract. Idempotency keys are scoped by tenant. An exact replay returns the existing
+  request, while the same key with different normalized intent fails as a
+  conflict. Claim selection is deterministic: descending priority, then creation
+  time and request ID. Deadlines and cancellation invalidate current claims.
+  The process-local in-memory backend is only the executable reference contract;
+  it is not an HA or durable deployment option. The production backend remains
+  PostgreSQL with database-clock leases and transactional terminal publication;
+  Redis may later supply wake-up hints but cannot own request truth.

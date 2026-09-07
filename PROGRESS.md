@@ -91,12 +91,23 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 - Frontier full-checkpoint 262K/1M correctness/performance evidence, DeepSeek EP4/EP8 topology lock, CUDA Graph pointer stability, MTP/DSpark selection, 30-minute soak, and failure recovery remain open
 - NVLink-profile gates blocked on H100/A100-class hardware; PCIe-switch chassis and ≥400 Gb/s RDMA NICs gate E4/E5
 - G6 remaining P-C gates still in progress
+- AsyncRequest v1 currently provides only the backend-neutral lifecycle and
+  in-memory reference store; PostgreSQL persistence, public API/worker wiring,
+  and multi-gateway failover evidence remain open.
 - Human sign-off pending on M2–M4 design reviews
 
 ## Change Log
 
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
+
+### 2026-09-07 — [design] AsyncRequest v1 store and fencing contract
+- What: added a separate online async-request state model, tenant-scoped
+  idempotency, deterministic priority claims, lease renewal/reclaim, fencing,
+  cancellation/deadline invalidation, and a process-local reference store.
+- Why: a stable backend-neutral contract is required before PostgreSQL and API
+  wiring, and Batch job/file semantics must not become the online queue model.
+- Refs: m10 A36; kairyu/async_requests; tests/unit/test_async_request_store.py
 
 ### 2026-09-01 — [progress] Production-ready split-role Helm controls
 - What: chart 0.2.0 can pin repository@sha256, label gateway/replica roles,

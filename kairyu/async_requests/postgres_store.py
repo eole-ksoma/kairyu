@@ -296,6 +296,50 @@ _SCHEMA_STATEMENTS = (
     $$
     """,
     """
+    CREATE OR REPLACE FUNCTION maintain_async_request_state_shard()
+    RETURNS TRIGGER
+    LANGUAGE plpgsql
+    AS $$
+    DECLARE
+        metric_shard SMALLINT;
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1
+            FROM async_request_metric_migrations
+            WHERE store_id = NEW.store_id AND migration = 'sharded-v1'
+        ) THEN
+            RETURN NEW;
+        END IF;
+        metric_shard := mod(
+            hashtextextended(NEW.request_id, 0) & 9223372036854775807,
+            64
+        );
+        IF TG_OP = 'INSERT' THEN
+            INSERT INTO async_request_state_shards (store_id, state, shard, total)
+            VALUES (NEW.store_id, NEW.state, metric_shard, 1)
+            ON CONFLICT (store_id, state, shard)
+            DO UPDATE SET total = async_request_state_shards.total + 1;
+        ELSIF NEW.state IS DISTINCT FROM OLD.state THEN
+            UPDATE async_request_state_shards
+            SET total = total - 1
+            WHERE store_id = OLD.store_id
+              AND state = OLD.state
+              AND shard = metric_shard
+              AND total > 0;
+            IF NOT FOUND THEN
+                RAISE EXCEPTION 'missing async request v1 state counter for %/%/%',
+                    OLD.store_id, OLD.state, metric_shard;
+            END IF;
+            INSERT INTO async_request_state_shards (store_id, state, shard, total)
+            VALUES (NEW.store_id, NEW.state, metric_shard, 1)
+            ON CONFLICT (store_id, state, shard)
+            DO UPDATE SET total = async_request_state_shards.total + 1;
+        END IF;
+        RETURN NEW;
+    END;
+    $$
+    """,
+    """
     CREATE OR REPLACE FUNCTION maintain_async_request_state_shard_v2()
     RETURNS TRIGGER
     LANGUAGE plpgsql
@@ -624,27 +668,46 @@ class PostgresRequestStore:
             self._require_open()
             self._ensure_general_connection()
             with self._connection.cursor() as cursor:
+                cursor.execute("SET statement_timeout = 0")
+                cursor.execute("SET lock_timeout = 0")
                 cursor.execute(
-                    """
-                    SELECT index.indisvalid
-                    FROM pg_class AS relation
-                    JOIN pg_index AS index ON index.indexrelid = relation.oid
-                    WHERE relation.relname = 'async_requests_oldest_queued_idx'
-                    """
+                    "SELECT pg_advisory_lock(%s, %s)",
+                    (1_261_587_810, 4),
                 )
-                index_row = cursor.fetchone()
-                if index_row is not None and not bool(index_row[0]):
+                try:
                     cursor.execute(
-                        "DROP INDEX CONCURRENTLY async_requests_oldest_queued_idx"
+                        """
+                        SELECT index.indisvalid
+                        FROM pg_class AS relation
+                        JOIN pg_index AS index ON index.indexrelid = relation.oid
+                        JOIN pg_class AS target ON target.oid = index.indrelid
+                        WHERE relation.relname = 'async_requests_oldest_queued_idx'
+                          AND target.oid = 'async_requests'::regclass
+                          AND relation.relnamespace = target.relnamespace
+                        """
                     )
-                cursor.execute(
-                    """
-                    CREATE INDEX CONCURRENTLY IF NOT EXISTS
-                        async_requests_oldest_queued_idx
-                    ON async_requests (store_id, created_at, request_id)
-                    WHERE state = 'queued'
-                    """
-                )
+                    index_row = cursor.fetchone()
+                    if index_row is not None and not bool(index_row[0]):
+                        cursor.execute(
+                            "DROP INDEX CONCURRENTLY "
+                            "async_requests_oldest_queued_idx"
+                        )
+                    cursor.execute(
+                        """
+                        CREATE INDEX CONCURRENTLY IF NOT EXISTS
+                            async_requests_oldest_queued_idx
+                        ON async_requests (store_id, created_at, request_id)
+                        WHERE state = 'queued'
+                        """
+                    )
+                finally:
+                    cursor.execute(
+                        "SELECT pg_advisory_unlock(%s, %s)",
+                        (1_261_587_810, 4),
+                    )
+                    timeout_ms = self._connect_timeout * 1000
+                    cursor.execute(f"SET statement_timeout = {timeout_ms}")
+                    cursor.execute(f"SET lock_timeout = {timeout_ms}")
             with self._connection.transaction():
                 with self._connection.cursor() as cursor:
                     cursor.execute("SET LOCAL statement_timeout = 0")

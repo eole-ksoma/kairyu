@@ -665,8 +665,22 @@ def test_new_schema_preserves_legacy_counter_during_rolling_upgrade(
     assert psycopg is not None
     with psycopg.connect(_POSTGRES_DSN, autocommit=True) as connection:
         connection.execute(
+            "DELETE FROM async_request_metric_migrations WHERE store_id = %s",
+            (store_id,),
+        )
+        connection.execute(
+            """
+            INSERT INTO async_request_metric_migrations (store_id, migration)
+            VALUES (%s, 'sharded-v1')
+            """,
+            (store_id,),
+        )
+        connection.execute(
             "DROP TRIGGER IF EXISTS async_request_claim_audit_metric_total "
             "ON async_request_claim_audit"
+        )
+        connection.execute(
+            "DROP TRIGGER IF EXISTS async_request_state_shard ON async_requests"
         )
         connection.execute(
             """
@@ -702,10 +716,31 @@ def test_new_schema_preserves_legacy_counter_during_rolling_upgrade(
             EXECUTE FUNCTION increment_async_request_metric_total()
             """
         )
+        connection.execute(
+            """
+            CREATE OR REPLACE FUNCTION maintain_async_request_state_shard()
+            RETURNS TRIGGER
+            LANGUAGE plpgsql
+            AS $$
+            BEGIN
+                RAISE EXCEPTION 'unrepaired v1 state trigger executed';
+            END;
+            $$
+            """
+        )
+        connection.execute(
+            """
+            CREATE TRIGGER async_request_state_shard
+            AFTER INSERT OR UPDATE OF state ON async_requests
+            FOR EACH ROW
+            EXECUTE FUNCTION maintain_async_request_state_shard()
+            """
+        )
     try:
-        # Starting the new code repairs the old same-name function before any
-        # mixed-version event, while its separately named shard trigger remains.
+        # Starting the new code repairs both old same-name functions. The
+        # maintenance cutover removes v1 activation before any new event.
         second = create()
+        second.migrate_metrics_during_maintenance()
         first.submit(submission(owner="tenant-a"))
         assert first.claim_next("worker-a", lease_seconds=30) is not None
         second.submit(submission(owner="tenant-b"))
@@ -728,6 +763,9 @@ def test_new_schema_preserves_legacy_counter_during_rolling_upgrade(
             connection.execute(
                 "DROP TRIGGER IF EXISTS async_request_claim_audit_metric_total "
                 "ON async_request_claim_audit"
+            )
+            connection.execute(
+                "DROP TRIGGER IF EXISTS async_request_state_shard ON async_requests"
             )
 
 

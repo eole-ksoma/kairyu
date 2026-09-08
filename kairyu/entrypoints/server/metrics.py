@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import math
 import threading
+import time
 from collections.abc import Iterator
 
 from prometheus_client import (
@@ -47,11 +48,21 @@ _PREPLACEMENT_PHASES = frozenset(
 
 
 class _AsyncRequestStoreCollector:
-    """Fail-open scrape-time view over a shared durable request store."""
+    """Fail-open cached view over shared durable request stores.
+
+    Blocking backends refresh outside both the ASGI event loop and the scrape
+    path. A scrape only schedules at most one bounded-frequency refresh and
+    returns the last completed snapshot.
+    """
+
+    _REFRESH_INTERVAL_S = 1.0
 
     def __init__(self) -> None:
         self._stores: dict[str, object] = {}
         self._last_good: dict[str, RequestQueueMetricsSnapshot] = {}
+        self._snapshot_ok: dict[str, bool] = {}
+        self._last_refresh_started: dict[str, float] = {}
+        self._refreshing: set[str] = set()
         self._lock = threading.RLock()
 
     def add(self, store: object) -> None:
@@ -60,6 +71,53 @@ class _AsyncRequestStoreCollector:
         if callable(snapshot) and isinstance(store_id, str) and store_id:
             with self._lock:
                 self._stores[store_id] = store
+                self._snapshot_ok.setdefault(store_id, False)
+            if bool(getattr(store, "metrics_snapshot_nonblocking", False)):
+                self._refresh(store_id, store)
+            else:
+                self._schedule_refresh(store_id, store, force=True)
+
+    def _refresh(self, store_id: str, store: object) -> None:
+        try:
+            snapshot = self._validate(store.metrics_snapshot())
+        except Exception:
+            logger.warning(
+                "async request metrics snapshot failed for store %r",
+                store_id,
+                exc_info=True,
+            )
+            with self._lock:
+                self._snapshot_ok[store_id] = False
+        else:
+            with self._lock:
+                self._last_good[store_id] = snapshot
+                self._snapshot_ok[store_id] = True
+        finally:
+            with self._lock:
+                self._refreshing.discard(store_id)
+
+    def _schedule_refresh(
+        self,
+        store_id: str,
+        store: object,
+        *,
+        force: bool = False,
+    ) -> None:
+        now = time.monotonic()
+        with self._lock:
+            last_started = self._last_refresh_started.get(store_id, float("-inf"))
+            if store_id in self._refreshing or (
+                not force and now - last_started < self._REFRESH_INTERVAL_S
+            ):
+                return
+            self._refreshing.add(store_id)
+            self._last_refresh_started[store_id] = now
+        threading.Thread(
+            target=self._refresh,
+            args=(store_id, store),
+            name=f"kairyu-async-metrics-{store_id}",
+            daemon=True,
+        ).start()
 
     @staticmethod
     def _empty_snapshot() -> RequestQueueMetricsSnapshot:
@@ -121,20 +179,13 @@ class _AsyncRequestStoreCollector:
         with self._lock:
             stores = tuple(self._stores.items())
         for store_id, store in stores:
-            snapshot_ok = True
-            try:
-                snapshot = self._validate(store.metrics_snapshot())
-                with self._lock:
-                    self._last_good[store_id] = snapshot
-            except Exception:
-                snapshot_ok = False
-                logger.warning(
-                    "async request metrics snapshot failed for store %r",
-                    store_id,
-                    exc_info=True,
-                )
-                with self._lock:
-                    snapshot = self._last_good.get(store_id, self._empty_snapshot())
+            if bool(getattr(store, "metrics_snapshot_nonblocking", False)):
+                self._refresh(store_id, store)
+            else:
+                self._schedule_refresh(store_id, store)
+            with self._lock:
+                snapshot_ok = self._snapshot_ok.get(store_id, False)
+                snapshot = self._last_good.get(store_id, self._empty_snapshot())
             for state in AsyncRequestState:
                 states.add_metric(
                     [store_id, state.value],

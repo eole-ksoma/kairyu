@@ -159,6 +159,10 @@ def test_metrics_snapshot_is_shared_aggregate_and_totals_are_durable(
     after_audit_retention = second.metrics_snapshot()
     assert after_audit_retention.transition_counts["claim"] == 1
     assert after_audit_retention.transition_counts["running"] == 1
+    restarted = create()
+    after_restart = restarted.metrics_snapshot()
+    assert after_restart.transition_counts["claim"] == 1
+    assert after_restart.transition_counts["running"] == 1
 
 
 def test_metrics_totals_backfill_existing_audit_on_startup(store_factory) -> None:
@@ -171,7 +175,15 @@ def test_metrics_totals_backfill_existing_audit_on_startup(store_factory) -> Non
     assert psycopg is not None
     with psycopg.connect(_POSTGRES_DSN, autocommit=True) as connection:
         connection.execute(
-            "DELETE FROM async_request_metric_totals WHERE store_id = %s",
+            "DELETE FROM async_request_metric_migrations WHERE store_id = %s",
+            (store_id,),
+        )
+        connection.execute(
+            "DELETE FROM async_request_metric_shards WHERE store_id = %s",
+            (store_id,),
+        )
+        connection.execute(
+            "DELETE FROM async_request_state_shards WHERE store_id = %s",
             (store_id,),
         )
 
@@ -517,6 +529,34 @@ def test_closed_connections_are_reestablished(store_factory) -> None:
     claim = store.claim_next("worker-a", lease_seconds=30)
     assert claim is not None
     assert claim.request_id == request.id
+    store._metrics_connection.close()
+    assert store.metrics_snapshot().transition_counts["claim"] == 1
+
+
+def test_metric_updates_are_sharded_across_request_ids(store_factory) -> None:
+    create, store_id = store_factory
+    store = create(max_records_per_owner=64)
+    for index in range(32):
+        store.submit(submission(owner=f"tenant-{index:02d}"))
+    for index in range(32):
+        claim = store.claim_next(f"worker-{index:02d}", lease_seconds=30)
+        assert claim is not None
+
+    assert psycopg is not None
+    with psycopg.connect(_POSTGRES_DSN, autocommit=True) as connection:
+        row = connection.execute(
+            """
+            SELECT count(*), sum(total)
+            FROM async_request_metric_shards
+            WHERE store_id = %s AND event = 'claim'
+            """,
+            (store_id,),
+        ).fetchone()
+
+    assert row is not None
+    assert int(row[0]) > 1
+    assert int(row[1]) == 32
+    assert store.metrics_snapshot().transition_counts["claim"] == 32
 
 
 def test_cancel_and_success_race_commits_only_one_terminal_state(store_factory) -> None:

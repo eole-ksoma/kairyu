@@ -790,11 +790,14 @@ is not C7/F1b acceptance evidence.
   `kairyu_tenant_in_flight_requests`. AsyncRequest gateways expose shared-store
   `kairyu_async_request_queue_depth`,
   `kairyu_async_request_oldest_queued_age_seconds`, lifecycle state,
-  transition, attempt, and snapshot-health series. These values are identical
-  PostgreSQL-backed snapshots on every gateway: aggregate across gateway
-  targets with `max without(instance, pod)` rather than `sum`, and alert when
-  `kairyu_async_request_metrics_snapshot_success` is zero. Scrape every gateway
-  and replica.
+  transition, attempt, and snapshot-health series. Queue, state, transition,
+  and attempt values are shared PostgreSQL-backed snapshots: de-duplicate those
+  series across gateway targets with `max without(instance, pod)` rather than
+  `sum`. Snapshot health is gateway-local and must not use `max`; alert per
+  target, or when `min without(instance, pod)
+  (kairyu_async_request_metrics_snapshot_success) == 0`. During a failed
+  refresh the shared series retain that gateway's last good snapshot. Scrape
+  every gateway and replica.
 - With a versioned `pricing:` section, `/admin/usage.csv` snapshots the local
   immutable ledger and exports tenant charges for a `[start_ts,end_ts)` period.
   The CSV carries source SHA-256, price-sheet version, Decimal unit rates,

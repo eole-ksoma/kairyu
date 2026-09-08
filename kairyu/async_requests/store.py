@@ -139,6 +139,8 @@ class InMemoryRequestStore:
     protocol over shared durable storage.
     """
 
+    metrics_snapshot_nonblocking = True
+
     def __init__(
         self,
         *,
@@ -215,6 +217,8 @@ class InMemoryRequestStore:
             )
             self._requests[request_id] = request
             self._fencing_tokens[request_id] = 0
+            if expired:
+                self._transition_counts["expire"] += 1
             if submission.idempotency_key is not None:
                 self._idempotency[(submission.owner, submission.idempotency_key)] = (
                     fingerprint,

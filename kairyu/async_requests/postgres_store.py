@@ -46,6 +46,7 @@ except ModuleNotFoundError:  # pragma: no cover - core-only installation.
 
 _SCHEMA_VERSION = 1
 _EXPIRY_SWEEP_LIMIT = 100
+_METRIC_SHARDS = 64
 _CLAIM_STATES = frozenset({AsyncRequestState.CLAIMED, AsyncRequestState.RUNNING})
 _REQUEST_COLUMNS = """
     request_id, owner, endpoint, body, priority, idempotency_key, metadata,
@@ -191,15 +192,63 @@ _SCHEMA_STATEMENTS = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS async_request_metric_shards (
+        store_id TEXT NOT NULL
+            REFERENCES async_request_store_registry(store_id) ON DELETE CASCADE,
+        event TEXT NOT NULL CHECK (
+            event IN ('claim', 'reclaim', 'renew', 'defer', 'running', 'succeed',
+                      'fail', 'cancel', 'expire')
+        ),
+        shard SMALLINT NOT NULL CHECK (shard >= 0 AND shard < 64),
+        total BIGINT NOT NULL DEFAULT 0 CHECK (total >= 0),
+        PRIMARY KEY (store_id, event, shard)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS async_request_state_shards (
+        store_id TEXT NOT NULL
+            REFERENCES async_request_store_registry(store_id) ON DELETE CASCADE,
+        state TEXT NOT NULL CHECK (
+            state IN ('queued', 'claimed', 'running', 'succeeded', 'failed',
+                      'cancelled', 'expired')
+        ),
+        shard SMALLINT NOT NULL CHECK (shard >= 0 AND shard < 64),
+        total BIGINT NOT NULL DEFAULT 0 CHECK (total >= 0),
+        PRIMARY KEY (store_id, state, shard)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS async_request_metric_migrations (
+        store_id TEXT NOT NULL
+            REFERENCES async_request_store_registry(store_id) ON DELETE CASCADE,
+        migration TEXT NOT NULL,
+        completed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+        PRIMARY KEY (store_id, migration)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS async_requests_oldest_queued_idx
+        ON async_requests (store_id, created_at, request_id)
+        WHERE state = 'queued'
+    """,
+    """
     CREATE OR REPLACE FUNCTION increment_async_request_metric_total()
     RETURNS TRIGGER
     LANGUAGE plpgsql
     AS $$
     BEGIN
-        INSERT INTO async_request_metric_totals (store_id, event, total)
-        VALUES (NEW.store_id, NEW.event, 1)
-        ON CONFLICT (store_id, event)
-        DO UPDATE SET total = async_request_metric_totals.total + 1;
+        INSERT INTO async_request_metric_shards (store_id, event, shard, total)
+        VALUES (
+            NEW.store_id,
+            NEW.event,
+            mod(
+                hashtextextended(NEW.request_id, 0) & 9223372036854775807,
+                64
+            )::smallint,
+            1
+        )
+        ON CONFLICT (store_id, event, shard)
+        DO UPDATE SET total = async_request_metric_shards.total + 1;
         RETURN NEW;
     END;
     $$
@@ -217,6 +266,60 @@ _SCHEMA_STATEMENTS = (
             AFTER INSERT ON async_request_claim_audit
             FOR EACH ROW
             EXECUTE FUNCTION increment_async_request_metric_total();
+        END IF;
+    END;
+    $$
+    """,
+    """
+    CREATE OR REPLACE FUNCTION maintain_async_request_state_shard()
+    RETURNS TRIGGER
+    LANGUAGE plpgsql
+    AS $$
+    DECLARE
+        metric_shard SMALLINT;
+    BEGIN
+        metric_shard := mod(
+            hashtextextended(NEW.request_id, 0) & 9223372036854775807,
+            64
+        );
+        IF TG_OP = 'INSERT' THEN
+            INSERT INTO async_request_state_shards (store_id, state, shard, total)
+            VALUES (NEW.store_id, NEW.state, metric_shard, 1)
+            ON CONFLICT (store_id, state, shard)
+            DO UPDATE SET total = async_request_state_shards.total + 1;
+        ELSIF NEW.state IS DISTINCT FROM OLD.state THEN
+            UPDATE async_request_state_shards
+            SET total = total - 1
+            WHERE store_id = OLD.store_id
+              AND state = OLD.state
+              AND shard = metric_shard
+              AND total > 0;
+            IF NOT FOUND THEN
+                RAISE EXCEPTION 'missing async request state counter for %/%/%',
+                    OLD.store_id, OLD.state, metric_shard;
+            END IF;
+            INSERT INTO async_request_state_shards (store_id, state, shard, total)
+            VALUES (NEW.store_id, NEW.state, metric_shard, 1)
+            ON CONFLICT (store_id, state, shard)
+            DO UPDATE SET total = async_request_state_shards.total + 1;
+        END IF;
+        RETURN NEW;
+    END;
+    $$
+    """,
+    """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_trigger
+            WHERE tgname = 'async_request_state_shard'
+              AND tgrelid = 'async_requests'::regclass
+              AND NOT tgisinternal
+        ) THEN
+            CREATE TRIGGER async_request_state_shard
+            AFTER INSERT OR UPDATE OF state ON async_requests
+            FOR EACH ROW
+            EXECUTE FUNCTION maintain_async_request_state_shard();
         END IF;
     END;
     $$
@@ -285,9 +388,11 @@ class PostgresRequestStore:
         self._max_records_per_owner = max_records_per_owner
         self._lock = threading.RLock()
         self._lease_lock = threading.RLock()
+        self._metrics_lock = threading.RLock()
         self._closed = False
         self._connection = None
         self._lease_connection = None
+        self._metrics_connection = None
         if eager_connect:
             self._open()
 
@@ -300,7 +405,11 @@ class PostgresRequestStore:
             try:
                 self._initialize_schema()
                 self._lease_connection = self._connect()
+                self._metrics_connection = self._connect()
             except BaseException:
+                if self._lease_connection is not None:
+                    self._lease_connection.close()
+                    self._lease_connection = None
                 self._connection.close()
                 self._connection = None
                 raise
@@ -316,13 +425,16 @@ class PostgresRequestStore:
     def close(self) -> None:
         with self._lock:
             with self._lease_lock:
-                if self._closed:
-                    return
-                if self._lease_connection is not None:
-                    self._lease_connection.close()
-                if self._connection is not None:
-                    self._connection.close()
-                self._closed = True
+                with self._metrics_lock:
+                    if self._closed:
+                        return
+                    if self._metrics_connection is not None:
+                        self._metrics_connection.close()
+                    if self._lease_connection is not None:
+                        self._lease_connection.close()
+                    if self._connection is not None:
+                        self._connection.close()
+                    self._closed = True
 
     def __enter__(self) -> Self:
         self._require_open()
@@ -373,6 +485,12 @@ class PostgresRequestStore:
             self._lease_connection.close()
             self._lease_connection = self._connect()
 
+    def _ensure_metrics_connection(self) -> None:
+        assert self._metrics_connection is not None
+        if self._metrics_connection.closed or self._metrics_connection.broken:
+            self._metrics_connection.close()
+            self._metrics_connection = self._connect()
+
     def _initialize_schema(self) -> None:
         with self._lock:
             self._require_open()
@@ -390,24 +508,85 @@ class PostgresRequestStore:
                         """,
                         (self._store_id, _SCHEMA_VERSION),
                     )
-                    # Backfill stores created before durable metric totals were
-                    # introduced. GREATEST makes repeated startup idempotent and
-                    # preserves monotonic totals after future audit retention.
                     cursor.execute(
                         """
-                        INSERT INTO async_request_metric_totals (store_id, event, total)
-                        SELECT store_id, event, count(*)
-                        FROM async_request_claim_audit
-                        WHERE store_id = %s
-                        GROUP BY store_id, event
-                        ON CONFLICT (store_id, event)
-                        DO UPDATE SET total = GREATEST(
-                            async_request_metric_totals.total,
-                            EXCLUDED.total
+                        SELECT EXISTS (
+                            SELECT 1
+                            FROM async_request_metric_migrations
+                            WHERE store_id = %s AND migration = 'sharded-v1'
                         )
                         """,
                         (self._store_id,),
                     )
+                    if not bool(cursor.fetchone()[0]):
+                        # These locks close the otherwise unavoidable race between
+                        # the historical snapshot and old writers that only know
+                        # about the audit/request tables. This runs once per store;
+                        # the durable marker makes all later starts constant-time.
+                        cursor.execute(
+                            "LOCK TABLE async_request_claim_audit "
+                            "IN SHARE ROW EXCLUSIVE MODE"
+                        )
+                        cursor.execute(
+                            "LOCK TABLE async_requests IN SHARE ROW EXCLUSIVE MODE"
+                        )
+                        cursor.execute("SET LOCAL statement_timeout = 0")
+                        cursor.execute(
+                            "DELETE FROM async_request_metric_shards WHERE store_id = %s",
+                            (self._store_id,),
+                        )
+                        cursor.execute(
+                            """
+                            INSERT INTO async_request_metric_shards (
+                                store_id, event, shard, total
+                            )
+                            SELECT
+                                store_id,
+                                event,
+                                mod(
+                                    hashtextextended(request_id, 0)
+                                        & 9223372036854775807,
+                                    %s
+                                )::smallint,
+                                count(*)
+                            FROM async_request_claim_audit
+                            WHERE store_id = %s
+                            GROUP BY store_id, event, 3
+                            """,
+                            (_METRIC_SHARDS, self._store_id),
+                        )
+                        cursor.execute(
+                            "DELETE FROM async_request_state_shards WHERE store_id = %s",
+                            (self._store_id,),
+                        )
+                        cursor.execute(
+                            """
+                            INSERT INTO async_request_state_shards (
+                                store_id, state, shard, total
+                            )
+                            SELECT
+                                store_id,
+                                state,
+                                mod(
+                                    hashtextextended(request_id, 0)
+                                        & 9223372036854775807,
+                                    %s
+                                )::smallint,
+                                count(*)
+                            FROM async_requests
+                            WHERE store_id = %s
+                            GROUP BY store_id, state, 3
+                            """,
+                            (_METRIC_SHARDS, self._store_id),
+                        )
+                        cursor.execute(
+                            """
+                            INSERT INTO async_request_metric_migrations (
+                                store_id, migration
+                            ) VALUES (%s, 'sharded-v1')
+                            """,
+                            (self._store_id,),
+                        )
                     cursor.execute(
                         """
                         SELECT schema_version
@@ -590,61 +769,53 @@ class PostgresRequestStore:
                     return self._load_request_locked(cursor, request_id, owner=owner)
 
     def metrics_snapshot(self) -> RequestQueueMetricsSnapshot:
-        """Read one aggregate, payload-free snapshot using PostgreSQL time."""
-        with self._lock:
+        """Read bounded aggregate counters on an isolated PostgreSQL connection."""
+        with self._metrics_lock:
             self._require_open()
-            self._ensure_general_connection()
-            with self._connection.transaction():
-                with self._connection.cursor() as cursor:
+            self._ensure_metrics_connection()
+            with self._metrics_connection.transaction():
+                with self._metrics_connection.cursor() as cursor:
                     cursor.execute(
                         """
-                        WITH metric_clock AS MATERIALIZED (
-                            SELECT statement_timestamp() AS now
-                        ), projected AS (
-                            SELECT
-                                CASE
-                                    WHEN state IN ('queued', 'claimed', 'running')
-                                     AND deadline_at <= metric_clock.now
-                                    THEN 'expired'
-                                    ELSE state
-                                END AS effective_state,
-                                created_at,
-                                metric_clock.now
-                            FROM async_requests
-                            CROSS JOIN metric_clock
-                            WHERE store_id = %s
-                        )
-                        SELECT
-                            effective_state,
-                            count(*),
-                            COALESCE(
-                                GREATEST(
-                                    EXTRACT(
-                                        EPOCH FROM max(now) - min(created_at)
-                                            FILTER (WHERE effective_state = 'queued')
-                                    ),
-                                    0
-                                ),
-                                0
-                            )
-                        FROM projected
-                        GROUP BY effective_state
+                        SELECT state, sum(total)
+                        FROM async_request_state_shards
+                        WHERE store_id = %s
+                        GROUP BY state
                         """,
                         (self._store_id,),
                     )
                     rows = cursor.fetchall()
                     state_counts = {state: 0 for state in AsyncRequestState}
-                    oldest_queued_age_seconds = 0.0
-                    for state_value, count, oldest_age in rows:
+                    for state_value, count in rows:
                         state = AsyncRequestState(str(state_value))
                         state_counts[state] = int(count)
-                        if state is AsyncRequestState.QUEUED:
-                            oldest_queued_age_seconds = float(oldest_age)
+                    # Deadlines advance without a write. Project only active,
+                    # overdue rows through the existing partial deadline index;
+                    # terminal history is never scanned.
                     cursor.execute(
                         """
-                        SELECT event, total
-                        FROM async_request_metric_totals
+                        SELECT state, count(*)
+                        FROM async_requests
                         WHERE store_id = %s
+                          AND state IN ('queued', 'claimed', 'running')
+                          AND deadline_at <= statement_timestamp()
+                        GROUP BY state
+                        """,
+                        (self._store_id,),
+                    )
+                    projected_expired = 0
+                    for state_value, count in cursor.fetchall():
+                        state = AsyncRequestState(str(state_value))
+                        expired_count = int(count)
+                        state_counts[state] -= expired_count
+                        projected_expired += expired_count
+                    state_counts[AsyncRequestState.EXPIRED] += projected_expired
+                    cursor.execute(
+                        """
+                        SELECT event, sum(total)
+                        FROM async_request_metric_shards
+                        WHERE store_id = %s
+                        GROUP BY event
                         """,
                         (self._store_id,),
                     )
@@ -655,6 +826,33 @@ class PostgresRequestStore:
                         event_name = str(event)
                         if event_name in transition_counts:
                             transition_counts[event_name] = int(total)
+                    cursor.execute(
+                        """
+                        SELECT COALESCE(
+                            GREATEST(
+                                EXTRACT(
+                                    EPOCH FROM statement_timestamp() - created_at
+                                ),
+                                0
+                            ),
+                            0
+                        )
+                        FROM async_requests
+                        WHERE store_id = %s
+                          AND state = 'queued'
+                          AND (
+                              deadline_at IS NULL
+                              OR deadline_at > statement_timestamp()
+                          )
+                        ORDER BY created_at, request_id
+                        LIMIT 1
+                        """,
+                        (self._store_id,),
+                    )
+                    oldest_row = cursor.fetchone()
+                    oldest_queued_age_seconds = (
+                        0.0 if oldest_row is None else float(oldest_row[0])
+                    )
                     return RequestQueueMetricsSnapshot(
                         state_counts=state_counts,
                         oldest_queued_age_seconds=oldest_queued_age_seconds,

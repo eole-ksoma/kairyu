@@ -26,6 +26,37 @@ from kairyu.async_requests.models import (
     status_of,
 )
 
+ASYNC_REQUEST_TRANSITION_EVENTS = (
+    "claim",
+    "reclaim",
+    "renew",
+    "defer",
+    "running",
+    "succeed",
+    "fail",
+    "cancel",
+    "expire",
+)
+
+
+@dataclass(frozen=True)
+class RequestQueueMetricsSnapshot:
+    """Bounded, aggregate-only view used by the Prometheus collector."""
+
+    state_counts: dict[AsyncRequestState, int]
+    oldest_queued_age_seconds: float
+    transition_counts: dict[str, int]
+
+    @property
+    def queue_depth(self) -> int:
+        return self.state_counts.get(AsyncRequestState.QUEUED, 0)
+
+    @property
+    def attempts_total(self) -> int:
+        return self.transition_counts.get("claim", 0) + self.transition_counts.get(
+            "reclaim", 0
+        )
+
 
 class IdempotencyConflictError(RuntimeError):
     """An owner reused an idempotency key with different caller intent."""
@@ -89,6 +120,8 @@ class RequestStoreProtocol(Protocol):
 
     def cancel(self, request_id: str, *, owner: str | None = None) -> AsyncRequest: ...
 
+    def metrics_snapshot(self) -> RequestQueueMetricsSnapshot: ...
+
 
 @dataclass(frozen=True)
 class _Lease:
@@ -127,6 +160,9 @@ class InMemoryRequestStore:
         self._fencing_tokens: dict[str, int] = {}
         self._owner_not_before: dict[str, datetime] = {}
         self._idempotency: dict[tuple[str, str], tuple[str, str]] = {}
+        self._transition_counts = {
+            event: 0 for event in ASYNC_REQUEST_TRANSITION_EVENTS
+        }
         self._lock = threading.RLock()
 
     @property
@@ -300,6 +336,8 @@ class InMemoryRequestStore:
             self._requests[request.id] = claimed
             self._leases[request.id] = lease
             self._fencing_tokens[request.id] = token
+            event = "claim" if request.state is AsyncRequestState.QUEUED else "reclaim"
+            self._transition_counts[event] += 1
             return self._claim(claimed, lease)
 
     def renew_claim(self, claim: RequestClaim, *, lease_seconds: float) -> RequestClaim:
@@ -312,6 +350,7 @@ class InMemoryRequestStore:
                 lease_until=self._lease_until(request, now, lease_seconds),
             )
             self._leases[request.id] = renewed
+            self._transition_counts["renew"] += 1
             return self._claim(request, renewed)
 
     def defer(self, claim: RequestClaim, *, delay_seconds: float) -> AsyncRequest:
@@ -330,6 +369,7 @@ class InMemoryRequestStore:
                 self._owner_not_before.get(request.owner, now),
                 now + timedelta(seconds=delay_seconds),
             )
+            self._transition_counts["defer"] += 1
             return self._copy(deferred)
 
     def mark_running(self, claim: RequestClaim) -> AsyncRequest:
@@ -345,6 +385,7 @@ class InMemoryRequestStore:
                 deep=True,
             )
             self._requests[request.id] = running
+            self._transition_counts["running"] += 1
             return self._copy(running)
 
     def succeed(self, claim: RequestClaim, result: dict[str, JsonValue]) -> AsyncRequest:
@@ -381,6 +422,7 @@ class InMemoryRequestStore:
             self._requests[request.id] = cancelled
             self._leases.pop(request.id, None)
             self._fencing_tokens[request.id] += 1
+            self._transition_counts["cancel"] += 1
             return self._copy(cancelled)
 
     def _finish(
@@ -410,7 +452,35 @@ class InMemoryRequestStore:
             )
             self._requests[request.id] = finished
             self._leases.pop(request.id, None)
+            self._transition_counts[
+                "succeed" if state is AsyncRequestState.SUCCEEDED else "fail"
+            ] += 1
             return self._copy(finished)
+
+    def metrics_snapshot(self) -> RequestQueueMetricsSnapshot:
+        """Return aggregate queue state without exposing owner or payload data."""
+        with self._lock:
+            now = self._now()
+            self._expire_due(now)
+            state_counts = {state: 0 for state in AsyncRequestState}
+            oldest_created_at: datetime | None = None
+            for request in self._requests.values():
+                state_counts[request.state] += 1
+                if request.state is AsyncRequestState.QUEUED and (
+                    oldest_created_at is None
+                    or request.created_at < oldest_created_at
+                ):
+                    oldest_created_at = request.created_at
+            oldest_age = (
+                0.0
+                if oldest_created_at is None
+                else max(0.0, (now - oldest_created_at).total_seconds())
+            )
+            return RequestQueueMetricsSnapshot(
+                state_counts=state_counts,
+                oldest_queued_age_seconds=oldest_age,
+                transition_counts=dict(self._transition_counts),
+            )
 
     def _validate_claim(
         self,
@@ -459,6 +529,7 @@ class InMemoryRequestStore:
         self._requests[request.id] = expired
         self._leases.pop(request.id, None)
         self._fencing_tokens[request.id] += 1
+        self._transition_counts["expire"] += 1
 
     def _load(self, request_id: str, *, owner: str | None) -> AsyncRequest:
         request = self._requests.get(request_id)

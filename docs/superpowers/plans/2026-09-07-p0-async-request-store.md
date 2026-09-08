@@ -81,5 +81,14 @@ protocol with shared durable storage and database-clock leases.
 
 ## Following production slices
 
-- [ ] Redis wake-up hints and queue-age/admission metrics. Redis must not become
-  the source of truth.
+- [x] Expose shared-store queue depth, oldest queued age, lifecycle transition,
+  attempt, and snapshot-health metrics with bounded labels. Persist transition
+  totals independently of per-request audit retention and retain the last good
+  snapshot when PostgreSQL is temporarily unavailable.
+- [x] Extend the three-gateway staged gate to require identical shared queue
+  telemetry, failover/expiry/cancellation counters, empty final depth, and no
+  request-ID or prompt leakage.
+- [ ] Add the AsyncRequest retention/purge policy and audit-safe deletion.
+- [ ] Add Redis wake-up hints only after measured PostgreSQL polling pressure
+  justifies another operational dependency. Redis must not become the source
+  of truth.

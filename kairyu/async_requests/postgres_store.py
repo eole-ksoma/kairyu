@@ -30,9 +30,11 @@ from kairyu.async_requests.models import (
     RequestClaim,
 )
 from kairyu.async_requests.store import (
+    ASYNC_REQUEST_TRANSITION_EVENTS,
     IdempotencyConflictError,
     InvalidRequestTransitionError,
     RequestCapacityError,
+    RequestQueueMetricsSnapshot,
     StaleRequestClaimError,
 )
 
@@ -175,6 +177,49 @@ _SCHEMA_STATEMENTS = (
     """
     CREATE INDEX IF NOT EXISTS async_request_claim_audit_request_idx
         ON async_request_claim_audit (store_id, request_id, sequence)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS async_request_metric_totals (
+        store_id TEXT NOT NULL
+            REFERENCES async_request_store_registry(store_id) ON DELETE CASCADE,
+        event TEXT NOT NULL CHECK (
+            event IN ('claim', 'reclaim', 'renew', 'defer', 'running', 'succeed',
+                      'fail', 'cancel', 'expire')
+        ),
+        total BIGINT NOT NULL DEFAULT 0 CHECK (total >= 0),
+        PRIMARY KEY (store_id, event)
+    )
+    """,
+    """
+    CREATE OR REPLACE FUNCTION increment_async_request_metric_total()
+    RETURNS TRIGGER
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+        INSERT INTO async_request_metric_totals (store_id, event, total)
+        VALUES (NEW.store_id, NEW.event, 1)
+        ON CONFLICT (store_id, event)
+        DO UPDATE SET total = async_request_metric_totals.total + 1;
+        RETURN NEW;
+    END;
+    $$
+    """,
+    """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_trigger
+            WHERE tgname = 'async_request_claim_audit_metric_total'
+              AND tgrelid = 'async_request_claim_audit'::regclass
+              AND NOT tgisinternal
+        ) THEN
+            CREATE TRIGGER async_request_claim_audit_metric_total
+            AFTER INSERT ON async_request_claim_audit
+            FOR EACH ROW
+            EXECUTE FUNCTION increment_async_request_metric_total();
+        END IF;
+    END;
+    $$
     """,
 )
 
@@ -344,6 +389,24 @@ class PostgresRequestStore:
                         ON CONFLICT (store_id) DO NOTHING
                         """,
                         (self._store_id, _SCHEMA_VERSION),
+                    )
+                    # Backfill stores created before durable metric totals were
+                    # introduced. GREATEST makes repeated startup idempotent and
+                    # preserves monotonic totals after future audit retention.
+                    cursor.execute(
+                        """
+                        INSERT INTO async_request_metric_totals (store_id, event, total)
+                        SELECT store_id, event, count(*)
+                        FROM async_request_claim_audit
+                        WHERE store_id = %s
+                        GROUP BY store_id, event
+                        ON CONFLICT (store_id, event)
+                        DO UPDATE SET total = GREATEST(
+                            async_request_metric_totals.total,
+                            EXCLUDED.total
+                        )
+                        """,
+                        (self._store_id,),
                     )
                     cursor.execute(
                         """
@@ -525,6 +588,78 @@ class PostgresRequestStore:
             with self._connection.transaction():
                 with self._connection.cursor() as cursor:
                     return self._load_request_locked(cursor, request_id, owner=owner)
+
+    def metrics_snapshot(self) -> RequestQueueMetricsSnapshot:
+        """Read one aggregate, payload-free snapshot using PostgreSQL time."""
+        with self._lock:
+            self._require_open()
+            self._ensure_general_connection()
+            with self._connection.transaction():
+                with self._connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        WITH metric_clock AS MATERIALIZED (
+                            SELECT statement_timestamp() AS now
+                        ), projected AS (
+                            SELECT
+                                CASE
+                                    WHEN state IN ('queued', 'claimed', 'running')
+                                     AND deadline_at <= metric_clock.now
+                                    THEN 'expired'
+                                    ELSE state
+                                END AS effective_state,
+                                created_at,
+                                metric_clock.now
+                            FROM async_requests
+                            CROSS JOIN metric_clock
+                            WHERE store_id = %s
+                        )
+                        SELECT
+                            effective_state,
+                            count(*),
+                            COALESCE(
+                                GREATEST(
+                                    EXTRACT(
+                                        EPOCH FROM max(now) - min(created_at)
+                                            FILTER (WHERE effective_state = 'queued')
+                                    ),
+                                    0
+                                ),
+                                0
+                            )
+                        FROM projected
+                        GROUP BY effective_state
+                        """,
+                        (self._store_id,),
+                    )
+                    rows = cursor.fetchall()
+                    state_counts = {state: 0 for state in AsyncRequestState}
+                    oldest_queued_age_seconds = 0.0
+                    for state_value, count, oldest_age in rows:
+                        state = AsyncRequestState(str(state_value))
+                        state_counts[state] = int(count)
+                        if state is AsyncRequestState.QUEUED:
+                            oldest_queued_age_seconds = float(oldest_age)
+                    cursor.execute(
+                        """
+                        SELECT event, total
+                        FROM async_request_metric_totals
+                        WHERE store_id = %s
+                        """,
+                        (self._store_id,),
+                    )
+                    transition_counts = {
+                        event: 0 for event in ASYNC_REQUEST_TRANSITION_EVENTS
+                    }
+                    for event, total in cursor.fetchall():
+                        event_name = str(event)
+                        if event_name in transition_counts:
+                            transition_counts[event_name] = int(total)
+                    return RequestQueueMetricsSnapshot(
+                        state_counts=state_counts,
+                        oldest_queued_age_seconds=oldest_queued_age_seconds,
+                        transition_counts=transition_counts,
+                    )
 
     def list(
         self,

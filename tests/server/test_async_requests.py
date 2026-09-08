@@ -490,6 +490,42 @@ async def test_async_control_routes_do_not_consume_worker_request_quota() -> Non
         assert second.json()["error"]["code"] == "tenant_rate_limited"
 
 
+async def test_metrics_exposes_aggregate_async_queue_without_request_data() -> None:
+    app, store, worker = _surface()
+    secret_prompt = "private-prompt-not-a-label"
+    async with _client(app) as client:
+        created = await client.post(
+            "/v1/async/chat/completions",
+            json=_body(secret_prompt),
+        )
+        request_id = created.json()["request"]["id"]
+        queued_metrics = (await client.get("/metrics")).text
+        assert await worker.process_next() is True
+        completed_metrics = (await client.get("/metrics")).text
+
+    assert 'kairyu_async_request_queue_depth{store="memory"} 1.0' in queued_metrics
+    assert (
+        'kairyu_async_request_state{state="queued",store="memory"} 1.0'
+        in queued_metrics
+    )
+    assert 'kairyu_async_request_queue_depth{store="memory"} 0.0' in completed_metrics
+    assert (
+        'kairyu_async_request_state{state="succeeded",store="memory"} 1.0'
+        in completed_metrics
+    )
+    assert (
+        'kairyu_async_request_transitions_total{event="succeed",store="memory"} 1.0'
+        in completed_metrics
+    )
+    assert 'kairyu_async_request_attempts_total{store="memory"} 1.0' in completed_metrics
+    assert (
+        'kairyu_async_request_metrics_snapshot_success{store="memory"} 1.0'
+        in completed_metrics
+    )
+    assert request_id not in completed_metrics
+    assert secret_prompt not in completed_metrics
+
+
 async def test_worker_defers_blocked_tenant_without_starving_another() -> None:
     tenant_config = TenantConfig(
         limits={"tenant-a": TenantLimits(max_in_flight=1)}

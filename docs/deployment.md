@@ -787,7 +787,14 @@ is not C7/F1b acceptance evidence.
   `kairyu_scheduler_queue_high_watermark` series by model and
   interactive/batch class. Tenant-enabled gateways additionally expose
   `kairyu_tenant_admission_total` by bounded tenant/source/decision/reason and
-  `kairyu_tenant_in_flight_requests`. Scrape every gateway and replica.
+  `kairyu_tenant_in_flight_requests`. AsyncRequest gateways expose shared-store
+  `kairyu_async_request_queue_depth`,
+  `kairyu_async_request_oldest_queued_age_seconds`, lifecycle state,
+  transition, attempt, and snapshot-health series. These values are identical
+  PostgreSQL-backed snapshots on every gateway: aggregate across gateway
+  targets with `max without(instance, pod)` rather than `sum`, and alert when
+  `kairyu_async_request_metrics_snapshot_success` is zero. Scrape every gateway
+  and replica.
 - With a versioned `pricing:` section, `/admin/usage.csv` snapshots the local
   immutable ledger and exports tenant charges for a `[start_ts,end_ts)` period.
   The CSV carries source SHA-256, price-sheet version, Decimal unit rates,

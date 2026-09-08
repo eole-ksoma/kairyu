@@ -23,6 +23,17 @@ _REQUEST_ID = re.compile(r"^[A-Za-z0-9_-]+$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 
 
+def metric_value(text: str, name: str, **labels: str) -> float:
+    """Read one Prometheus sample without depending on label output order."""
+    for line in text.splitlines():
+        if not line.startswith(f"{name}{{"):
+            continue
+        label_text, raw_value = line.rsplit("} ", 1)
+        if all(f'{key}="{value}"' in label_text for key, value in labels.items()):
+            return float(raw_value)
+    raise KeyError(f"metric sample {name!r} with labels {labels!r} was not found")
+
+
 def rank_gateways(session_id: str) -> tuple[str, ...]:
     """Match the F1c load balancer's frozen rendezvous selection."""
     return tuple(
@@ -611,6 +622,81 @@ class Smoke:
             }
         )
 
+    def shared_queue_telemetry(self) -> None:
+        snapshots: dict[str, str] = {}
+        for gateway_id in GATEWAY_IDS:
+            deadline = time.monotonic() + self._timeout_seconds
+            while time.monotonic() < deadline:
+                text = self._request("GET", "/metrics", gateway_id=gateway_id).text
+                if (
+                    metric_value(
+                        text,
+                        "kairyu_async_request_metrics_snapshot_success",
+                        store=STORE_ID,
+                    )
+                    == 1
+                ):
+                    snapshots[gateway_id] = text
+                    break
+                time.sleep(0.2)
+            else:
+                raise AssertionError(
+                    f"gateway {gateway_id} did not recover shared-store metrics"
+                )
+
+        selected = {
+            gateway_id: tuple(
+                sorted(
+                    line
+                    for line in text.splitlines()
+                    if line.startswith("kairyu_async_request_")
+                )
+            )
+            for gateway_id, text in snapshots.items()
+        }
+        if len(set(selected.values())) != 1:
+            raise AssertionError("gateways exposed inconsistent shared queue metrics")
+
+        reference = snapshots["a"]
+        if metric_value(
+            reference,
+            "kairyu_async_request_queue_depth",
+            store=STORE_ID,
+        ) != 0:
+            raise AssertionError("completed smoke left durable work queued")
+        minimums = {
+            ("kairyu_async_request_transitions_total", "reclaim"): 1,
+            ("kairyu_async_request_transitions_total", "expire"): 1,
+            ("kairyu_async_request_transitions_total", "cancel"): 2,
+            ("kairyu_async_request_transitions_total", "succeed"): 3,
+        }
+        for (name, event), minimum in minimums.items():
+            observed = metric_value(reference, name, store=STORE_ID, event=event)
+            if observed < minimum:
+                raise AssertionError(
+                    f"{name} event={event!r} was {observed}, expected >= {minimum}"
+                )
+        attempts = metric_value(
+            reference,
+            "kairyu_async_request_attempts_total",
+            store=STORE_ID,
+        )
+        if attempts < 6:
+            raise AssertionError(f"attempt counter was {attempts}, expected >= 6")
+        for request_id in self.request_ids:
+            if request_id in reference:
+                raise AssertionError("request ID leaked into Prometheus labels")
+        for prompt in ("shared-state", "cancel-me", "expire-me", "survive-owner-loss"):
+            if prompt in reference:
+                raise AssertionError("request prompt leaked into Prometheus labels")
+        self.checks.append(
+            {
+                "name": "shared_low_cardinality_queue_telemetry",
+                "gateways": list(GATEWAY_IDS),
+                "attempts_total": attempts,
+            }
+        )
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -646,6 +732,7 @@ def main() -> int:
         smoke.large_body_responsiveness()
         smoke.owner_failover()
         smoke.database_reconnect()
+        smoke.shared_queue_telemetry()
         report = {
             "schema_version": 1,
             "gate": "async-request-three-gateway-smoke",

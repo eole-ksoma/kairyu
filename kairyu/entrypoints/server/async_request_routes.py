@@ -88,6 +88,10 @@ def add_async_request_routes(
     store: RequestStoreProtocol,
     worker: AsyncRequestWorker,
 ) -> None:
+    metrics = getattr(app.state, "metrics", None)
+    if metrics is not None:
+        metrics.track_async_request_store(store)
+
     async def store_call(function, *args, **kwargs):
         return await asyncio.to_thread(function, *args, **kwargs)
 

@@ -5,9 +5,27 @@ import yaml
 from verification.fleet.resilience.async_request_gateway_smoke import (
     GATEWAY_IDS,
     find_takeover,
+    metric_value,
     rank_gateways,
     sessions_by_gateway,
 )
+
+
+def test_metric_value_ignores_prometheus_label_order():
+    text = (
+        '# HELP kairyu_async_request_transitions_total test\n'
+        'kairyu_async_request_transitions_total{event="reclaim",store="shared"} 2.0\n'
+    )
+
+    assert (
+        metric_value(
+            text,
+            "kairyu_async_request_transitions_total",
+            store="shared",
+            event="reclaim",
+        )
+        == 2
+    )
 
 
 def test_sessions_target_every_gateway_deterministically():

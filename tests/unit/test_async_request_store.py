@@ -56,6 +56,57 @@ def test_store_satisfies_runtime_protocol(store: InMemoryRequestStore) -> None:
     assert isinstance(store, RequestStoreProtocol)
 
 
+def test_metrics_snapshot_reports_bounded_queue_state_and_transitions(
+    store: InMemoryRequestStore,
+    clock: Clock,
+) -> None:
+    first = store.submit(submission())
+    store.submit(submission(owner="tenant-b"))
+    clock.advance(3)
+    claim = store.claim_next("worker-a", lease_seconds=30)
+    assert claim is not None
+    assert claim.request_id == first.id
+    store.mark_running(claim)
+    store.succeed(claim, {"answer": 42})
+    clock.advance(2)
+
+    snapshot = store.metrics_snapshot()
+
+    assert snapshot.queue_depth == 1
+    assert snapshot.state_counts[AsyncRequestState.QUEUED] == 1
+    assert snapshot.state_counts[AsyncRequestState.SUCCEEDED] == 1
+    assert snapshot.oldest_queued_age_seconds == 5
+    assert snapshot.transition_counts["claim"] == 1
+    assert snapshot.transition_counts["running"] == 1
+    assert snapshot.transition_counts["succeed"] == 1
+    assert snapshot.attempts_total == 1
+    assert set(snapshot.transition_counts) == {
+        "claim",
+        "reclaim",
+        "renew",
+        "defer",
+        "running",
+        "succeed",
+        "fail",
+        "cancel",
+        "expire",
+    }
+
+
+def test_metrics_snapshot_materializes_due_deadlines(
+    store: InMemoryRequestStore,
+    clock: Clock,
+) -> None:
+    store.submit(submission(deadline_at=clock.now + timedelta(seconds=1)))
+    clock.advance(2)
+
+    snapshot = store.metrics_snapshot()
+
+    assert snapshot.queue_depth == 0
+    assert snapshot.state_counts[AsyncRequestState.EXPIRED] == 1
+    assert snapshot.transition_counts["expire"] == 1
+
+
 def test_submit_get_and_list_are_tenant_scoped(store: InMemoryRequestStore) -> None:
     first = store.submit(submission())
     second = store.submit(submission(owner="tenant-b", priority=10))

@@ -110,6 +110,76 @@ def test_cross_instance_idempotency_tenant_scope_and_listing(store_factory) -> N
     assert pending_result is None
 
 
+def test_metrics_snapshot_is_shared_aggregate_and_totals_are_durable(
+    store_factory,
+) -> None:
+    create, store_id = store_factory
+    first = create()
+    second = create()
+    running_request = first.submit(submission(idempotency_key="running"))
+    expiring_request = first.submit(
+        submission(
+            owner="tenant-b",
+            idempotency_key="expired",
+            deadline_at=datetime.now(UTC) + timedelta(minutes=5),
+        )
+    )
+    first.submit(submission(owner="tenant-c", idempotency_key="queued"))
+    claim = second.claim_next("worker-a", lease_seconds=30)
+    assert claim is not None
+    assert claim.request_id == running_request.id
+    second.mark_running(claim)
+
+    assert psycopg is not None
+    with psycopg.connect(_POSTGRES_DSN, autocommit=True) as connection:
+        connection.execute(
+            """
+            UPDATE async_requests
+            SET deadline_at = clock_timestamp() - interval '1 second'
+            WHERE store_id = %s AND request_id = %s
+            """,
+            (store_id, expiring_request.id),
+        )
+
+    snapshot = first.metrics_snapshot()
+
+    assert snapshot.queue_depth == 1
+    assert snapshot.state_counts[AsyncRequestState.RUNNING] == 1
+    assert snapshot.state_counts[AsyncRequestState.EXPIRED] == 1
+    assert snapshot.oldest_queued_age_seconds >= 0
+    assert snapshot.transition_counts["claim"] == 1
+    assert snapshot.transition_counts["running"] == 1
+    assert snapshot.attempts_total == 1
+
+    with psycopg.connect(_POSTGRES_DSN, autocommit=True) as connection:
+        connection.execute(
+            "DELETE FROM async_request_claim_audit WHERE store_id = %s",
+            (store_id,),
+        )
+    after_audit_retention = second.metrics_snapshot()
+    assert after_audit_retention.transition_counts["claim"] == 1
+    assert after_audit_retention.transition_counts["running"] == 1
+
+
+def test_metrics_totals_backfill_existing_audit_on_startup(store_factory) -> None:
+    create, store_id = store_factory
+    first = create()
+    first.submit(submission())
+    claim = first.claim_next("worker-a", lease_seconds=30)
+    assert claim is not None
+
+    assert psycopg is not None
+    with psycopg.connect(_POSTGRES_DSN, autocommit=True) as connection:
+        connection.execute(
+            "DELETE FROM async_request_metric_totals WHERE store_id = %s",
+            (store_id,),
+        )
+
+    restarted = create()
+
+    assert restarted.metrics_snapshot().transition_counts["claim"] == 1
+
+
 def test_cross_instance_owner_capacity_is_atomic_and_replays_survive_limit(
     store_factory,
 ) -> None:

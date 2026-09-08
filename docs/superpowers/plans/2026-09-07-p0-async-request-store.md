@@ -83,8 +83,10 @@ protocol with shared durable storage and database-clock leases.
 
 - [x] Expose shared-store queue depth, oldest queued age, lifecycle transition,
   attempt, and snapshot-health metrics with bounded labels. Persist transition
-  totals independently of per-request audit retention and retain the last good
-  snapshot when PostgreSQL is temporarily unavailable.
+  totals independently of per-request audit retention, use transaction-sharded
+  durable counters, and retain the last good snapshot when PostgreSQL is
+  temporarily unavailable. Existing stores use an explicit, drain-first v2
+  maintenance migration; ordinary Pod startup never scans or locks history.
 - [x] Extend the three-gateway staged gate to require identical shared queue
   telemetry, failover/expiry/cancellation counters, empty final depth, and no
   request-ID or prompt leakage.

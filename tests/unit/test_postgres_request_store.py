@@ -159,6 +159,10 @@ def test_metrics_snapshot_is_shared_aggregate_and_totals_are_durable(
     after_audit_retention = second.metrics_snapshot()
     assert after_audit_retention.transition_counts["claim"] == 1
     assert after_audit_retention.transition_counts["running"] == 1
+    first.migrate_metrics_during_maintenance()
+    after_rebuild = first.metrics_snapshot()
+    assert after_rebuild.transition_counts["claim"] == 1
+    assert after_rebuild.transition_counts["running"] == 1
     restarted = create()
     after_restart = restarted.metrics_snapshot()
     assert after_restart.transition_counts["claim"] == 1
@@ -193,6 +197,49 @@ def test_metrics_totals_backfill_requires_explicit_maintenance(store_factory) ->
         restarted.metrics_snapshot()
     restarted.migrate_metrics_during_maintenance()
     assert restarted.metrics_snapshot().transition_counts["claim"] == 1
+
+
+def test_maintenance_preserves_legacy_totals_after_all_history_is_deleted(
+    store_factory,
+) -> None:
+    create, store_id = store_factory
+    first = create()
+    request = first.submit(submission())
+    claim = first.claim_next("worker-a", lease_seconds=30)
+    assert claim is not None
+
+    assert psycopg is not None
+    with psycopg.connect(_POSTGRES_DSN, autocommit=True) as connection:
+        connection.execute(
+            "DELETE FROM async_request_claim_audit WHERE store_id = %s",
+            (store_id,),
+        )
+        connection.execute(
+            "DELETE FROM async_requests WHERE store_id = %s AND request_id = %s",
+            (store_id, request.id),
+        )
+        connection.execute(
+            "DELETE FROM async_request_metric_shards WHERE store_id = %s",
+            (store_id,),
+        )
+        connection.execute(
+            """
+            INSERT INTO async_request_metric_totals (store_id, event, total)
+            VALUES (%s, 'claim', 7)
+            ON CONFLICT (store_id, event) DO UPDATE SET total = EXCLUDED.total
+            """,
+            (store_id,),
+        )
+        connection.execute(
+            "DELETE FROM async_request_metric_migrations WHERE store_id = %s",
+            (store_id,),
+        )
+
+    restarted = create()
+    with pytest.raises(RuntimeError, match="maintenance migration"):
+        restarted.metrics_snapshot()
+    restarted.migrate_metrics_during_maintenance()
+    assert restarted.metrics_snapshot().transition_counts["claim"] == 7
 
 
 def test_unmigrated_store_transitions_remain_available(store_factory) -> None:
@@ -628,10 +675,20 @@ def test_new_schema_preserves_legacy_counter_during_rolling_upgrade(
             LANGUAGE plpgsql
             AS $$
             BEGIN
-                INSERT INTO async_request_metric_totals (store_id, event, total)
-                VALUES (NEW.store_id, NEW.event, 1)
-                ON CONFLICT (store_id, event)
-                DO UPDATE SET total = async_request_metric_totals.total + 1;
+                INSERT INTO async_request_metric_shards (
+                    store_id, event, shard, total
+                ) VALUES (
+                    NEW.store_id,
+                    NEW.event,
+                    mod(
+                        hashtextextended(NEW.request_id, 0)
+                            & 9223372036854775807,
+                        64
+                    )::smallint,
+                    1
+                )
+                ON CONFLICT (store_id, event, shard)
+                DO UPDATE SET total = async_request_metric_shards.total + 1;
                 RETURN NEW;
             END;
             $$
@@ -646,9 +703,11 @@ def test_new_schema_preserves_legacy_counter_during_rolling_upgrade(
             """
         )
     try:
+        # Starting the new code repairs the old same-name function before any
+        # mixed-version event, while its separately named shard trigger remains.
+        second = create()
         first.submit(submission(owner="tenant-a"))
         assert first.claim_next("worker-a", lease_seconds=30) is not None
-        second = create()
         second.submit(submission(owner="tenant-b"))
         assert second.claim_next("worker-b", lease_seconds=30) is not None
 
@@ -669,6 +728,43 @@ def test_new_schema_preserves_legacy_counter_during_rolling_upgrade(
             connection.execute(
                 "DROP TRIGGER IF EXISTS async_request_claim_audit_metric_total "
                 "ON async_request_claim_audit"
+            )
+
+
+def test_schema_cutover_blocks_old_store_initializers_globally(store_factory) -> None:
+    create, _store_id = store_factory
+    first = create()
+    legacy_store_id = f"legacy-{uuid.uuid4().hex}"
+    assert psycopg is not None
+    try:
+        with psycopg.connect(_POSTGRES_DSN, autocommit=True) as connection:
+            connection.execute(
+                """
+                INSERT INTO async_request_store_registry (store_id, schema_version)
+                VALUES (%s, 1)
+                """,
+                (legacy_store_id,),
+            )
+
+        create()
+
+        with psycopg.connect(_POSTGRES_DSN, autocommit=True) as connection:
+            row = connection.execute(
+                """
+                SELECT schema_version
+                FROM async_request_store_registry
+                WHERE store_id = %s
+                """,
+                (legacy_store_id,),
+            ).fetchone()
+        assert row is not None
+        assert int(row[0]) == 2
+        assert first.metrics_snapshot().queue_depth == 0
+    finally:
+        with psycopg.connect(_POSTGRES_DSN, autocommit=True) as connection:
+            connection.execute(
+                "DELETE FROM async_request_store_registry WHERE store_id = %s",
+                (legacy_store_id,),
             )
 
 

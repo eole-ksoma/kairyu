@@ -800,9 +800,12 @@ is not C7/F1b acceptance evidence.
   every gateway and replica.
 
   A new empty AsyncRequest store activates sharded telemetry automatically.
-  For a store containing requests or audit history, deploy the compatible code
-  first; telemetry reports snapshot health `0` until the one-time backfill.
-  Drain AsyncRequest writers, then run:
+  For a pre-existing registry, deploy the compatible code first; the first v2
+  Pod atomically advances all registry rows so already-running v1 Pods can
+  drain, while a v1 Pod restart fails closed instead of replacing shared
+  trigger functions. Telemetry reports snapshot health `0` until the one-time
+  backfill. Drain AsyncRequest writers for every store, then run the following
+  once per store:
 
   ```bash
   python scripts/async_request_metrics_migration.py \
@@ -811,7 +814,7 @@ is not C7/F1b acceptance evidence.
   ```
 
   The DSN is read from `KAIRYU_ASYNC_REQUEST_POSTGRES_DSN`. During a mixed
-  rollout an existing legacy trigger remains available to old Pods while the
+  rollout an existing legacy trigger remains available to running old Pods while the
   new, separately named trigger writes 64 sharded counters. After every store
   is backfilled and all old Pods are gone, run the same command with
   `--mode finalize-legacy` to remove the legacy single-row writer. Neither

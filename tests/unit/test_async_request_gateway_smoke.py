@@ -9,6 +9,25 @@ from verification.fleet.resilience.async_request_gateway_smoke import (
     rank_gateways,
     sessions_by_gateway,
 )
+from verification.fleet.resilience.fleet_gateway_bench import (
+    wall_clock_envelope_contains,
+)
+
+
+def test_cross_process_clock_envelope_has_a_narrow_explicit_tolerance():
+    assert wall_clock_envelope_contains(1_000_000, 999_500, 2_000_500, 2_000_000)
+    assert not wall_clock_envelope_contains(
+        1_000_000,
+        -1,
+        2_000_000,
+        2_000_000,
+    )
+    assert not wall_clock_envelope_contains(
+        1_000_000,
+        1_500_000,
+        3_000_001,
+        2_000_000,
+    )
 
 
 def test_metric_value_ignores_prometheus_label_order():

@@ -46,8 +46,23 @@ protocol with shared durable storage and database-clock leases.
   stale-fence rejection, deadline precedence, terminal races, and audit order
   against a real PostgreSQL server.
 
+## Task 5 — HTTP API and shared chat worker
+
+- [x] Add `POST /v1/async/chat/completions` plus tenant-scoped
+  `/v1/requests` status/list/result/cancel routes, 202 receipts, deadline and
+  idempotency controls, bounded bodies, and non-streaming enforcement.
+- [x] Run claimed work through the shared direct-chat validation, preparation,
+  tool gates, tenant admission/metering, priority, and usage contract.
+- [x] Maintain the request lease during inference, abort local execution after
+  cancellation or lost fencing, and stop claiming new work during shutdown.
+- [x] Wire PostgreSQL construction, fixed worker consumers, and store closure
+  through `DeploymentSpec` and the application lifespan.
+- [x] Bound receipt/status/list projections independently of persisted bodies;
+  use narrow PostgreSQL reads, tenant-policy queue priority, one worker-owned
+  inference quota charge, owner-wide durable admission deferrals,
+  deadline-aware heartbeats, and sanitized error logs.
+
 ## Following production slices
 
-- [ ] `/v1/requests` submit/status/list/cancel API and shared chat dispatch worker.
 - [ ] Redis wake-up hints, queue-age/admission metrics, and multi-gateway failover
   drills. Redis must not become the source of truth.

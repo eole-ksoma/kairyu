@@ -6,6 +6,7 @@ process-local signal may wake workers later, but neither is authoritative.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -24,12 +25,14 @@ from kairyu.async_requests.models import (
     AsyncRequest,
     AsyncRequestError,
     AsyncRequestState,
+    AsyncRequestStatus,
     AsyncRequestSubmission,
     RequestClaim,
 )
 from kairyu.async_requests.store import (
     IdempotencyConflictError,
     InvalidRequestTransitionError,
+    RequestCapacityError,
     StaleRequestClaimError,
 )
 
@@ -46,6 +49,11 @@ _REQUEST_COLUMNS = """
     request_id, owner, endpoint, body, priority, idempotency_key, metadata,
     state, attempt, created_at, updated_at, deadline_at, completed_at, result,
     error
+"""
+_STATUS_COLUMNS = """
+    request_id, owner, endpoint, priority, idempotency_key, metadata,
+    state, attempt, created_at, updated_at, deadline_at, completed_at, error,
+    result IS NOT NULL
 """
 logger = logging.getLogger("kairyu.async_requests.postgres")
 
@@ -65,7 +73,7 @@ _SCHEMA_STATEMENTS = (
         owner TEXT NOT NULL CHECK (owner <> ''),
         endpoint TEXT NOT NULL CHECK (endpoint <> ''),
         body JSONB NOT NULL CHECK (jsonb_typeof(body) = 'object'),
-        priority INTEGER NOT NULL CHECK (priority BETWEEN -100 AND 100),
+        priority BIGINT NOT NULL,
         idempotency_key TEXT,
         intent_fingerprint TEXT NOT NULL,
         metadata JSONB,
@@ -123,15 +131,28 @@ _SCHEMA_STATEMENTS = (
         WHERE idempotency_key IS NOT NULL
     """,
     """
-    CREATE INDEX IF NOT EXISTS async_requests_claimable_idx
+    CREATE INDEX IF NOT EXISTS async_requests_owner_capacity_idx
+        ON async_requests (store_id, owner)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS async_requests_claimable_v2_idx
         ON async_requests (
-            store_id, state, priority DESC, lease_until, created_at, request_id
+            store_id, state, priority, lease_until, created_at, request_id
         )
     """,
     """
     CREATE INDEX IF NOT EXISTS async_requests_deadline_idx
         ON async_requests (store_id, deadline_at, request_id)
         WHERE state IN ('queued', 'claimed', 'running') AND deadline_at IS NOT NULL
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS async_request_owner_deferrals (
+        store_id TEXT NOT NULL
+            REFERENCES async_request_store_registry(store_id) ON DELETE CASCADE,
+        owner TEXT NOT NULL,
+        not_before TIMESTAMPTZ NOT NULL,
+        PRIMARY KEY (store_id, owner)
+    )
     """,
     """
     CREATE TABLE IF NOT EXISTS async_request_claim_audit (
@@ -142,7 +163,7 @@ _SCHEMA_STATEMENTS = (
         fencing_token BIGINT NOT NULL,
         at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
         event TEXT NOT NULL CHECK (
-            event IN ('claim', 'reclaim', 'renew', 'running', 'succeed',
+            event IN ('claim', 'reclaim', 'renew', 'defer', 'running', 'succeed',
                       'fail', 'cancel', 'expire')
         ),
         lease_until TIMESTAMPTZ,
@@ -201,6 +222,8 @@ class PostgresRequestStore:
         *,
         store_id: str,
         connect_timeout_s: float = 10.0,
+        eager_connect: bool = True,
+        max_records_per_owner: int = 64,
     ) -> None:
         if psycopg is None:
             raise RuntimeError(
@@ -212,17 +235,34 @@ class PostgresRequestStore:
             raise ValueError("connect_timeout_s must be finite and greater than zero")
         self._dsn = dsn
         self._connect_timeout = max(1, math.ceil(timeout))
+        if max_records_per_owner <= 0:
+            raise ValueError("max_records_per_owner must be positive")
+        self._max_records_per_owner = max_records_per_owner
         self._lock = threading.RLock()
         self._lease_lock = threading.RLock()
         self._closed = False
-        self._connection = self._connect()
-        try:
-            self._initialize_schema()
-            self._lease_connection = self._connect()
-        except BaseException:
-            self._connection.close()
-            self._closed = True
-            raise
+        self._connection = None
+        self._lease_connection = None
+        if eager_connect:
+            self._open()
+
+    def _open(self) -> None:
+        with self._lock:
+            self._require_open(allow_unstarted=True)
+            if self._connection is not None:
+                return
+            self._connection = self._connect()
+            try:
+                self._initialize_schema()
+                self._lease_connection = self._connect()
+            except BaseException:
+                self._connection.close()
+                self._connection = None
+                raise
+
+    async def startup(self) -> None:
+        """Connect during application startup so failures use lifecycle cleanup."""
+        await asyncio.to_thread(self._open)
 
     @property
     def store_id(self) -> str:
@@ -233,8 +273,10 @@ class PostgresRequestStore:
             with self._lease_lock:
                 if self._closed:
                     return
-                self._lease_connection.close()
-                self._connection.close()
+                if self._lease_connection is not None:
+                    self._lease_connection.close()
+                if self._connection is not None:
+                    self._connection.close()
                 self._closed = True
 
     def __enter__(self) -> Self:
@@ -252,22 +294,36 @@ class PostgresRequestStore:
 
     def _connect(self):
         assert psycopg is not None
+        timeout_ms = self._connect_timeout * 1000
         return psycopg.connect(
             self._dsn,
             autocommit=True,
             connect_timeout=self._connect_timeout,
+            options=(
+                f"-c statement_timeout={timeout_ms} "
+                f"-c lock_timeout={timeout_ms} "
+                f"-c idle_in_transaction_session_timeout={timeout_ms}"
+            ),
+            keepalives=1,
+            keepalives_idle=self._connect_timeout,
+            keepalives_interval=self._connect_timeout,
+            keepalives_count=1,
         )
 
-    def _require_open(self) -> None:
+    def _require_open(self, *, allow_unstarted: bool = False) -> None:
         if self._closed:
             raise RuntimeError("PostgresRequestStore is closed")
+        if not allow_unstarted and self._connection is None:
+            raise RuntimeError("PostgresRequestStore has not started")
 
     def _ensure_general_connection(self) -> None:
+        assert self._connection is not None
         if self._connection.closed or self._connection.broken:
             self._connection.close()
             self._connection = self._connect()
 
     def _ensure_lease_connection(self) -> None:
+        assert self._lease_connection is not None
         if self._lease_connection.closed or self._lease_connection.broken:
             self._lease_connection.close()
             self._lease_connection = self._connect()
@@ -275,6 +331,7 @@ class PostgresRequestStore:
     def _initialize_schema(self) -> None:
         with self._lock:
             self._require_open()
+            assert self._connection is not None
             with self._connection.transaction():
                 with self._connection.cursor() as cursor:
                     cursor.execute("SELECT pg_advisory_xact_lock(%s, %s)", (1_261_587_810, 1))
@@ -314,8 +371,41 @@ class PostgresRequestStore:
             self._ensure_general_connection()
             with self._connection.transaction():
                 with self._connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                        (json.dumps([self._store_id, submission.owner]),),
+                    )
                     cursor.execute("SELECT clock_timestamp()")
                     now = cursor.fetchone()[0]
+                    replay_exists = False
+                    if submission.idempotency_key is not None:
+                        cursor.execute(
+                            """
+                            SELECT EXISTS (
+                                SELECT 1 FROM async_requests
+                                WHERE store_id = %s AND owner = %s
+                                  AND idempotency_key = %s
+                            )
+                            """,
+                            (
+                                self._store_id,
+                                submission.owner,
+                                submission.idempotency_key,
+                            ),
+                        )
+                        replay_exists = bool(cursor.fetchone()[0])
+                    if not replay_exists:
+                        cursor.execute(
+                            """
+                            SELECT count(*) FROM async_requests
+                            WHERE store_id = %s AND owner = %s
+                            """,
+                            (self._store_id, submission.owner),
+                        )
+                        if int(cursor.fetchone()[0]) >= self._max_records_per_owner:
+                            raise RequestCapacityError(
+                                f"owner {submission.owner!r} reached durable request capacity"
+                            )
                     expired = submission.deadline_at is not None and submission.deadline_at <= now
                     state = AsyncRequestState.EXPIRED if expired else AsyncRequestState.QUEUED
                     request = AsyncRequest(
@@ -509,6 +599,161 @@ class PostgresRequestStore:
                             self._try_persist_expiry(cursor, str(row[0]), now=row[15])
                     return requests
 
+    def get_status(
+        self, request_id: str, *, owner: str | None = None
+    ) -> AsyncRequestStatus:
+        """Read one public status without materializing its body or result."""
+        with self._lock:
+            self._require_open()
+            self._ensure_general_connection()
+            with self._connection.transaction():
+                with self._connection.cursor() as cursor:
+                    cursor.execute(
+                        f"""
+                        WITH status_clock AS MATERIALIZED (
+                            SELECT statement_timestamp() AS now
+                        )
+                        SELECT {_STATUS_COLUMNS}, status_clock.now,
+                               state IN ('queued', 'claimed', 'running')
+                                   AND deadline_at <= status_clock.now
+                        FROM async_requests
+                        CROSS JOIN status_clock
+                        WHERE store_id = %s AND request_id = %s
+                          AND (%s::text IS NULL OR owner = %s)
+                        """,
+                        (self._store_id, request_id, owner, owner),
+                    )
+                    row = cursor.fetchone()
+                    if row is None:
+                        raise KeyError(request_id)
+                    logically_expired = bool(row[15])
+                    status = self._status_from_row(
+                        row,
+                        logically_expired=logically_expired,
+                        now=row[14],
+                    )
+                    if logically_expired:
+                        self._try_persist_expiry(cursor, str(row[0]), now=row[14])
+                    return status
+
+    def list_statuses(
+        self,
+        *,
+        owner: str | None = None,
+        state: AsyncRequestState | None = None,
+        limit: int = 20,
+    ) -> list[AsyncRequestStatus]:
+        """List using a narrow SELECT so aggregate payloads stay bounded."""
+        if limit <= 0:
+            raise ValueError("limit must be greater than zero")
+        with self._lock:
+            self._require_open()
+            self._ensure_general_connection()
+            with self._connection.transaction():
+                with self._connection.cursor() as cursor:
+                    self._sweep_expired(cursor, limit=_EXPIRY_SWEEP_LIMIT)
+                    predicates = ["store_id = %s"]
+                    parameters: list[Any] = [self._store_id]
+                    if owner is not None:
+                        predicates.append("owner = %s")
+                        parameters.append(owner)
+                    if state is AsyncRequestState.EXPIRED:
+                        predicates.append(
+                            """
+                            (
+                                state = 'expired'
+                                OR (
+                                    state IN ('queued', 'claimed', 'running')
+                                    AND deadline_at <= list_clock.now
+                                )
+                            )
+                            """
+                        )
+                    elif state in _CLAIM_STATES or state is AsyncRequestState.QUEUED:
+                        assert state is not None
+                        predicates.append("state = %s")
+                        predicates.append(
+                            "(deadline_at IS NULL OR deadline_at > list_clock.now)"
+                        )
+                        parameters.append(state.value)
+                    elif state is not None:
+                        predicates.append("state = %s")
+                        parameters.append(state.value)
+                    parameters.append(limit)
+                    cursor.execute(
+                        f"""
+                        WITH list_clock AS MATERIALIZED (
+                            SELECT statement_timestamp() AS now
+                        )
+                        SELECT {_STATUS_COLUMNS}, list_clock.now,
+                               state IN ('queued', 'claimed', 'running')
+                                   AND deadline_at <= list_clock.now
+                        FROM async_requests
+                        CROSS JOIN list_clock
+                        WHERE {' AND '.join(predicates)}
+                        ORDER BY created_at DESC, request_id DESC
+                        LIMIT %s
+                        """,
+                        parameters,
+                    )
+                    rows = cursor.fetchall()
+                    statuses = [
+                        self._status_from_row(
+                            row,
+                            logically_expired=bool(row[15]),
+                            now=row[14],
+                        )
+                        for row in rows
+                    ]
+                    for row in rows:
+                        if bool(row[15]):
+                            self._try_persist_expiry(cursor, str(row[0]), now=row[14])
+                    return statuses
+
+    def get_result(
+        self, request_id: str, *, owner: str | None = None
+    ) -> tuple[AsyncRequestStatus, dict[str, JsonValue] | None]:
+        """Read status plus result only for a successful terminal row."""
+        with self._lock:
+            self._require_open()
+            self._ensure_general_connection()
+            with self._connection.transaction():
+                with self._connection.cursor() as cursor:
+                    cursor.execute(
+                        f"""
+                        WITH result_clock AS MATERIALIZED (
+                            SELECT statement_timestamp() AS now
+                        )
+                        SELECT {_STATUS_COLUMNS},
+                               CASE WHEN state = 'succeeded' THEN result END,
+                               result_clock.now,
+                               state IN ('queued', 'claimed', 'running')
+                                   AND deadline_at <= result_clock.now
+                        FROM async_requests
+                        CROSS JOIN result_clock
+                        WHERE store_id = %s AND request_id = %s
+                          AND (%s::text IS NULL OR owner = %s)
+                        """,
+                        (self._store_id, request_id, owner, owner),
+                    )
+                    row = cursor.fetchone()
+                    if row is None:
+                        raise KeyError(request_id)
+                    logically_expired = bool(row[16])
+                    status = self._status_from_row(
+                        row,
+                        logically_expired=logically_expired,
+                        now=row[15],
+                    )
+                    if logically_expired:
+                        self._try_persist_expiry(cursor, str(row[0]), now=row[15])
+                    result = (
+                        None
+                        if logically_expired
+                        else _optional_json_object(row[14], name="result")
+                    )
+                    return status, result
+
     def claim_next(self, worker_id: str, *, lease_seconds: float) -> RequestClaim | None:
         worker_id = _validate_identity(worker_id, name="worker_id")
         lease_seconds = _validate_lease_seconds(lease_seconds)
@@ -526,6 +771,12 @@ class PostgresRequestStore:
                             FROM async_requests
                             WHERE store_id = %s
                               AND (deadline_at IS NULL OR deadline_at > clock_timestamp())
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM async_request_owner_deferrals deferral
+                                  WHERE deferral.store_id = async_requests.store_id
+                                    AND deferral.owner = async_requests.owner
+                                    AND deferral.not_before > clock_timestamp()
+                              )
                               AND (
                                   state = 'queued'
                                   OR (
@@ -533,7 +784,7 @@ class PostgresRequestStore:
                                       AND lease_until <= clock_timestamp()
                                   )
                               )
-                            ORDER BY priority DESC, created_at, request_id
+                            ORDER BY priority, created_at, request_id
                             FOR UPDATE SKIP LOCKED
                             LIMIT 1
                             """,
@@ -563,6 +814,12 @@ class PostgresRequestStore:
                                 )
                             WHERE store_id = %s AND request_id = %s
                               AND (deadline_at IS NULL OR deadline_at > clock_timestamp())
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM async_request_owner_deferrals deferral
+                                  WHERE deferral.store_id = async_requests.store_id
+                                    AND deferral.owner = async_requests.owner
+                                    AND deferral.not_before > clock_timestamp()
+                              )
                               AND (
                                   state = 'queued'
                                   OR (
@@ -748,6 +1005,82 @@ class PostgresRequestStore:
         if stale_after_commit:
             raise StaleRequestClaimError(f"request claim for {claim.request_id!r} is stale")
         raise RuntimeError("PostgreSQL running transition produced no result")
+
+    def defer(self, claim: RequestClaim, *, delay_seconds: float) -> AsyncRequest:
+        """Release a fence and cool down its tenant without occupying a consumer."""
+        self._validate_claim_identity(claim)
+        delay_seconds = _validate_lease_seconds(delay_seconds)
+        stale_after_commit = False
+        with self._lease_lock:
+            self._require_open()
+            self._ensure_lease_connection()
+            with self._lease_connection.transaction():
+                with self._lease_connection.cursor() as cursor:
+                    loaded = self._load_claim(cursor, claim)
+                    if loaded is None:
+                        stale_after_commit = True
+                    else:
+                        request, claimed_at, lease_until, now = loaded
+                        cursor.execute(
+                            f"""
+                            UPDATE async_requests
+                            SET state = 'queued', updated_at = %s,
+                                claim_worker = NULL,
+                                fencing_token = fencing_token + 1,
+                                claimed_at = NULL, lease_until = NULL
+                            WHERE store_id = %s AND request_id = %s
+                              AND state IN ('claimed', 'running')
+                              AND claim_worker = %s AND fencing_token = %s
+                              AND lease_until > %s
+                            RETURNING {_REQUEST_COLUMNS}, fencing_token
+                            """,
+                            (
+                                now,
+                                self._store_id,
+                                claim.request_id,
+                                claim.worker_id,
+                                claim.fencing_token,
+                                now,
+                            ),
+                        )
+                        row = cursor.fetchone()
+                        if row is None:
+                            stale_after_commit = True
+                        else:
+                            deferred = self._request_from_row(row)
+                            next_token = int(row[15])
+                            cursor.execute(
+                                """
+                                INSERT INTO async_request_owner_deferrals (
+                                    store_id, owner, not_before
+                                ) VALUES (
+                                    %s, %s, %s + (%s * interval '1 second')
+                                )
+                                ON CONFLICT (store_id, owner) DO UPDATE
+                                SET not_before = GREATEST(
+                                    async_request_owner_deferrals.not_before,
+                                    EXCLUDED.not_before
+                                )
+                                """,
+                                (self._store_id, request.owner, now, delay_seconds),
+                            )
+                            self._audit(
+                                cursor,
+                                request_id=request.id,
+                                worker_id=claim.worker_id,
+                                fencing_token=next_token,
+                                event="defer",
+                                at=now,
+                                lease_until=None,
+                                details={
+                                    "previous_claimed_at": claimed_at.isoformat(),
+                                    "previous_lease_until": lease_until.isoformat(),
+                                },
+                            )
+                            return deferred
+        if stale_after_commit:
+            raise StaleRequestClaimError(f"request claim for {claim.request_id!r} is stale")
+        raise RuntimeError("PostgreSQL defer transition produced no result")
 
     def succeed(self, claim: RequestClaim, result: dict[str, JsonValue]) -> AsyncRequest:
         return self._finish(
@@ -1330,6 +1663,35 @@ class PostgresRequestStore:
             error=_optional_json_object(row[14], name="error"),
         )
 
+    def _status_from_row(
+        self,
+        row: Any,
+        *,
+        logically_expired: bool = False,
+        now: datetime | None = None,
+    ) -> AsyncRequestStatus:
+        state = AsyncRequestState.EXPIRED if logically_expired else AsyncRequestState(str(row[6]))
+        return AsyncRequestStatus(
+            id=str(row[0]),
+            owner=str(row[1]),
+            endpoint=str(row[2]),
+            priority=int(row[3]),
+            idempotency_key=row[4],
+            metadata=_optional_json_object(row[5], name="metadata"),
+            state=state,
+            attempt=int(row[7]),
+            created_at=row[8],
+            updated_at=now if logically_expired else row[9],
+            deadline_at=row[10],
+            completed_at=now if logically_expired else row[11],
+            error=(
+                None
+                if logically_expired
+                else _optional_json_object(row[12], name="error")
+            ),
+            has_result=False if logically_expired else bool(row[13]),
+        )
+
     def _validate_claim_identity(self, claim: RequestClaim) -> None:
         if claim.store_id != self._store_id:
             raise ValueError(
@@ -1347,7 +1709,7 @@ class PostgresRequestStore:
         worker_id: str | None,
         fencing_token: int,
         event: Literal[
-            "claim", "reclaim", "renew", "running", "succeed", "fail", "cancel", "expire"
+            "claim", "reclaim", "renew", "defer", "running", "succeed", "fail", "cancel", "expire"
         ],
         lease_until: datetime | None,
         at: datetime | None = None,

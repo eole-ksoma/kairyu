@@ -91,15 +91,26 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 - Frontier full-checkpoint 262K/1M correctness/performance evidence, DeepSeek EP4/EP8 topology lock, CUDA Graph pointer stability, MTP/DSpark selection, 30-minute soak, and failure recovery remain open
 - NVLink-profile gates blocked on H100/A100-class hardware; PCIe-switch chassis and ≥400 Gb/s RDMA NICs gate E4/E5
 - G6 remaining P-C gates still in progress
-- AsyncRequest v1 has a backend-neutral lifecycle plus PostgreSQL DB-clock
-  leases/fencing; public API/worker wiring and multi-gateway failover evidence
-  remain open.
+- AsyncRequest v1 has a PostgreSQL-backed non-streaming Chat API, tenant-scoped
+  state/result/cancel routes, and a lease-fenced worker; multi-gateway failover
+  evidence and queue telemetry remain open.
 - Human sign-off pending on M2–M4 design reviews
 
 ## Change Log
 
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
+
+### 2026-09-08 — [progress] AsyncRequest API and chat worker
+- What: added tenant-scoped async Chat submission/status/result/cancel, bounded
+  persisted bodies, fixed lease-renewing workers, shared chat validation and
+  admission/metering, cancellation abort, and DeploymentSpec/lifespan wiring.
+  Review hardening keeps status/list projections body-free, derives queue
+  priority from tenant policy, bounds per-tenant queue growth, defers transient
+  quota pressure without starving other tenants, shortens heartbeats at
+  deadlines, and defers PostgreSQL connect to lifespan.
+- Refs: m10 A38; kairyu/async_requests/worker.py;
+  kairyu/entrypoints/server/async_request_routes.py; async_requests deployment
 
 ### 2026-09-07 — [progress] PostgreSQL AsyncRequest persistence
 - What: added the production RequestStore schema and backend with tenant-scoped

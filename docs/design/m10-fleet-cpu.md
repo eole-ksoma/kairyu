@@ -1152,7 +1152,8 @@ online learning or the M4 request-family bandit.
   Request bodies and results are restricted to JSON values so every backend can
   preserve the same contract. Idempotency keys are scoped by tenant. An exact replay returns the existing
   request, while the same key with different normalized intent fails as a
-  conflict. Claim selection is deterministic: descending priority, then creation
+  conflict. Claim selection is deterministic: ascending signed-int64 priority
+  (vLLM-compatible smaller values run first), then creation
   time and request ID. Deadlines and cancellation invalidate current claims.
   The process-local in-memory backend is only the executable reference contract;
   it is not an HA or durable deployment option. The production backend remains
@@ -1182,3 +1183,48 @@ online learning or the M4 request-family bandit.
   from starving worker heartbeats inside one process. The retained integration
   suite runs against the CI-pinned PostgreSQL image and verifies cross-instance
   races; Redis remains outside this consistency boundary.
+
+- **A38 (2026-09-08)**: the durable request transport is an additive,
+  non-streaming Chat Completions path. `POST /v1/async/chat/completions` stores
+  the authenticated tenant and validated JSON intent, returns 202 with stable
+  status/result/cancel URLs, and accepts `Idempotency-Key`,
+  and `X-Kairyu-Deadline-At`. Queue priority comes only from authenticated
+  tenant policy; untrusted callers cannot raise global queue position.
+  Tenant-scoped `GET /v1/requests`, status, result, and cancel routes return 404
+  across tenant boundaries. Pending result reads return 202; only a fenced
+  successful terminal row returns the stored Chat Completion result. Direct
+  streaming remains on `/v1/chat/completions`; `stream=true` is rejected before
+  queue insertion.
+
+  Receipt, list, and status responses are bounded projections and never return
+  persisted request or result bodies. Async control routes establish identity
+  without consuming inference RPM; submissions use an independent per-tenant
+  RPM bucket plus a hard per-tenant stored-record allocation to bound queue and
+  retained-state growth, and the worker owns the single inference
+  request-quota admission. Lease takeover remains at-least-once for usage metering even
+  though fenced publication is single-winner; request-ID-idempotent accounting
+  is a later extension.
+
+  Transient tenant RPM, token-balance, and in-flight rejection is queue pressure,
+  not a terminal request failure: a fenced defer returns the request to queued
+  state and persists a short owner-wide cooldown so other tenants remain
+  claimable. Bounds larger than the tenant token burst are terminal because no
+  refill can make them admissible.
+
+  `AsyncRequestWorker` uses a fixed consumer pool over the shared store. Each
+  direct served model traverses the same chat validation, backend preparation,
+  tool-choice checks, tenant admission/reservation, metering, and usage boundary
+  as other background chat work, with the tenant's trusted batch scheduling
+  priority. A dedicated heartbeat renews the database lease during validation,
+  SLO-pressure waiting, and inference. Local cancellation aborts the backend
+  task immediately; remote cancellation is observed through renewal failure,
+  and all publication remains fenced. Shutdown stops new dispatch, aborts local
+  active work, leaves unfinished claims for lease-based takeover, then closes
+  the store. Orchestrated/AUTO and Responses async inputs remain later API
+  extensions; v1 accepts direct publicly served Chat models only.
+
+  Deployment enables the surface only with an `async_requests` section and a
+  preflighted PostgreSQL DSN. It owns worker concurrency, polling, lease length,
+  store identity, and an independent persisted-body byte cap (8 MiB by default).
+  Request IDs are collapsed in metric route labels; high-cardinality IDs remain
+  in request state and logs rather than Prometheus labels.

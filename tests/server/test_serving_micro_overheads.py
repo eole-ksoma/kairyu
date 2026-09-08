@@ -13,6 +13,14 @@ from kairyu.entrypoints.server.middleware import (
 def test_metrics_path_template_cache_is_bounded() -> None:
     _template_path.cache_clear()
     try:
+        assert (
+            _template_path("/v1/requests/req-0123456789abcdef01234567")
+            == "/v1/requests/{id}"
+        )
+        assert (
+            _template_path("/v1/requests/attacker-random/result")
+            == "/v1/requests/{id}/result"
+        )
         paths = [f"/v1/files/file-{index:04d}" for index in range(1025)]
         for path in paths:
             assert _template_path(path) == "/v1/files/{id}"

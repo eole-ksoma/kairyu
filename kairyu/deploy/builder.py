@@ -615,6 +615,14 @@ def build_app_from_spec(
             raise ValueError(
                 f"batch PostgreSQL DSN environment variable {spec.batch.dsn_env!r} is not set"
             )
+    async_request_postgres_dsn: str | None = None
+    if spec.async_requests is not None:
+        async_request_postgres_dsn = os.environ.get(spec.async_requests.dsn_env)
+        if not async_request_postgres_dsn:
+            raise ValueError(
+                "async request PostgreSQL DSN environment variable "
+                f"{spec.async_requests.dsn_env!r} is not set"
+            )
     # Chat policy is metadata-only and deliberately resolves before any
     # embedding/engine constructor can allocate model or GPU resources.
     chat_policy = _resolve_chat_policy(spec, base_dir)
@@ -861,8 +869,8 @@ def build_app_from_spec(
         if public_models is None or name in public_models
     )
 
-    workers: list[BatchWorker] = []  # filled after create_app (worker needs app metrics)
-    batch_stores: list[object] = []
+    workers: list[object] = []  # filled after create_app (workers need app metrics)
+    owned_stores: list[object] = []
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -889,7 +897,7 @@ def build_app_from_spec(
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
             shutdown_errors: list[Exception] = []
-            for store in batch_stores:
+            for store in owned_stores:
                 close = getattr(store, "close", None)
                 if callable(close):
                     try:
@@ -934,6 +942,11 @@ def build_app_from_spec(
         runtime_engines=engines,
         runtime_embedding_backends=embedding_backends,
         runtime_orchestrators=all_orchestrators,
+        async_request_body_limit=(
+            spec.async_requests.max_body_bytes
+            if spec.async_requests is not None
+            else None
+        ),
     )
     app.state.deployment_spec = spec
     app.state.probers = tuple(probers)
@@ -961,7 +974,7 @@ def build_app_from_spec(
             assert spec.batch.data_dir is not None
             store = BatchStore(spec.batch.data_dir)
             store.recover_orphans()
-        batch_stores.append(store)
+        owned_stores.append(store)
         worker = BatchWorker(
             store,
             engines,
@@ -980,6 +993,40 @@ def build_app_from_spec(
         add_batch_routes(app, store, worker)
         app.state.batch_store = store
         app.state.batch_worker = worker
+    if spec.async_requests is not None:
+        from kairyu.async_requests.postgres_store import PostgresRequestStore
+        from kairyu.async_requests.worker import AsyncRequestWorker
+        from kairyu.entrypoints.server.async_request_routes import (
+            add_async_request_routes,
+        )
+
+        assert async_request_postgres_dsn is not None
+        request_store = PostgresRequestStore(
+            async_request_postgres_dsn,
+            store_id=spec.async_requests.store_id,
+            eager_connect=False,
+            max_records_per_owner=spec.async_requests.max_records_per_tenant,
+        )
+        owned_stores.append(request_store)
+        startup_resources.append(request_store)
+        request_worker = AsyncRequestWorker(
+            request_store,
+            served_engines,
+            max_concurrency=spec.async_requests.max_concurrency,
+            poll_interval_s=spec.async_requests.poll_interval_s,
+            lease_seconds=spec.async_requests.lease_seconds,
+            metrics=app.state.metrics,
+            chat_templates=served_chat_templates,
+            legacy_chat_models=served_legacy_chat_models,
+            usage_ledger=getattr(app.state, "usage_ledger", None),
+            tenant_limiter=getattr(app.state, "tenant_limiter", None),
+            tenant_config=tenant_config,
+            admission_controller=app.state.slo_admission,
+        )
+        workers.append(request_worker)
+        add_async_request_routes(app, request_store, request_worker)
+        app.state.async_request_store = request_store
+        app.state.async_request_worker = request_worker
     return app
 
 

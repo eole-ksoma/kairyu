@@ -1903,6 +1903,7 @@ def create_app(
     runtime_engines: Mapping[str, EngineBackend] | None = None,
     runtime_embedding_backends: Mapping[str, EmbeddingBackend] | None = None,
     runtime_orchestrators: Mapping[str, Orchestrator] | None = None,
+    async_request_body_limit: int | None = None,
 ) -> FastAPI:
     settings = settings or ServerSettings()
     legacy_chat_models = frozenset(legacy_chat_models or ())
@@ -2034,6 +2035,12 @@ def create_app(
 
     # add_middleware prepends, so add innermost first: metrics -> concurrency
     # guard -> auth -> access log (outermost).
+    if async_request_body_limit is not None:
+        app.add_middleware(
+            ChatBodyLimitMiddleware,
+            limit=async_request_body_limit,
+            paths=("/v1/async/chat/completions",),
+        )
     if settings.max_chat_body_bytes is not None:
         app.add_middleware(
             ChatBodyLimitMiddleware,

@@ -14,6 +14,7 @@ from kairyu.async_requests import (
     IdempotencyConflictError,
     InMemoryRequestStore,
     InvalidRequestTransitionError,
+    RequestCapacityError,
     RequestStoreProtocol,
     StaleRequestClaimError,
 )
@@ -88,6 +89,17 @@ def test_idempotency_is_owner_scoped_and_rejects_payload_conflicts(
         )
 
 
+def test_owner_record_capacity_is_bounded_but_allows_idempotent_replay() -> None:
+    bounded = InMemoryRequestStore(max_records_per_owner=1)
+    intent = submission(idempotency_key="stable")
+    first = bounded.submit(intent)
+
+    assert bounded.submit(intent) == first
+    with pytest.raises(RequestCapacityError):
+        bounded.submit(submission())
+    assert bounded.submit(submission(owner="tenant-b")).owner == "tenant-b"
+
+
 def test_store_state_is_isolated_from_nested_input_and_output_mutation(
     store: InMemoryRequestStore,
 ) -> None:
@@ -129,8 +141,8 @@ def test_concurrent_idempotent_submit_and_claim_have_single_winner(
 def test_claim_orders_by_priority_then_age_and_completes_once(
     store: InMemoryRequestStore,
 ) -> None:
-    low = store.submit(submission(priority=0))
-    high = store.submit(submission(priority=10))
+    high = store.submit(submission(priority=0))
+    low = store.submit(submission(priority=10))
 
     claim = store.claim_next("worker-a", lease_seconds=30)
     assert claim is not None
@@ -308,6 +320,13 @@ def test_failed_request_carries_only_structured_error(store: InMemoryRequestStor
     assert failed.result is None
     assert failed.error is not None
     assert failed.error.retryable is True
+
+
+def test_public_error_fields_are_size_bounded() -> None:
+    with pytest.raises(ValidationError):
+        AsyncRequestError(code="x" * 129, message="bounded")
+    with pytest.raises(ValidationError):
+        AsyncRequestError(code="bounded", message="x" * 1025)
 
 
 def test_non_json_input_and_result_are_rejected(store: InMemoryRequestStore) -> None:

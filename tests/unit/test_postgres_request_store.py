@@ -15,10 +15,13 @@ from kairyu.async_requests import (
     AsyncRequestState,
     AsyncRequestSubmission,
     IdempotencyConflictError,
+    RequestCapacityError,
     RequestStoreProtocol,
     StaleRequestClaimError,
 )
 from kairyu.async_requests.postgres_store import PostgresRequestStore
+from kairyu.async_requests.worker import AsyncRequestWorker
+from kairyu.engine.mock import MockBackend
 
 _POSTGRES_DSN = os.environ.get("KAIRYU_TEST_POSTGRES_DSN")
 pytestmark = pytest.mark.postgres
@@ -35,8 +38,8 @@ def store_factory():
     store_id = f"pytest-requests-{uuid.uuid4().hex}"
     stores: list[PostgresRequestStore] = []
 
-    def create() -> PostgresRequestStore:
-        store = PostgresRequestStore(_POSTGRES_DSN, store_id=store_id)
+    def create(**kwargs) -> PostgresRequestStore:
+        store = PostgresRequestStore(_POSTGRES_DSN, store_id=store_id, **kwargs)
         stores.append(store)
         return store
 
@@ -95,6 +98,52 @@ def test_cross_instance_idempotency_tenant_scope_and_listing(store_factory) -> N
     assert other_owner.id != request.id
     assert [item.id for item in first.list(owner="tenant-a")] == [request.id]
     assert [item.id for item in first.list(owner="tenant-b")] == [other_owner.id]
+    status = first.get_status(request.id, owner="tenant-a")
+    assert status.id == request.id
+    assert status.has_result is False
+    assert "body" not in status.model_dump()
+    listed_statuses = first.list_statuses(owner="tenant-a")
+    assert [item.id for item in listed_statuses] == [request.id]
+    assert all("result" not in item.model_dump() for item in listed_statuses)
+    pending_status, pending_result = first.get_result(request.id, owner="tenant-a")
+    assert pending_status.state is AsyncRequestState.QUEUED
+    assert pending_result is None
+
+
+def test_cross_instance_owner_capacity_is_atomic_and_replays_survive_limit(
+    store_factory,
+) -> None:
+    create, _store_id = store_factory
+    first = create(max_records_per_owner=1)
+    second = create(max_records_per_owner=1)
+    intent = submission(idempotency_key="one")
+    created = first.submit(intent)
+
+    assert second.submit(intent) == created
+    with pytest.raises(RequestCapacityError):
+        second.submit(submission())
+    assert second.submit(submission(owner="tenant-b")).owner == "tenant-b"
+
+
+def test_defer_cools_down_owner_and_allows_another_tenant_to_claim(
+    store_factory,
+) -> None:
+    create, _store_id = store_factory
+    store = create()
+    blocked = store.submit(submission(owner="tenant-a", priority=0))
+    runnable = store.submit(submission(owner="tenant-b", priority=1))
+    claim = store.claim_next("worker-a", lease_seconds=30)
+    assert claim is not None
+    assert claim.request_id == blocked.id
+    store.mark_running(claim)
+
+    deferred = store.defer(claim, delay_seconds=30)
+    next_claim = store.claim_next("worker-b", lease_seconds=30)
+
+    assert deferred.state is AsyncRequestState.QUEUED
+    assert next_claim is not None
+    assert next_claim.request_id == runnable.id
+    assert "defer" in [row["event"] for row in store.export_claim_audit(blocked.id)]
 
 
 def test_cross_instance_claim_is_atomic_and_terminal_publication_is_fenced(
@@ -310,7 +359,7 @@ def test_locked_due_request_does_not_block_other_tenants(store_factory) -> None:
 
 def test_list_projects_and_persists_deadlines_beyond_sweeper_batch(store_factory) -> None:
     create, store_id = store_factory
-    store = create()
+    store = create(max_records_per_owner=200)
     requests = [
         store.submit(
             submission(
@@ -441,3 +490,33 @@ def test_cancel_and_success_race_commits_only_one_terminal_state(store_factory) 
         if row["event"] in {"succeed", "cancel"}
     ]
     assert len(terminal_events) == 1
+
+
+async def test_async_worker_renews_and_publishes_through_postgres(store_factory) -> None:
+    create, _store_id = store_factory
+    store = create()
+    backend = MockBackend(responses={"hello": "postgres result"}, latency_s=0.25)
+    worker = AsyncRequestWorker(
+        store,
+        {"m": backend},
+        lease_seconds=0.15,
+        legacy_chat_models={"m"},
+    )
+    request = store.submit(
+        submission(
+            body={
+                "model": "m",
+                "messages": [{"role": "user", "content": "hello"}],
+            }
+        )
+    )
+
+    assert await worker.process_next() is True
+    completed = store.get(request.id)
+    assert completed.state is AsyncRequestState.SUCCEEDED
+    assert completed.result is not None
+    assert completed.result["choices"][0]["message"]["content"] == "postgres result"
+    events = [row["event"] for row in store.export_claim_audit(request.id)]
+    assert events[:2] == ["claim", "running"]
+    assert events[-1] == "succeed"
+    assert "renew" in events[2:-1]

@@ -20,8 +20,10 @@ from kairyu.async_requests.models import (
     AsyncRequest,
     AsyncRequestError,
     AsyncRequestState,
+    AsyncRequestStatus,
     AsyncRequestSubmission,
     RequestClaim,
+    status_of,
 )
 
 
@@ -35,6 +37,10 @@ class InvalidRequestTransitionError(RuntimeError):
 
 class StaleRequestClaimError(RuntimeError):
     """A worker no longer owns the fenced request lease."""
+
+
+class RequestCapacityError(RuntimeError):
+    """A tenant reached its bounded durable-record allocation."""
 
 
 @runtime_checkable
@@ -53,9 +59,27 @@ class RequestStoreProtocol(Protocol):
         limit: int = 20,
     ) -> list[AsyncRequest]: ...
 
+    def get_status(
+        self, request_id: str, *, owner: str | None = None
+    ) -> AsyncRequestStatus: ...
+
+    def list_statuses(
+        self,
+        *,
+        owner: str | None = None,
+        state: AsyncRequestState | None = None,
+        limit: int = 20,
+    ) -> list[AsyncRequestStatus]: ...
+
+    def get_result(
+        self, request_id: str, *, owner: str | None = None
+    ) -> tuple[AsyncRequestStatus, dict[str, JsonValue] | None]: ...
+
     def claim_next(self, worker_id: str, *, lease_seconds: float) -> RequestClaim | None: ...
 
     def renew_claim(self, claim: RequestClaim, *, lease_seconds: float) -> RequestClaim: ...
+
+    def defer(self, claim: RequestClaim, *, delay_seconds: float) -> AsyncRequest: ...
 
     def mark_running(self, claim: RequestClaim) -> AsyncRequest: ...
 
@@ -88,15 +112,20 @@ class InMemoryRequestStore:
         store_id: str = "memory",
         clock: Callable[[], datetime] | None = None,
         id_factory: Callable[[], str] | None = None,
+        max_records_per_owner: int = 64,
     ) -> None:
         if not store_id.strip() or "\x00" in store_id:
             raise ValueError("store_id must be a non-empty string without NUL")
         self._store_id = store_id
         self._clock = clock or (lambda: datetime.now(UTC))
         self._id_factory = id_factory or (lambda: f"req-{uuid.uuid4().hex[:24]}")
+        if max_records_per_owner <= 0:
+            raise ValueError("max_records_per_owner must be positive")
+        self._max_records_per_owner = max_records_per_owner
         self._requests: dict[str, AsyncRequest] = {}
         self._leases: dict[str, _Lease] = {}
         self._fencing_tokens: dict[str, int] = {}
+        self._owner_not_before: dict[str, datetime] = {}
         self._idempotency: dict[tuple[str, str], tuple[str, str]] = {}
         self._lock = threading.RLock()
 
@@ -120,6 +149,15 @@ class InMemoryRequestStore:
                             "idempotency key was already used with different request data"
                         )
                     return self._copy(self._requests[request_id])
+
+            owner_records = sum(
+                request.owner == submission.owner
+                for request in self._requests.values()
+            )
+            if owner_records >= self._max_records_per_owner:
+                raise RequestCapacityError(
+                    f"owner {submission.owner!r} reached durable request capacity"
+                )
 
             request_id = self._id_factory()
             if request_id in self._requests:
@@ -178,6 +216,45 @@ class InMemoryRequestStore:
             )
             return [self._copy(request) for request in ordered[:limit]]
 
+    def get_status(
+        self, request_id: str, *, owner: str | None = None
+    ) -> AsyncRequestStatus:
+        with self._lock:
+            self._expire_due(self._now())
+            return status_of(self._load(request_id, owner=owner))
+
+    def list_statuses(
+        self,
+        *,
+        owner: str | None = None,
+        state: AsyncRequestState | None = None,
+        limit: int = 20,
+    ) -> list[AsyncRequestStatus]:
+        if limit <= 0:
+            raise ValueError("limit must be greater than zero")
+        with self._lock:
+            self._expire_due(self._now())
+            requests = (
+                request
+                for request in self._requests.values()
+                if (owner is None or request.owner == owner)
+                and (state is None or request.state is state)
+            )
+            ordered = sorted(
+                requests,
+                key=lambda request: (request.created_at, request.id),
+                reverse=True,
+            )
+            return [status_of(request) for request in ordered[:limit]]
+
+    def get_result(
+        self, request_id: str, *, owner: str | None = None
+    ) -> tuple[AsyncRequestStatus, dict[str, JsonValue] | None]:
+        with self._lock:
+            self._expire_due(self._now())
+            request = self._load(request_id, owner=owner)
+            return status_of(request), deepcopy(request.result)
+
     def claim_next(self, worker_id: str, *, lease_seconds: float) -> RequestClaim | None:
         self._validate_worker(worker_id)
         lease_seconds = self._validate_lease_seconds(lease_seconds)
@@ -187,17 +264,23 @@ class InMemoryRequestStore:
             candidates = [
                 request
                 for request in self._requests.values()
-                if request.state is AsyncRequestState.QUEUED
-                or (
-                    request.state in {AsyncRequestState.CLAIMED, AsyncRequestState.RUNNING}
-                    and self._leases[request.id].lease_until <= now
+                if self._owner_not_before.get(request.owner, now) <= now
+                and (
+                    request.state is AsyncRequestState.QUEUED
+                    or (
+                        request.state in {
+                            AsyncRequestState.CLAIMED,
+                            AsyncRequestState.RUNNING,
+                        }
+                        and self._leases[request.id].lease_until <= now
+                    )
                 )
             ]
             if not candidates:
                 return None
             request = min(
                 candidates,
-                key=lambda item: (-item.priority, item.created_at, item.id),
+                key=lambda item: (item.priority, item.created_at, item.id),
             )
             token = self._fencing_tokens[request.id] + 1
             claimed = request.model_copy(
@@ -230,6 +313,24 @@ class InMemoryRequestStore:
             )
             self._leases[request.id] = renewed
             return self._claim(request, renewed)
+
+    def defer(self, claim: RequestClaim, *, delay_seconds: float) -> AsyncRequest:
+        delay_seconds = self._validate_lease_seconds(delay_seconds)
+        with self._lock:
+            now = self._now()
+            request, _lease = self._validate_claim(claim, now=now)
+            deferred = request.model_copy(
+                update={"state": AsyncRequestState.QUEUED, "updated_at": now},
+                deep=True,
+            )
+            self._requests[request.id] = deferred
+            self._leases.pop(request.id, None)
+            self._fencing_tokens[request.id] += 1
+            self._owner_not_before[request.owner] = max(
+                self._owner_not_before.get(request.owner, now),
+                now + timedelta(seconds=delay_seconds),
+            )
+            return self._copy(deferred)
 
     def mark_running(self, claim: RequestClaim) -> AsyncRequest:
         with self._lock:

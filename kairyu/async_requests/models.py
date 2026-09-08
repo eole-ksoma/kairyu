@@ -62,8 +62,8 @@ class AsyncRequestError(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    code: str
-    message: str
+    code: str = Field(max_length=128)
+    message: str = Field(max_length=1024)
     retryable: bool = False
 
     @field_validator("code", "message")
@@ -80,7 +80,7 @@ class AsyncRequestSubmission(BaseModel):
     owner: str = "default"
     endpoint: str
     body: dict[str, JsonValue]
-    priority: int = Field(default=0, ge=-100, le=100)
+    priority: int = Field(default=0, ge=-(2**63), le=2**63 - 1)
     idempotency_key: str | None = Field(default=None, max_length=255)
     metadata: dict[str, str] | None = None
     deadline_at: datetime | None = None
@@ -121,7 +121,7 @@ class AsyncRequest(BaseModel):
     owner: str
     endpoint: str
     body: dict[str, JsonValue]
-    priority: int = Field(ge=-100, le=100)
+    priority: int = Field(ge=-(2**63), le=2**63 - 1)
     idempotency_key: str | None = None
     metadata: dict[str, str] | None = None
     state: AsyncRequestState
@@ -173,6 +173,61 @@ class AsyncRequest(BaseModel):
         elif self.completed_at is not None:
             raise ValueError("non-terminal requests cannot set completed_at")
         return self
+
+
+class AsyncRequestStatus(BaseModel):
+    """Bounded public projection that never exposes persisted input or output."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: str
+    object: Literal["async.request"] = "async.request"
+    owner: str
+    endpoint: str
+    priority: int = Field(ge=-(2**63), le=2**63 - 1)
+    idempotency_key: str | None = None
+    metadata: dict[str, str] | None = None
+    state: AsyncRequestState
+    attempt: int = Field(default=0, ge=0)
+    created_at: datetime
+    updated_at: datetime
+    deadline_at: datetime | None = None
+    completed_at: datetime | None = None
+    error: AsyncRequestError | None = None
+    has_result: bool = False
+
+    @field_validator("id", "owner", "endpoint")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _non_empty(value, name=info.field_name)
+
+    @field_validator("created_at", "updated_at", "deadline_at", "completed_at")
+    @classmethod
+    def validate_timestamp(cls, value: datetime | None, info) -> datetime | None:
+        if value is None:
+            return None
+        return _aware(value, name=info.field_name)
+
+
+def status_of(request: AsyncRequest) -> AsyncRequestStatus:
+    """Create the public, size-bounded status view of a full store record."""
+
+    return AsyncRequestStatus(
+        id=request.id,
+        owner=request.owner,
+        endpoint=request.endpoint,
+        priority=request.priority,
+        idempotency_key=request.idempotency_key,
+        metadata=request.metadata,
+        state=request.state,
+        attempt=request.attempt,
+        created_at=request.created_at,
+        updated_at=request.updated_at,
+        deadline_at=request.deadline_at,
+        completed_at=request.completed_at,
+        error=request.error,
+        has_result=request.result is not None,
+    ).model_copy(deep=True)
 
 
 class RequestClaim(BaseModel):

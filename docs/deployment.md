@@ -366,6 +366,65 @@ tokens; a process-local submit signal only wakes the local poller. After an
 owner crash, inference may run again, but only the current fenced claimant may
 publish the terminal job and output.
 
+Durable asynchronous Chat Completions use a separate request state machine and
+PostgreSQL schema; they do not reuse Batch jobs or file objects:
+
+```yaml
+async_requests:
+  dsn_env: KAIRYU_ASYNC_REQUEST_POSTGRES_DSN
+  store_id: production
+  max_concurrency: 8
+  max_body_bytes: 8388608
+  max_records_per_tenant: 64
+  poll_interval_s: 0.5
+  lease_seconds: 30
+```
+
+`POST /v1/async/chat/completions` accepts the normal non-streaming Chat body.
+Optional `Idempotency-Key`, `X-Kairyu-Deadline-At` (timezone-aware ISO 8601),
+headers control durable submission. Queue ordering uses the authenticated
+tenant's trusted `batch_priority`; clients cannot raise their global queue
+position. A 202 receipt links to tenant-scoped status, result, and cancel
+routes under `/v1/requests/{id}`; list filtering uses `state` and `limit` query
+parameters. Receipt, list, and status projections omit persisted input and
+output bodies. Pending result reads return 202 with `Retry-After`, successful reads
+return the stored Chat Completion, and other terminal states return 409. The
+configured body cap applies even when the direct Chat body limit is disabled.
+Async control-plane calls are authenticated and tenant-scoped. Submission uses
+a separate per-tenant RPM bucket to bound durable queue growth, status polling
+does not drain inference quota, and the worker charges inference RPM once when
+execution starts.
+`max_records_per_tenant` is a hard durable allocation: idempotent replays remain
+available at the limit, while new records return 429 until an operator removes
+retained terminal records. Automated retention/purge is a following slice.
+At the default 8 MiB input cap this bounds persisted input to roughly 512 MiB
+per tenant; size the PostgreSQL volume/quota for the configured tenant count,
+results, indexes, and audit history.
+
+Set `KAIRYU_ASYNC_REQUEST_WORKER_ID` to the immutable gateway Pod UID when it is
+available. Workers renew database-clock leases while waiting or executing, use
+fencing for terminal publication, and run only publicly served direct Chat
+models in v1. Local cancellation aborts generation immediately; another
+gateway observes cancellation no later than its next heartbeat. AUTO
+orchestration, Responses inputs, retention/purge, and Redis wake-up hints remain
+separate later extensions.
+
+PostgreSQL connect, statement, lock, idle-transaction, and TCP keepalive waits
+are bounded; worker shutdown also has a bounded drain before forced task
+cancellation. Successful result JSON encoding is offloaded from the gateway
+event loop.
+
+Temporary tenant request, token, or in-flight pressure returns the request to
+the queue behind a durable tenant cooldown rather than making it terminal or
+occupying a worker slot. This allows another tenant to claim work immediately.
+A request whose token bound can never fit the tenant burst fails terminally as
+a configuration/request mismatch.
+
+Execution is at-least-once across lease takeover. Fencing prevents stale result
+publication, but usage metering is not yet exactly-once; a takeover after an old
+worker records usage can duplicate accounting. A future ledger schema should
+use the request ID as an idempotency key.
+
 The formal F5b GPU check is
 `verification/fleet/resilience/noisy_neighbor_gpu_bench.py --assert-gate`.
 It compares 10x offered noisy traffic against bracketed compliant-neighbor

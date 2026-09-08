@@ -465,12 +465,19 @@ class InMemoryRequestStore:
         """Return aggregate queue state without exposing owner or payload data."""
         with self._lock:
             now = self._now()
-            self._expire_due(now)
             state_counts = {state: 0 for state in AsyncRequestState}
             oldest_created_at: datetime | None = None
             for request in self._requests.values():
-                state_counts[request.state] += 1
-                if request.state is AsyncRequestState.QUEUED and (
+                logically_expired = (
+                    request.state not in TERMINAL_REQUEST_STATES
+                    and request.deadline_at is not None
+                    and request.deadline_at <= now
+                )
+                effective_state = (
+                    AsyncRequestState.EXPIRED if logically_expired else request.state
+                )
+                state_counts[effective_state] += 1
+                if effective_state is AsyncRequestState.QUEUED and (
                     oldest_created_at is None
                     or request.created_at < oldest_created_at
                 ):

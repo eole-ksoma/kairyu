@@ -798,6 +798,24 @@ is not C7/F1b acceptance evidence.
   (kairyu_async_request_metrics_snapshot_success) == 0`. During a failed
   refresh the shared series retain that gateway's last good snapshot. Scrape
   every gateway and replica.
+
+  A new empty AsyncRequest store activates sharded telemetry automatically.
+  For a store containing requests or audit history, deploy the compatible code
+  first; telemetry reports snapshot health `0` until the one-time backfill.
+  Drain AsyncRequest writers, then run:
+
+  ```bash
+  python scripts/async_request_metrics_migration.py \
+    --store-id "$STORE_ID" --mode backfill \
+    --maintenance-window-confirmed
+  ```
+
+  The DSN is read from `KAIRYU_ASYNC_REQUEST_POSTGRES_DSN`. During a mixed
+  rollout an existing legacy trigger remains available to old Pods while the
+  new, separately named trigger writes 64 sharded counters. After every store
+  is backfilled and all old Pods are gone, run the same command with
+  `--mode finalize-legacy` to remove the legacy single-row writer. Neither
+  operation runs automatically during normal Pod startup.
 - With a versioned `pricing:` section, `/admin/usage.csv` snapshots the local
   immutable ledger and exports tenant charges for a `[start_ts,end_ts)` period.
   The CSV carries source SHA-256, price-sheet version, Decimal unit rates,

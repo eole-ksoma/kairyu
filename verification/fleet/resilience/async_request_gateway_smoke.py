@@ -623,10 +623,12 @@ class Smoke:
         )
 
     def shared_queue_telemetry(self) -> None:
+        deadline = time.monotonic() + self._timeout_seconds
         snapshots: dict[str, str] = {}
-        for gateway_id in GATEWAY_IDS:
-            deadline = time.monotonic() + self._timeout_seconds
-            while time.monotonic() < deadline:
+        selected: dict[str, tuple[str, ...]] = {}
+        while time.monotonic() < deadline:
+            snapshots = {}
+            for gateway_id in GATEWAY_IDS:
                 text = self._request("GET", "/metrics", gateway_id=gateway_id).text
                 if (
                     metric_value(
@@ -637,24 +639,21 @@ class Smoke:
                     == 1
                 ):
                     snapshots[gateway_id] = text
+            if len(snapshots) == len(GATEWAY_IDS):
+                selected = {
+                    gateway_id: tuple(
+                        sorted(
+                            line
+                            for line in text.splitlines()
+                            if line.startswith("kairyu_async_request_")
+                        )
+                    )
+                    for gateway_id, text in snapshots.items()
+                }
+                if len(set(selected.values())) == 1:
                     break
-                time.sleep(0.2)
-            else:
-                raise AssertionError(
-                    f"gateway {gateway_id} did not recover shared-store metrics"
-                )
-
-        selected = {
-            gateway_id: tuple(
-                sorted(
-                    line
-                    for line in text.splitlines()
-                    if line.startswith("kairyu_async_request_")
-                )
-            )
-            for gateway_id, text in snapshots.items()
-        }
-        if len(set(selected.values())) != 1:
+            time.sleep(0.2)
+        else:
             raise AssertionError("gateways exposed inconsistent shared queue metrics")
 
         reference = snapshots["a"]

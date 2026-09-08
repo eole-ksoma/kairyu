@@ -213,9 +213,13 @@ _SCHEMA_STATEMENTS = (
                       'cancelled', 'expired')
         ),
         shard SMALLINT NOT NULL CHECK (shard >= 0 AND shard < 64),
-        total BIGINT NOT NULL DEFAULT 0 CHECK (total >= 0),
+        total BIGINT NOT NULL DEFAULT 0,
         PRIMARY KEY (store_id, state, shard)
     )
+    """,
+    """
+    ALTER TABLE async_request_state_shards
+        DROP CONSTRAINT IF EXISTS async_request_state_shards_total_check
     """,
     """
     CREATE TABLE IF NOT EXISTS async_request_metric_migrations (
@@ -227,24 +231,35 @@ _SCHEMA_STATEMENTS = (
     )
     """,
     """
-    CREATE INDEX IF NOT EXISTS async_requests_oldest_queued_idx
-        ON async_requests (store_id, created_at, request_id)
-        WHERE state = 'queued'
-    """,
-    """
-    CREATE OR REPLACE FUNCTION increment_async_request_metric_total()
+    CREATE OR REPLACE FUNCTION increment_async_request_metric_shard()
     RETURNS TRIGGER
     LANGUAGE plpgsql
     AS $$
+    DECLARE
+        metric_shard SMALLINT;
     BEGIN
+        IF NOT EXISTS (
+            SELECT 1
+            FROM async_request_metric_migrations
+            WHERE store_id = NEW.store_id AND migration = 'sharded-v1'
+        ) THEN
+            RETURN NEW;
+        END IF;
+        metric_shard := mod(
+            txid_current() & 9223372036854775807,
+            64
+        );
+        PERFORM pg_advisory_xact_lock(
+            hashtextextended(
+                'kairyu-async-event:' || NEW.store_id || ':' || metric_shard::text,
+                0
+            )
+        );
         INSERT INTO async_request_metric_shards (store_id, event, shard, total)
         VALUES (
             NEW.store_id,
             NEW.event,
-            mod(
-                hashtextextended(NEW.request_id, 0) & 9223372036854775807,
-                64
-            )::smallint,
+            metric_shard,
             1
         )
         ON CONFLICT (store_id, event, shard)
@@ -258,14 +273,14 @@ _SCHEMA_STATEMENTS = (
     BEGIN
         IF NOT EXISTS (
             SELECT 1 FROM pg_trigger
-            WHERE tgname = 'async_request_claim_audit_metric_total'
+            WHERE tgname = 'async_request_claim_audit_metric_shard'
               AND tgrelid = 'async_request_claim_audit'::regclass
               AND NOT tgisinternal
         ) THEN
-            CREATE TRIGGER async_request_claim_audit_metric_total
+            CREATE TRIGGER async_request_claim_audit_metric_shard
             AFTER INSERT ON async_request_claim_audit
             FOR EACH ROW
-            EXECUTE FUNCTION increment_async_request_metric_total();
+            EXECUTE FUNCTION increment_async_request_metric_shard();
         END IF;
     END;
     $$
@@ -277,27 +292,45 @@ _SCHEMA_STATEMENTS = (
     AS $$
     DECLARE
         metric_shard SMALLINT;
+        target_store_id TEXT;
     BEGIN
+        target_store_id := CASE WHEN TG_OP = 'DELETE' THEN OLD.store_id ELSE NEW.store_id END;
+        IF NOT EXISTS (
+            SELECT 1
+            FROM async_request_metric_migrations
+            WHERE store_id = target_store_id AND migration = 'sharded-v1'
+        ) THEN
+            RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+        END IF;
         metric_shard := mod(
-            hashtextextended(NEW.request_id, 0) & 9223372036854775807,
+            txid_current() & 9223372036854775807,
             64
+        );
+        -- Every state delta in one transaction uses one shard and one advisory
+        -- lock. Reverse transitions and multi-row deletes/sweeps therefore
+        -- cannot acquire counter rows in a cyclic order. Individual signed
+        -- shard deltas may be negative; their durable sum is non-negative.
+        PERFORM pg_advisory_xact_lock(
+            hashtextextended(
+                'kairyu-async-state:' || target_store_id || ':' || metric_shard::text,
+                0
+            )
         );
         IF TG_OP = 'INSERT' THEN
             INSERT INTO async_request_state_shards (store_id, state, shard, total)
             VALUES (NEW.store_id, NEW.state, metric_shard, 1)
             ON CONFLICT (store_id, state, shard)
             DO UPDATE SET total = async_request_state_shards.total + 1;
+        ELSIF TG_OP = 'DELETE' THEN
+            INSERT INTO async_request_state_shards (store_id, state, shard, total)
+            VALUES (OLD.store_id, OLD.state, metric_shard, -1)
+            ON CONFLICT (store_id, state, shard)
+            DO UPDATE SET total = async_request_state_shards.total - 1;
         ELSIF NEW.state IS DISTINCT FROM OLD.state THEN
-            UPDATE async_request_state_shards
-            SET total = total - 1
-            WHERE store_id = OLD.store_id
-              AND state = OLD.state
-              AND shard = metric_shard
-              AND total > 0;
-            IF NOT FOUND THEN
-                RAISE EXCEPTION 'missing async request state counter for %/%/%',
-                    OLD.store_id, OLD.state, metric_shard;
-            END IF;
+            INSERT INTO async_request_state_shards (store_id, state, shard, total)
+            VALUES (OLD.store_id, OLD.state, metric_shard, -1)
+            ON CONFLICT (store_id, state, shard)
+            DO UPDATE SET total = async_request_state_shards.total - 1;
             INSERT INTO async_request_state_shards (store_id, state, shard, total)
             VALUES (NEW.store_id, NEW.state, metric_shard, 1)
             ON CONFLICT (store_id, state, shard)
@@ -317,7 +350,7 @@ _SCHEMA_STATEMENTS = (
               AND NOT tgisinternal
         ) THEN
             CREATE TRIGGER async_request_state_shard
-            AFTER INSERT OR UPDATE OF state ON async_requests
+            AFTER INSERT OR UPDATE OF state OR DELETE ON async_requests
             FOR EACH ROW
             EXECUTE FUNCTION maintain_async_request_state_shard();
         END IF;
@@ -405,7 +438,6 @@ class PostgresRequestStore:
             try:
                 self._initialize_schema()
                 self._lease_connection = self._connect()
-                self._metrics_connection = self._connect()
             except BaseException:
                 if self._lease_connection is not None:
                     self._lease_connection.close()
@@ -486,8 +518,9 @@ class PostgresRequestStore:
             self._lease_connection = self._connect()
 
     def _ensure_metrics_connection(self) -> None:
-        assert self._metrics_connection is not None
-        if self._metrics_connection.closed or self._metrics_connection.broken:
+        if self._metrics_connection is None:
+            self._metrics_connection = self._connect()
+        elif self._metrics_connection.closed or self._metrics_connection.broken:
             self._metrics_connection.close()
             self._metrics_connection = self._connect()
 
@@ -508,85 +541,26 @@ class PostgresRequestStore:
                         """,
                         (self._store_id, _SCHEMA_VERSION),
                     )
+                    # A brand-new store is safe to activate immediately. Existing
+                    # stores require the explicit maintenance migration below;
+                    # normal Pod startup must never lock and scan live history.
                     cursor.execute(
                         """
-                        SELECT EXISTS (
+                        INSERT INTO async_request_metric_migrations (
+                            store_id, migration
+                        )
+                        SELECT %s, 'sharded-v1'
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM async_requests WHERE store_id = %s
+                        ) AND NOT EXISTS (
                             SELECT 1
-                            FROM async_request_metric_migrations
-                            WHERE store_id = %s AND migration = 'sharded-v1'
-                        )
-                        """,
-                        (self._store_id,),
-                    )
-                    if not bool(cursor.fetchone()[0]):
-                        # These locks close the otherwise unavoidable race between
-                        # the historical snapshot and old writers that only know
-                        # about the audit/request tables. This runs once per store;
-                        # the durable marker makes all later starts constant-time.
-                        cursor.execute(
-                            "LOCK TABLE async_request_claim_audit "
-                            "IN SHARE ROW EXCLUSIVE MODE"
-                        )
-                        cursor.execute(
-                            "LOCK TABLE async_requests IN SHARE ROW EXCLUSIVE MODE"
-                        )
-                        cursor.execute("SET LOCAL statement_timeout = 0")
-                        cursor.execute(
-                            "DELETE FROM async_request_metric_shards WHERE store_id = %s",
-                            (self._store_id,),
-                        )
-                        cursor.execute(
-                            """
-                            INSERT INTO async_request_metric_shards (
-                                store_id, event, shard, total
-                            )
-                            SELECT
-                                store_id,
-                                event,
-                                mod(
-                                    hashtextextended(request_id, 0)
-                                        & 9223372036854775807,
-                                    %s
-                                )::smallint,
-                                count(*)
                             FROM async_request_claim_audit
                             WHERE store_id = %s
-                            GROUP BY store_id, event, 3
-                            """,
-                            (_METRIC_SHARDS, self._store_id),
                         )
-                        cursor.execute(
-                            "DELETE FROM async_request_state_shards WHERE store_id = %s",
-                            (self._store_id,),
-                        )
-                        cursor.execute(
-                            """
-                            INSERT INTO async_request_state_shards (
-                                store_id, state, shard, total
-                            )
-                            SELECT
-                                store_id,
-                                state,
-                                mod(
-                                    hashtextextended(request_id, 0)
-                                        & 9223372036854775807,
-                                    %s
-                                )::smallint,
-                                count(*)
-                            FROM async_requests
-                            WHERE store_id = %s
-                            GROUP BY store_id, state, 3
-                            """,
-                            (_METRIC_SHARDS, self._store_id),
-                        )
-                        cursor.execute(
-                            """
-                            INSERT INTO async_request_metric_migrations (
-                                store_id, migration
-                            ) VALUES (%s, 'sharded-v1')
-                            """,
-                            (self._store_id,),
-                        )
+                        ON CONFLICT (store_id, migration) DO NOTHING
+                        """,
+                        (self._store_id, self._store_id, self._store_id),
+                    )
                     cursor.execute(
                         """
                         SELECT schema_version
@@ -603,6 +577,124 @@ class PostgresRequestStore:
                             f"store_id {self._store_id!r}: expected "
                             f"{_SCHEMA_VERSION}, got {observed!r}"
                         )
+
+    def migrate_metrics_during_maintenance(self) -> None:
+        """Backfill telemetry for an existing store during a write outage.
+
+        This deliberately never runs from normal Pod startup. Operators must
+        drain writers first; the table locks also protect against an accidental
+        concurrent old-version writer and make the baseline exact.
+        """
+        with self._lock:
+            self._require_open()
+            self._ensure_general_connection()
+            with self._connection.transaction():
+                with self._connection.cursor() as cursor:
+                    cursor.execute("SET LOCAL statement_timeout = 0")
+                    cursor.execute(
+                        "LOCK TABLE async_request_claim_audit "
+                        "IN SHARE ROW EXCLUSIVE MODE"
+                    )
+                    cursor.execute(
+                        "LOCK TABLE async_requests IN SHARE ROW EXCLUSIVE MODE"
+                    )
+                    cursor.execute(
+                        "DELETE FROM async_request_metric_migrations "
+                        "WHERE store_id = %s AND migration = 'sharded-v1'",
+                        (self._store_id,),
+                    )
+                    cursor.execute(
+                        "DELETE FROM async_request_metric_shards WHERE store_id = %s",
+                        (self._store_id,),
+                    )
+                    cursor.execute(
+                        """
+                        INSERT INTO async_request_metric_shards (
+                            store_id, event, shard, total
+                        )
+                        SELECT
+                            store_id,
+                            event,
+                            mod(
+                                hashtextextended(request_id, 0)
+                                    & 9223372036854775807,
+                                %s
+                            )::smallint,
+                            count(*)
+                        FROM async_request_claim_audit
+                        WHERE store_id = %s
+                        GROUP BY store_id, event, 3
+                        """,
+                        (_METRIC_SHARDS, self._store_id),
+                    )
+                    cursor.execute(
+                        "DELETE FROM async_request_state_shards WHERE store_id = %s",
+                        (self._store_id,),
+                    )
+                    cursor.execute(
+                        """
+                        INSERT INTO async_request_state_shards (
+                            store_id, state, shard, total
+                        )
+                        SELECT
+                            store_id,
+                            state,
+                            mod(
+                                hashtextextended(request_id, 0)
+                                    & 9223372036854775807,
+                                %s
+                            )::smallint,
+                            count(*)
+                        FROM async_requests
+                        WHERE store_id = %s
+                        GROUP BY store_id, state, 3
+                        """,
+                        (_METRIC_SHARDS, self._store_id),
+                    )
+                    cursor.execute(
+                        """
+                        INSERT INTO async_request_metric_migrations (
+                            store_id, migration
+                        ) VALUES (%s, 'sharded-v1')
+                        """,
+                        (self._store_id,),
+                    )
+
+    def finalize_legacy_metric_trigger_after_rollout(self) -> None:
+        """Remove the old hot-row writer after every store and Pod is upgraded."""
+        with self._lock:
+            self._require_open()
+            self._ensure_general_connection()
+            with self._connection.transaction():
+                with self._connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT pg_advisory_xact_lock(%s, %s)",
+                        (1_261_587_810, 2),
+                    )
+                    cursor.execute(
+                        """
+                        SELECT store_id
+                        FROM async_request_store_registry AS registry
+                        WHERE NOT EXISTS (
+                            SELECT 1
+                            FROM async_request_metric_migrations AS migration
+                            WHERE migration.store_id = registry.store_id
+                              AND migration.migration = 'sharded-v1'
+                        )
+                        LIMIT 1
+                        """
+                    )
+                    row = cursor.fetchone()
+                    if row is not None:
+                        raise RuntimeError(
+                            "cannot finalize legacy telemetry before every store "
+                            f"is migrated; missing {row[0]!r}"
+                        )
+                    cursor.execute(
+                        "DROP TRIGGER IF EXISTS "
+                        "async_request_claim_audit_metric_total "
+                        "ON async_request_claim_audit"
+                    )
 
     def submit(self, submission: AsyncRequestSubmission) -> AsyncRequest:
         submission = submission.model_copy(deep=True)
@@ -776,6 +868,25 @@ class PostgresRequestStore:
             with self._metrics_connection.transaction():
                 with self._metrics_connection.cursor() as cursor:
                     cursor.execute(
+                        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+                    )
+                    cursor.execute(
+                        """
+                        SELECT transaction_timestamp(), EXISTS (
+                            SELECT 1
+                            FROM async_request_metric_migrations
+                            WHERE store_id = %s AND migration = 'sharded-v1'
+                        )
+                        """,
+                        (self._store_id,),
+                    )
+                    metric_now, migrated = cursor.fetchone()
+                    if not bool(migrated):
+                        raise RuntimeError(
+                            "async request telemetry requires the explicit "
+                            "maintenance migration"
+                        )
+                    cursor.execute(
                         """
                         SELECT state, sum(total)
                         FROM async_request_state_shards
@@ -798,10 +909,10 @@ class PostgresRequestStore:
                         FROM async_requests
                         WHERE store_id = %s
                           AND state IN ('queued', 'claimed', 'running')
-                          AND deadline_at <= statement_timestamp()
+                          AND deadline_at <= %s
                         GROUP BY state
                         """,
-                        (self._store_id,),
+                        (self._store_id, metric_now),
                     )
                     projected_expired = 0
                     for state_value, count in cursor.fetchall():
@@ -831,7 +942,7 @@ class PostgresRequestStore:
                         SELECT COALESCE(
                             GREATEST(
                                 EXTRACT(
-                                    EPOCH FROM statement_timestamp() - created_at
+                                    EPOCH FROM %s - created_at
                                 ),
                                 0
                             ),
@@ -842,12 +953,12 @@ class PostgresRequestStore:
                           AND state = 'queued'
                           AND (
                               deadline_at IS NULL
-                              OR deadline_at > statement_timestamp()
+                              OR deadline_at > %s
                           )
                         ORDER BY created_at, request_id
                         LIMIT 1
                         """,
-                        (self._store_id,),
+                        (metric_now, self._store_id, metric_now),
                     )
                     oldest_row = cursor.fetchone()
                     oldest_queued_age_seconds = (

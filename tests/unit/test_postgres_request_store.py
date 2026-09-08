@@ -165,7 +165,7 @@ def test_metrics_snapshot_is_shared_aggregate_and_totals_are_durable(
     assert after_restart.transition_counts["running"] == 1
 
 
-def test_metrics_totals_backfill_existing_audit_on_startup(store_factory) -> None:
+def test_metrics_totals_backfill_requires_explicit_maintenance(store_factory) -> None:
     create, store_id = store_factory
     first = create()
     first.submit(submission())
@@ -189,7 +189,56 @@ def test_metrics_totals_backfill_existing_audit_on_startup(store_factory) -> Non
 
     restarted = create()
 
+    with pytest.raises(RuntimeError, match="maintenance migration"):
+        restarted.metrics_snapshot()
+    restarted.migrate_metrics_during_maintenance()
     assert restarted.metrics_snapshot().transition_counts["claim"] == 1
+
+
+def test_unmigrated_store_transitions_remain_available(store_factory) -> None:
+    create, store_id = store_factory
+    first = create()
+    request = first.submit(submission())
+    assert psycopg is not None
+    with psycopg.connect(_POSTGRES_DSN, autocommit=True) as connection:
+        connection.execute(
+            "DELETE FROM async_request_metric_migrations WHERE store_id = %s",
+            (store_id,),
+        )
+        connection.execute(
+            "DELETE FROM async_request_metric_shards WHERE store_id = %s",
+            (store_id,),
+        )
+        connection.execute(
+            "DELETE FROM async_request_state_shards WHERE store_id = %s",
+            (store_id,),
+        )
+
+    claim = first.claim_next("worker-a", lease_seconds=30)
+    assert claim is not None
+    assert claim.request_id == request.id
+    first.mark_running(claim)
+    first.cancel(request.id)
+    first.migrate_metrics_during_maintenance()
+    snapshot = first.metrics_snapshot()
+    assert snapshot.state_counts[AsyncRequestState.CANCELLED] == 1
+    assert snapshot.transition_counts["cancel"] == 1
+
+
+def test_request_delete_decrements_state_metrics(store_factory) -> None:
+    create, store_id = store_factory
+    store = create()
+    request = store.submit(submission())
+    assert store.metrics_snapshot().queue_depth == 1
+
+    assert psycopg is not None
+    with psycopg.connect(_POSTGRES_DSN, autocommit=True) as connection:
+        connection.execute(
+            "DELETE FROM async_requests WHERE store_id = %s AND request_id = %s",
+            (store_id, request.id),
+        )
+
+    assert store.metrics_snapshot().queue_depth == 0
 
 
 def test_cross_instance_owner_capacity_is_atomic_and_replays_survive_limit(
@@ -529,6 +578,8 @@ def test_closed_connections_are_reestablished(store_factory) -> None:
     claim = store.claim_next("worker-a", lease_seconds=30)
     assert claim is not None
     assert claim.request_id == request.id
+    assert store._metrics_connection is None
+    assert store.metrics_snapshot().transition_counts["claim"] == 1
     store._metrics_connection.close()
     assert store.metrics_snapshot().transition_counts["claim"] == 1
 
@@ -557,6 +608,68 @@ def test_metric_updates_are_sharded_across_request_ids(store_factory) -> None:
     assert int(row[0]) > 1
     assert int(row[1]) == 32
     assert store.metrics_snapshot().transition_counts["claim"] == 32
+
+
+def test_new_schema_preserves_legacy_counter_during_rolling_upgrade(
+    store_factory,
+) -> None:
+    create, store_id = store_factory
+    first = create()
+    assert psycopg is not None
+    with psycopg.connect(_POSTGRES_DSN, autocommit=True) as connection:
+        connection.execute(
+            "DROP TRIGGER IF EXISTS async_request_claim_audit_metric_total "
+            "ON async_request_claim_audit"
+        )
+        connection.execute(
+            """
+            CREATE OR REPLACE FUNCTION increment_async_request_metric_total()
+            RETURNS TRIGGER
+            LANGUAGE plpgsql
+            AS $$
+            BEGIN
+                INSERT INTO async_request_metric_totals (store_id, event, total)
+                VALUES (NEW.store_id, NEW.event, 1)
+                ON CONFLICT (store_id, event)
+                DO UPDATE SET total = async_request_metric_totals.total + 1;
+                RETURN NEW;
+            END;
+            $$
+            """
+        )
+        connection.execute(
+            """
+            CREATE TRIGGER async_request_claim_audit_metric_total
+            AFTER INSERT ON async_request_claim_audit
+            FOR EACH ROW
+            EXECUTE FUNCTION increment_async_request_metric_total()
+            """
+        )
+    try:
+        first.submit(submission(owner="tenant-a"))
+        assert first.claim_next("worker-a", lease_seconds=30) is not None
+        second = create()
+        second.submit(submission(owner="tenant-b"))
+        assert second.claim_next("worker-b", lease_seconds=30) is not None
+
+        with psycopg.connect(_POSTGRES_DSN, autocommit=True) as connection:
+            legacy_total = connection.execute(
+                """
+                SELECT total
+                FROM async_request_metric_totals
+                WHERE store_id = %s AND event = 'claim'
+                """,
+                (store_id,),
+            ).fetchone()
+        assert legacy_total is not None
+        assert int(legacy_total[0]) == 2
+        assert second.metrics_snapshot().transition_counts["claim"] == 2
+    finally:
+        with psycopg.connect(_POSTGRES_DSN, autocommit=True) as connection:
+            connection.execute(
+                "DROP TRIGGER IF EXISTS async_request_claim_audit_metric_total "
+                "ON async_request_claim_audit"
+            )
 
 
 def test_cancel_and_success_race_commits_only_one_terminal_state(store_factory) -> None:

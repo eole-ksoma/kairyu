@@ -93,7 +93,7 @@ def test_metrics_snapshot_reports_bounded_queue_state_and_transitions(
     }
 
 
-def test_metrics_snapshot_materializes_due_deadlines(
+def test_metrics_snapshot_projects_due_deadlines_without_transition_side_effect(
     store: InMemoryRequestStore,
     clock: Clock,
 ) -> None:
@@ -104,6 +104,11 @@ def test_metrics_snapshot_materializes_due_deadlines(
 
     assert snapshot.queue_depth == 0
     assert snapshot.state_counts[AsyncRequestState.EXPIRED] == 1
+    assert snapshot.transition_counts["expire"] == 0
+
+    request_id = store.list()[0].id
+    assert store.get(request_id).state is AsyncRequestState.EXPIRED
+    snapshot = store.metrics_snapshot()
     assert snapshot.transition_counts["expire"] == 1
 
 

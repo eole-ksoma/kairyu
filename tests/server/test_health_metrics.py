@@ -263,6 +263,35 @@ def test_async_store_metrics_fail_open_and_retain_last_good_snapshot() -> None:
     assert 'kairyu_async_request_metrics_snapshot_success{store="durable"} 0.0' in degraded
 
 
+def test_blocking_async_store_warms_only_on_first_render() -> None:
+    from kairyu.async_requests import RequestQueueMetricsSnapshot
+
+    class _Store:
+        store_id = "durable"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def metrics_snapshot(self):
+            self.calls += 1
+            return RequestQueueMetricsSnapshot(
+                state_counts={AsyncRequestState.QUEUED: 2},
+                oldest_queued_age_seconds=4.0,
+                transition_counts={},
+            )
+
+    store = _Store()
+    metrics = ServerMetrics()
+    metrics.track_async_request_store(store)
+    assert store.calls == 0
+
+    rendered = metrics.render()[0].decode()
+
+    assert store.calls == 1
+    assert 'kairyu_async_request_queue_depth{store="durable"} 2.0' in rendered
+    assert 'kairyu_async_request_metrics_snapshot_success{store="durable"} 1.0' in rendered
+
+
 def test_metrics_exposes_live_cuda_graph_eager_fallback_counter() -> None:
     class _GraphEngine:
         @staticmethod

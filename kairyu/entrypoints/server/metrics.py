@@ -50,9 +50,9 @@ _PREPLACEMENT_PHASES = frozenset(
 class _AsyncRequestStoreCollector:
     """Fail-open cached view over shared durable request stores.
 
-    Blocking backends refresh outside both the ASGI event loop and the scrape
-    path. A scrape only schedules at most one bounded-frequency refresh and
-    returns the last completed snapshot.
+    Blocking backends perform their first warmup in the metrics worker thread,
+    after application startup, then refresh in the background at a bounded
+    frequency. The ASGI event loop never performs the store query.
     """
 
     _REFRESH_INTERVAL_S = 1.0
@@ -63,6 +63,7 @@ class _AsyncRequestStoreCollector:
         self._snapshot_ok: dict[str, bool] = {}
         self._last_refresh_started: dict[str, float] = {}
         self._refreshing: set[str] = set()
+        self._attempted: set[str] = set()
         self._lock = threading.RLock()
 
     def add(self, store: object) -> None:
@@ -72,10 +73,6 @@ class _AsyncRequestStoreCollector:
             with self._lock:
                 self._stores[store_id] = store
                 self._snapshot_ok.setdefault(store_id, False)
-            if bool(getattr(store, "metrics_snapshot_nonblocking", False)):
-                self._refresh(store_id, store)
-            else:
-                self._schedule_refresh(store_id, store, force=True)
 
     def _refresh(self, store_id: str, store: object) -> None:
         try:
@@ -111,6 +108,7 @@ class _AsyncRequestStoreCollector:
             ):
                 return
             self._refreshing.add(store_id)
+            self._attempted.add(store_id)
             self._last_refresh_started[store_id] = now
         threading.Thread(
             target=self._refresh,
@@ -182,7 +180,16 @@ class _AsyncRequestStoreCollector:
             if bool(getattr(store, "metrics_snapshot_nonblocking", False)):
                 self._refresh(store_id, store)
             else:
-                self._schedule_refresh(store_id, store)
+                with self._lock:
+                    first_refresh = store_id not in self._attempted
+                    if first_refresh:
+                        self._attempted.add(store_id)
+                        self._refreshing.add(store_id)
+                        self._last_refresh_started[store_id] = time.monotonic()
+                if first_refresh:
+                    self._refresh(store_id, store)
+                else:
+                    self._schedule_refresh(store_id, store)
             with self._lock:
                 snapshot_ok = self._snapshot_ok.get(store_id, False)
                 snapshot = self._last_good.get(store_id, self._empty_snapshot())

@@ -425,6 +425,28 @@ publication, but usage metering is not yet exactly-once; a takeover after an old
 worker records usage can duplicate accounting. A future ledger schema should
 use the request ID as an idempotency key.
 
+The first deployment gate is CPU-only and reuses the disposable F1c kind
+topology (three independently restartable gateways and one shared PostgreSQL):
+
+```bash
+bash scripts/kind_async_request_gate.sh
+```
+
+It runs the existing F1c shared-store gate before checking cross-gateway
+idempotency and reads, remote cancellation, deadline expiry, a concurrent
+768 KiB submit and responsiveness probe, lease-fenced takeover after killing
+the active owner, and persistence plus new work after a PostgreSQL process
+restart. Use `--keep-cluster` only for inspection; the default collects the
+report, claim audit, Kubernetes state/events, and service logs before bounded
+cluster cleanup. Evidence is written below
+`bench/results/async-request-kind-live/`, which is an ignored local directory.
+
+This is the per-slice functional gate. Multi-tenant fairness is exercised when
+the tenant-policy slice is integrated; GPU model correctness, peak/soak load,
+and performance acceptance remain end-of-plan integration gates. This ordering
+finds distributed lifecycle defects early without repeatedly paying for GPU
+runs while the control plane is still changing.
+
 The formal F5b GPU check is
 `verification/fleet/resilience/noisy_neighbor_gpu_bench.py --assert-gate`.
 It compares 10x offered noisy traffic against bracketed compliant-neighbor

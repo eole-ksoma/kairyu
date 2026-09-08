@@ -62,7 +62,21 @@ protocol with shared durable storage and database-clock leases.
   inference quota charge, owner-wide durable admission deferrals,
   deadline-aware heartbeats, and sanitized error logs.
 
+## Task 6 — Staged deployment validation
+
+- [x] Extend the disposable F1c topology with a deliberately slow direct mock
+  model and the AsyncRequest PostgreSQL configuration on all three gateways.
+- [x] Add a CPU/kind smoke driver for cross-gateway idempotency and reads,
+  cancellation, deadline expiry, bounded large-body responsiveness, fenced
+  owner takeover, and PostgreSQL restart/reconnection.
+- [x] Compose the smoke after the existing binding F1c gate, require one clean
+  source commit, refuse pre-existing clusters, and clean up by default.
+- [ ] Run the committed CPU/kind gate and retain its local report.
+- [ ] Run multi-tenant fairness with the tenant-policy integration slice.
+- [ ] Run GPU correctness, performance, and soak gates after the planned
+  implementation slices are complete.
+
 ## Following production slices
 
-- [ ] Redis wake-up hints, queue-age/admission metrics, and multi-gateway failover
-  drills. Redis must not become the source of truth.
+- [ ] Redis wake-up hints and queue-age/admission metrics. Redis must not become
+  the source of truth.

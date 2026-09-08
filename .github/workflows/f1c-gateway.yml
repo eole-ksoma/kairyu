@@ -1,4 +1,4 @@
-name: F1c three-gateway shared BatchStore
+name: F1c three-gateway shared stores
 
 on:
   pull_request:
@@ -6,8 +6,10 @@ on:
       - ".github/workflows/f1c-gateway.yml"
       - "scripts/install_kind_tools.sh"
       - "scripts/kind_gateway_gate.sh"
+      - "scripts/kind_async_request_gate.sh"
       - "deploy/kind/f1c/**"
       - "deploy/kind/f1a/mock/**"
+      - "verification/fleet/resilience/async_request_gateway_smoke.py"
       - "verification/fleet/resilience/fleet_gateway_bench.py"
       - "kairyu/**"
       - ".dockerignore"
@@ -28,6 +30,7 @@ jobs:
     timeout-minutes: 30
     env:
       F1C_RESULTS_DIR: bench/results/f1c-three-gateway-live
+      ASYNC_REQUEST_RESULTS_DIR: bench/results/async-request-kind-live
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -43,14 +46,16 @@ jobs:
           KIND_VERSION: v0.32.0
           KUBECTL_VERSION: v1.36.3
         run: bash scripts/install_kind_tools.sh
-      - name: Run the F1c Kubernetes integration test
+      - name: Run the F1c and AsyncRequest Kubernetes integration tests
         shell: bash
-        run: bash scripts/kind_gateway_gate.sh
+        run: bash scripts/kind_async_request_gate.sh
       - name: Upload raw evidence and offline replay
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: f1c-three-gateway-${{ github.run_id }}
-          path: bench/results/f1c-three-gateway-live
+          path: |
+            bench/results/f1c-three-gateway-live
+            bench/results/async-request-kind-live
           if-no-files-found: error
           retention-days: 30

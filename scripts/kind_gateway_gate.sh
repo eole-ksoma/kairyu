@@ -312,8 +312,7 @@ for digest in \
   fi
 done
 
-mapfile -t existing_clusters < <("$KIND" get clusters)
-for existing in "${existing_clusters[@]}"; do
+while IFS= read -r existing; do
   if [[ "$existing" == "$CLUSTER_NAME" ]]; then
     if ((REFUSE_EXISTING_CLUSTER == 1)); then
       echo "kind cluster ${CLUSTER_NAME} already exists" >&2
@@ -324,7 +323,7 @@ for existing in "${existing_clusters[@]}"; do
     CLUSTER_MAY_EXIST=0
     break
   fi
-done
+done < <("$KIND" get clusters)
 
 CLUSTER_MAY_EXIST=1
 "$KIND" create cluster \
@@ -335,7 +334,10 @@ CLUSTER_CREATED=1
 "$KIND" load docker-image \
   "$GATEWAY_IMAGE" "$MOCK_IMAGE" "$POSTGRES_LOAD_IMAGE" \
   --name "$CLUSTER_NAME"
-mapfile -t kind_nodes < <("$KIND" get nodes --name "$CLUSTER_NAME")
+kind_nodes=()
+while IFS= read -r kind_node; do
+  kind_nodes+=("$kind_node")
+done < <("$KIND" get nodes --name "$CLUSTER_NAME")
 if ((${#kind_nodes[@]} != 1)); then
   echo "expected one F1c kind node, found ${#kind_nodes[@]}" >&2
   exit 1

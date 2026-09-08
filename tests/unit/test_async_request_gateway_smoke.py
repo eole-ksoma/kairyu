@@ -89,5 +89,8 @@ def test_wrapper_preserves_preexisting_cluster_and_runs_foundation_first():
     assert script.index(foundation) < script.index(smoke)
     assert "another F1c/AsyncRequest kind gate owns" in foundation_script
     assert "if ((REFUSE_EXISTING_CLUSTER == 1))" in foundation_script
+    assert "mapfile" not in foundation_script
+    assert 'done < <("$KIND" get clusters)' in foundation_script
+    assert 'done < <("$KIND" get nodes --name "$CLUSTER_NAME")' in foundation_script
     assert 'run_bounded 120s "$KIND" delete cluster' in script
     assert "claim-audit.jsonl" in script

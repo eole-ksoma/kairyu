@@ -670,11 +670,13 @@ class PostgresRequestStore:
             with self._connection.cursor() as cursor:
                 cursor.execute("SET statement_timeout = 0")
                 cursor.execute("SET lock_timeout = 0")
-                cursor.execute(
-                    "SELECT pg_advisory_lock(%s, %s)",
-                    (1_261_587_810, 4),
-                )
+                lock_acquired = False
                 try:
+                    cursor.execute(
+                        "SELECT pg_advisory_lock(%s, %s)",
+                        (1_261_587_810, 4),
+                    )
+                    lock_acquired = True
                     cursor.execute(
                         """
                         SELECT index.indisvalid
@@ -701,10 +703,11 @@ class PostgresRequestStore:
                         """
                     )
                 finally:
-                    cursor.execute(
-                        "SELECT pg_advisory_unlock(%s, %s)",
-                        (1_261_587_810, 4),
-                    )
+                    if lock_acquired:
+                        cursor.execute(
+                            "SELECT pg_advisory_unlock(%s, %s)",
+                            (1_261_587_810, 4),
+                        )
                     timeout_ms = self._connect_timeout * 1000
                     cursor.execute(f"SET statement_timeout = {timeout_ms}")
                     cursor.execute(f"SET lock_timeout = {timeout_ms}")

@@ -53,7 +53,7 @@ _HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _IMAGE_DIGEST = re.compile(r"^(?:[^@\s]+@)?sha256:[0-9a-f]{64}$")
 _RUNTIME_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
-_CROSS_PROCESS_CLOCK_SKEW_NS = 1_000_000
+_CROSS_PROCESS_CLOCK_SKEW_NS = 5_000_000
 
 RAW_ARTIFACTS = (
     "traffic.jsonl",

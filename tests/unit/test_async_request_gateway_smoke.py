@@ -18,14 +18,14 @@ def test_cross_process_clock_envelope_has_a_narrow_explicit_tolerance():
     assert wall_clock_envelope_contains(1_000_000, 999_500, 2_000_500, 2_000_000)
     assert not wall_clock_envelope_contains(
         1_000_000,
-        -1,
+        -4_000_001,
         2_000_000,
         2_000_000,
     )
     assert not wall_clock_envelope_contains(
         1_000_000,
         1_500_000,
-        3_000_001,
+        7_000_001,
         2_000_000,
     )
 

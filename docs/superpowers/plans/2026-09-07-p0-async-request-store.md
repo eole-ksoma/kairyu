@@ -71,7 +71,10 @@ protocol with shared durable storage and database-clock leases.
   owner takeover, and PostgreSQL restart/reconnection.
 - [x] Compose the smoke after the existing binding F1c gate, require one clean
   source commit, refuse pre-existing clusters, and clean up by default.
-- [ ] Run the committed CPU/kind gate and retain its local report.
+- [x] Run the committed CPU/kind gate from source
+  `9e74a910ae64a3c042dea2edf38292b97704204b`. The existing F1c replay passed
+  all 26 checks, and the six-check AsyncRequest report passed before bounded
+  evidence collection and automatic cluster deletion.
 - [ ] Run multi-tenant fairness with the tenant-policy integration slice.
 - [ ] Run GPU correctness, performance, and soak gates after the planned
   implementation slices are complete.

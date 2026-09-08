@@ -28,6 +28,12 @@ def test_cross_process_clock_envelope_has_a_narrow_explicit_tolerance():
         7_000_001,
         2_000_000,
     )
+    assert not wall_clock_envelope_contains(
+        10_000_000,
+        5_000_000,
+        5_000_000,
+        0,
+    )
 
 
 def test_metric_value_ignores_prometheus_label_order():

@@ -109,6 +109,7 @@ def wall_clock_envelope_contains(
         type(tolerance_ns) is int
         and tolerance_ns >= 0
         and all(type(value) is int for value in values)
+        and outer_started_ns <= outer_finished_ns
         and inner_started_ns <= inner_finished_ns
         and outer_started_ns - tolerance_ns <= inner_started_ns
         and inner_finished_ns <= outer_finished_ns + tolerance_ns

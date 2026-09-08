@@ -703,14 +703,20 @@ class PostgresRequestStore:
                         """
                     )
                 finally:
-                    if lock_acquired:
-                        cursor.execute(
-                            "SELECT pg_advisory_unlock(%s, %s)",
-                            (1_261_587_810, 4),
-                        )
-                    timeout_ms = self._connect_timeout * 1000
-                    cursor.execute(f"SET statement_timeout = {timeout_ms}")
-                    cursor.execute(f"SET lock_timeout = {timeout_ms}")
+                    try:
+                        if lock_acquired:
+                            cursor.execute(
+                                "SELECT pg_advisory_unlock(%s, %s)",
+                                (1_261_587_810, 4),
+                            )
+                    finally:
+                        timeout_ms = self._connect_timeout * 1000
+                        try:
+                            cursor.execute(
+                                f"SET statement_timeout = {timeout_ms}"
+                            )
+                        finally:
+                            cursor.execute(f"SET lock_timeout = {timeout_ms}")
             with self._connection.transaction():
                 with self._connection.cursor() as cursor:
                     cursor.execute("SET LOCAL statement_timeout = 0")

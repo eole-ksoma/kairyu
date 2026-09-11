@@ -92,14 +92,28 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 - NVLink-profile gates blocked on H100/A100-class hardware; PCIe-switch chassis and ≥400 Gb/s RDMA NICs gate E4/E5
 - G6 remaining P-C gates still in progress
 - AsyncRequest v1 has a PostgreSQL-backed non-streaming Chat API, tenant-scoped
-  state/result/cancel routes, and a lease-fenced worker; multi-gateway failover
-  evidence and queue telemetry remain open.
+  state/result/cancel routes, a lease-fenced worker, shared queue telemetry,
+  bounded request/audit retention, and multi-gateway CPU evidence. The current
+  retention-expanded Kind rerun remains pending on Docker registry access.
+- Runner State v1 now fixes the controller-neutral logical state, transition,
+  identity, active-request, failure, and ordered startup-phase contracts. The
+  Kubernetes watcher/reconciler and runtime instrumentation remain open.
 - Human sign-off pending on M2–M4 design reviews
 
 ## Change Log
 
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
+
+### 2026-09-11 — [design] Runner State v1 and startup evidence
+- What: added immutable, versioned Runner status and startup phase schemas,
+  strict logical transition validation, pure status updates, and gap-free
+  image/model/compile/warmup reporting with bounded failure records.
+- Why: Pod phase alone cannot distinguish image pull, model load, warmup,
+  serving readiness, active work, or safe drain; controller and autoscaler
+  implementation now share one executable contract.
+- Refs: docs/design/runner-state-v1.md; kairyu/runners;
+  tests/unit/test_runner_lifecycle.py
 
 ### 2026-09-08 — [progress] AsyncRequest API and chat worker
 - What: added tenant-scoped async Chat submission/status/result/cancel, bounded

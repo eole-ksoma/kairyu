@@ -11,7 +11,7 @@ chat/tool path, and Chat UI. Default thinking effort is the model author's
   the official checkpoint (`low=50`, `high=75`, `max=100`).
 - [x] Implement lifecycle, UI defaults, model attestation, and verification.
 - [x] Run CPU contract tests and lint.
-- [ ] Save the existing stack's restart information; release its GPUs.
+- [x] Save the existing stack's restart information; release its GPUs.
 - [ ] Establish a correct TP8 baseline; compare EP, DSpark, batch/sequence
   limits, memory placement, and supported graphs in bounded stages.
 - [ ] Run final serving, tool, thinking/default/override, vision, cancellation,

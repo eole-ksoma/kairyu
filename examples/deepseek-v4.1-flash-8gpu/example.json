@@ -70,7 +70,7 @@
   },
   "vllm": {
     "image": "local/vllm-openai:deepseek-v41-sm120",
-    "image_id": "sha256:c4701cee4df917c8cc8c4afa34b5f7038662c2001dc2e963ab26aa5a02626483",
+    "image_id": "sha256:82cdd20125d935a175c790a3ba3a4d27006f8c04cf024571ef05cfeed98aa46d",
     "distribution": "overlay",
     "dockerfile": "vllm-sm120.Dockerfile",
     "base_image": "vllm/vllm-openai:deepseekv41-flash-0909@sha256:00d577a6a63281e15336029d5bcee4e9a2cf182214a4f20ba6111b1c8e79893d",
@@ -85,10 +85,13 @@
     "max_num_batched_tokens": 16384,
     "max_num_seqs": 64,
     "kv_cache_dtype": "fp8",
-    "block_size": 256,
+    "block_size": 128,
     "source_version": "0.1.dev20904+g179dd0fa9",
     "engram_cpu_offload": false,
-    "flashinfer_version": "0.6.18"
+    "flashinfer_version": "0.6.18",
+    "adaptive_verification": false,
+    "kv_cache_layout": "BLHNC",
+    "sm120_swa_block_size": 64
   },
   "webui": {
     "image": "ghcr.io/open-webui/open-webui:v0.11.0-slim@sha256:3698bd4e9628b7ae3768808721098616e669b4a05a6bceb2f5da2d84a3282a01",

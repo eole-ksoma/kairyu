@@ -59,9 +59,18 @@ the interactive UI default.
 
 ## L1 selection and evidence
 
-The SM120 FlashInfer overlay uses the same 0.6.18 source revision as the
-GPU-verified V4 Vision example; its 128/192-token sparse attention shapes
-cover the V4.1 window and DSpark draft.
+The SM120 FlashInfer overlay starts from the same 0.6.18 source revision as
+the GPU-verified V4 Vision example. V4.1 additionally needs 64-token SWA
+pages and dual-cache prefill instantiations for its 128-token C1 compressed
+pages. `patch_runtime.py` makes these L1 adaptations against exact source
+anchors; changed upstream sources fail the build. Manager blocks are 128
+tokens with the default BLHNC layout. Adaptive DSpark verification is off
+because the pinned indexer backend does not support it.
+
+`check_sm120_pages.py` runs inside the L1 image with one SM120 GPU. It checks
+decode and prefill against independent PyTorch attention using the actual
+packed cache bytes, C1/C2 page sizes, padded block strides, masks and sinks.
+Its tolerances follow the pinned FlashInfer DSV4 correctness tests.
 
 Runtime, model, and configuration pins live in `example.json`,
 `model-manifest.json`, and `kairyu.yaml`. See `MEASUREMENTS.md` for the tested

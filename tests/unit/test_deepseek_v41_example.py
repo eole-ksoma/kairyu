@@ -35,6 +35,15 @@ def test_effort_patch_rejects_drift_and_is_idempotent():
         patch.align_efforts("pass\n")
 
 
+def test_runtime_edits_fail_closed_on_missing_or_duplicate_anchors():
+    patch = load("patch_runtime")
+    for original in ("unchanged", "anchor\nanchor\n"):
+        with pytest.raises(ValueError, match="source drift"):
+            patch.replace_once(original, "anchor\n", "anchor\naddition\n")
+    changed = patch.replace_once("anchor\n", "anchor\n", "anchor\naddition\n")
+    assert patch.replace_once(changed, "anchor\n", "anchor\naddition\n") == changed
+
+
 def test_ui_can_switch_off_then_restore_default_and_explicit_efforts():
     selector = load("webui-reasoning-effort-filter").Filter()
     body = {"reasoning_effort": "high", "max_tokens": 32768}

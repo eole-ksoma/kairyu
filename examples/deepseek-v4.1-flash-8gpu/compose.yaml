@@ -27,14 +27,14 @@ services:
     - --kv-cache-dtype
     - fp8
     - --block-size
-    - '256'
+    - '128'
     - --tensor-parallel-size
     - '8'
     - --enable-expert-parallel
     - --moe-backend
     - marlin
     - --speculative-config
-    - '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":true}'
+    - '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":false}'
     - --tokenizer-mode
     - deepseek_v41
     - --reasoning-parser
@@ -61,7 +61,8 @@ services:
       - CMD
       - python3
       - -c
-      - import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/health", timeout=2)
+      - import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/health",
+        timeout=2)
       interval: 5s
       timeout: 3s
       retries: 1440
@@ -118,7 +119,8 @@ services:
       - CMD
       - python3
       - -c
-      - import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/readyz", timeout=2)
+      - import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/readyz",
+        timeout=2)
       interval: 5s
       timeout: 3s
       retries: 120

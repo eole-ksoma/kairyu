@@ -23,6 +23,7 @@ import verification
 
 CANDIDATES = {
     "baseline": {},
+    "pcie-ipc": {},
     "no-spec": {"--speculative-config": None},
     "no-ep": {"--enable-expert-parallel": None},
     "batch-8k": {"--max-num-batched-tokens": "8192"},
@@ -32,6 +33,9 @@ CANDIDATES = {
     "eager": {"--enforce-eager": True},
     "engram-cpu": {"--engram-config": '{"cpu_offload":true}'},
 }
+
+
+CANDIDATE_ENVIRONMENT = {"pcie-ipc": {"VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": "1"}}
 
 
 def candidate_command(command: list[str], name: str) -> list[str]:
@@ -112,16 +116,29 @@ def main() -> None:
             row_dir.mkdir()
             command = candidate_command(original, name)
             override = row_dir / "override.json"
-            override.write_text(json.dumps({"services": {"deepseek-0": {"command": command}}}))
+            environment = CANDIDATE_ENVIRONMENT.get(name, {})
+            service = {"command": command}
+            if environment:
+                service["environment"] = environment
+            override.write_text(json.dumps({"services": {"deepseek-0": service}}))
             report = {
                 "candidate": name,
                 "command": command,
+                "environment_override": environment,
                 "base_config_sha256": verification._served_config_sha256(),
                 "rows": [],
             }
             reports.append(report)
             try:
                 restart(override, row_dir / "startup.log")
+                if name == "pcie-ipc":
+                    logs = subprocess.check_output(
+                        ["docker", "logs", env["COMPOSE_PROJECT_NAME"] + "-deepseek-0-1"],
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                    )
+                    if "Initialized FlashInfer PCIe IPC all-reduce" not in logs:
+                        raise RuntimeError("PCIe IPC was not initialized; fallback is not a trial")
                 control._validate_tool_calling(f"http://127.0.0.1:{env['API_PORT']}")
                 control._validate_vision(f"http://127.0.0.1:{env['API_PORT']}")
                 for concurrency in args.concurrency:
@@ -153,7 +170,7 @@ def main() -> None:
                     if code:
                         raise RuntimeError(f"failed c{concurrency} row")
                 report["passed"] = True
-            except Exception as error:
+            except (Exception, SystemExit) as error:
                 report.update(passed=False, error=str(error))
             finally:
                 container = env["COMPOSE_PROJECT_NAME"] + "-deepseek-0-1"
@@ -166,6 +183,12 @@ def main() -> None:
                         "image_id": item["Image"],
                         "command": item["Config"]["Cmd"],
                         "started_at": item["State"]["StartedAt"],
+                        "environment_override": {
+                            key: dict(value.split("=", 1) for value in item["Config"]["Env"]).get(
+                                key
+                            )
+                            for key in environment
+                        },
                     }
                 with (row_dir / "worker.log").open("w") as log:
                     subprocess.run(

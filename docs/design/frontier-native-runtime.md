@@ -246,6 +246,14 @@ maps `high` to 50. An image-local encoder adjustment aligns those aliases,
 with the Python frontend selected and rendered-prefix checks at build time.
 Kairyu's L2/L3 effort normalization remains the existing contract.
 
+The official V4.1 image also needs SM120 page compatibility: 128-token
+manager blocks in BLHNC, 64-token SWA pages on the SM120 subclass, and the
+existing FlashInfer dual-cache prefill template instantiated for C1 pages
+of 128 tokens (C2 uses 64). Exact-anchor image patches fail on source drift;
+the 16-case packed-cache GPU numerical gate passes using upstream DSV4
+tolerances. Adaptive DSpark verification is disabled because the indexer
+backend rejects it. Full-model inference and parameter selection remain open.
+
 Fixed-length performance rows record first model output (reasoning or
 content) separately from first visible content, which stays null if no
 content was emitted. Completed-answer/tool/image gates are independent.

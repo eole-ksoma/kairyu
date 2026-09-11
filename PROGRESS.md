@@ -102,6 +102,11 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
 
+### 2026-09-11 — [progress] V4.1 SM120 cache compatibility
+- What: pin an example-local L1 overlay with 64-token SWA pages and C1 128-token dual-cache prefill instantiations; use manager blocks 128/BLHNC and disable unsupported adaptive verification. All 16 packed-cache GPU numerical cases pass at upstream DSV4 tolerances; full-model serving and tuning remain pending.
+- Why: the official V4.1 image's SWA pages and indexer layout assumptions fail startup on SM120 before serving. Source-anchored adaptations retain the existing kernel arithmetic and keep L2/L3 unchanged.
+- Refs: PR #597; `examples/deepseek-v4.1-flash-8gpu/{patch_runtime.py,check_sm120_pages.py,MEASUREMENTS.md}`; FN-D9 V4.1 amendment.
+
 ### 2026-09-11 — [amendment] FN-D9: V4.1 Flash on one eight-GPU replica
 - What: add a separate V4.1 example with the existing V4 vision ReplicaPool/API/UI path; default thinking is the official high (75). Pin the checkpoint manifest and isolate runtime encoder alignment. Fixed-token measurements distinguish model output from visible content; completed-answer gates stay separate. CPU contracts pass; GPU selection is pending.
 - Why: the owner revised the initial two-replica request to one TP8 replica; the initial vLLM encoder maps high differently from the checkpoint, and content-only timing mismeasures all-reasoning output.

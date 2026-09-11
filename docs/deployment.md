@@ -378,6 +378,10 @@ async_requests:
   max_records_per_tenant: 64
   poll_interval_s: 0.5
   lease_seconds: 30
+  # Disabled when omitted. Enable only after the rollout sequence below.
+  request_retention_s: 604800
+  audit_retention_s: 2592000
+  retention_batch_size: 500
 ```
 
 `POST /v1/async/chat/completions` accepts the normal non-streaming Chat body.
@@ -395,8 +399,10 @@ a separate per-tenant RPM bucket to bound durable queue growth, status polling
 does not drain inference quota, and the worker charges inference RPM once when
 execution starts.
 `max_records_per_tenant` is a hard durable allocation: idempotent replays remain
-available at the limit, while new records return 429 until an operator removes
-retained terminal records. Automated retention/purge is a following slice.
+available at the limit, while new records return 429 until retained terminal
+records cross the configured request TTL and the external retention job removes
+them. At that point the idempotency guarantee for the deleted request also ends;
+reusing its key creates a new request and may execute inference again.
 At the default 8 MiB input cap this bounds persisted input to roughly 512 MiB
 per tenant; size the PostgreSQL volume/quota for the configured tenant count,
 results, indexes, and audit history.
@@ -406,8 +412,69 @@ available. Workers renew database-clock leases while waiting or executing, use
 fencing for terminal publication, and run only publicly served direct Chat
 models in v1. Local cancellation aborts generation immediately; another
 gateway observes cancellation no later than its next heartbeat. AUTO
-orchestration, Responses inputs, retention/purge, and Redis wake-up hints remain
-separate later extensions.
+orchestration, Responses inputs, and Redis wake-up hints remain separate later
+extensions.
+
+AsyncRequest retention is deliberately not run by every gateway. Configure it
+in the DeploymentSpec and invoke the bounded external job from one Kubernetes
+CronJob or an equivalent scheduler. Omitted request and audit TTLs disable their
+respective deletion paths; omitting both makes the job a complete no-op. A
+request TTL removes only `succeeded`, `failed`, `cancelled`, and `expired`
+records. Before the request row is deleted, its body-free claim audit is moved
+in bounded chunks to the audit archive. The audit TTL is measured from the
+original event timestamp across both active and archived audit rows, so moving
+an event never restarts its retention period. Audit retention may be longer
+than request retention. If `audit_retention_s` is omitted, the audit archive is
+unbounded and must be capacity-planned separately.
+
+Deletion is eventual within the scheduler interval, not an exact-time erasure
+guarantee. Each transaction uses the PostgreSQL clock, locks terminal parents
+before their audit rows, skips work owned by another purger, and rechecks state
+and cutoff at deletion. Per-event transition and attempt counters survive both
+request and audit deletion; only the current state gauge is decremented. Neither
+request bodies, results, owners, request IDs, nor the DSN are written to normal
+retention-job output.
+
+Existing deployments must use this order because older binaries reject unknown
+DeploymentSpec keys:
+
+1. Deploy the new binary to every gateway while leaving all retention fields
+   omitted, and verify every old Pod has drained.
+2. Complete the existing `sharded-v2` telemetry migration for every store.
+3. Build the retention indexes online and activate the store marker:
+
+   ```bash
+   python scripts/async_request_retention.py deployment.yaml \
+     --mode prepare --apply
+   ```
+
+4. Add `request_retention_s`, `audit_retention_s`, and optionally
+   `retention_batch_size` to the DeploymentSpec. Preview one capped batch:
+
+   ```bash
+   python scripts/async_request_retention.py deployment.yaml --mode purge
+   ```
+
+   Preview opens a repeatable-read, database-enforced read-only transaction and
+   reports what the next bounded batch would delete or archive. It never creates
+   or repairs schema objects. `--mode prepare` without `--apply`, and purge when
+   both TTLs are omitted, return before opening a database connection.
+
+5. Apply bounded batches after reviewing the structured preview:
+
+   ```bash
+   python scripts/async_request_retention.py deployment.yaml \
+     --mode purge --apply --max-batches 100
+   ```
+
+Run the scheduled command with `concurrencyPolicy: Forbid`, a finite job
+deadline, `restartPolicy: Never`, and a dedicated Secret/service account. Its
+database role needs only connection plus the documented AsyncRequest retention
+tables and index preparation privileges; do not reuse a superuser credential.
+The job exits non-zero after a partial-run error and reports only aggregate
+counts plus a post-batch hint that eligible work remains. The hint includes rows
+temporarily locked by another purger, but concurrent commits immediately after
+the observation may change it. A later CronJob run safely resumes the backlog.
 
 PostgreSQL connect, statement, lock, idle-transaction, and TCP keepalive waits
 are bounded; worker shutdown also has a bounded drain before forced task

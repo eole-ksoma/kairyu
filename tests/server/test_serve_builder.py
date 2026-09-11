@@ -1448,6 +1448,9 @@ async_requests:
   max_records_per_tenant: 4321
   poll_interval_s: 0.1
   lease_seconds: 5
+  request_retention_s: 86400
+  audit_retention_s: 604800
+  retention_batch_size: 750
 """,
         resolve_credentials=False,
     )
@@ -1460,11 +1463,17 @@ async_requests:
     assert spec.async_requests.max_records_per_tenant == 4321
     assert spec.async_requests.poll_interval_s == 0.1
     assert spec.async_requests.lease_seconds == 5
+    assert spec.async_requests.request_retention_s == 86400
+    assert spec.async_requests.audit_retention_s == 604800
+    assert spec.async_requests.retention_batch_size == 750
 
     for invalid, message in (
         ("dsn_env: invalid-name", "dsn_env"),
         ("store_id: '   '", "store_id must be a non-empty PostgreSQL identity"),
         ("unknown: value", "extra_forbidden"),
+        ("request_retention_s: 0", "request_retention_s"),
+        ("audit_retention_s: .nan", "audit_retention_s"),
+        ("retention_batch_size: 10001", "retention_batch_size"),
     ):
         with pytest.raises(ValueError, match=message):
             load_deployment_spec(

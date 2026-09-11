@@ -90,7 +90,11 @@ protocol with shared durable storage and database-clock leases.
 - [x] Extend the three-gateway staged gate to require identical shared queue
   telemetry, failover/expiry/cancellation counters, empty final depth, and no
   request-ID or prompt leakage.
-- [ ] Add the AsyncRequest retention/purge policy and audit-safe deletion.
+- [x] Add opt-in AsyncRequest request/audit TTLs, bounded DB-clock purge,
+  audit-safe archival, online index preparation, dry-run/apply CLI controls,
+  and persistent transition counters. Request deletion ends the idempotency
+  guarantee for that key; audit retention can remain longer than payload
+  retention without keeping the request body or result.
 - [ ] Add Redis wake-up hints only after measured PostgreSQL polling pressure
   justifies another operational dependency. Redis must not become the source
   of truth.

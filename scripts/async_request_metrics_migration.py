@@ -39,7 +39,11 @@ def main() -> int:
     if not dsn:
         parser.error(f"{args.dsn_env} is not set")
 
-    with PostgresRequestStore(dsn, store_id=args.store_id) as store:
+    with PostgresRequestStore(
+        dsn,
+        store_id=args.store_id,
+        allow_store_creation=False,
+    ) as store:
         if args.mode == "backfill":
             store.migrate_metrics_during_maintenance()
         else:

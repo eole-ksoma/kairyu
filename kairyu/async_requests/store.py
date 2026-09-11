@@ -58,6 +58,20 @@ class RequestQueueMetricsSnapshot:
         )
 
 
+@dataclass(frozen=True)
+class RequestRetentionBatchResult:
+    """Aggregate-only result of one bounded retention transaction."""
+
+    request_cutoff: datetime | None
+    audit_cutoff: datetime | None
+    terminal_requests_deleted: int
+    audit_events_archived: int
+    audit_events_deleted: int
+    owner_deferrals_deleted: int
+    has_more: bool
+    applied: bool
+
+
 class IdempotencyConflictError(RuntimeError):
     """An owner reused an idempotency key with different caller intent."""
 
@@ -121,6 +135,15 @@ class RequestStoreProtocol(Protocol):
     def cancel(self, request_id: str, *, owner: str | None = None) -> AsyncRequest: ...
 
     def metrics_snapshot(self) -> RequestQueueMetricsSnapshot: ...
+
+    def purge_retained_data(
+        self,
+        *,
+        request_retention_seconds: float | None,
+        audit_retention_seconds: float | None,
+        batch_size: int = 500,
+        dry_run: bool = False,
+    ) -> RequestRetentionBatchResult: ...
 
 
 @dataclass(frozen=True)
@@ -493,6 +516,89 @@ class InMemoryRequestStore:
                 transition_counts=dict(self._transition_counts),
             )
 
+    def purge_retained_data(
+        self,
+        *,
+        request_retention_seconds: float | None,
+        audit_retention_seconds: float | None,
+        batch_size: int = 500,
+        dry_run: bool = False,
+    ) -> RequestRetentionBatchResult:
+        """Delete one bounded batch of terminal records using the store clock."""
+        request_retention = _validate_optional_retention_seconds(
+            request_retention_seconds, name="request_retention_seconds"
+        )
+        audit_retention = _validate_optional_retention_seconds(
+            audit_retention_seconds, name="audit_retention_seconds"
+        )
+        batch_size = _validate_retention_batch_size(batch_size)
+        dry_run = _validate_retention_dry_run(dry_run)
+        with self._lock:
+            now = self._now()
+            if request_retention is None and audit_retention is None:
+                return RequestRetentionBatchResult(
+                    request_cutoff=None,
+                    audit_cutoff=None,
+                    terminal_requests_deleted=0,
+                    audit_events_archived=0,
+                    audit_events_deleted=0,
+                    owner_deferrals_deleted=0,
+                    has_more=False,
+                    applied=not dry_run,
+                )
+            request_cutoff = (
+                None
+                if request_retention is None
+                else now - timedelta(seconds=request_retention)
+            )
+            audit_cutoff = (
+                None
+                if audit_retention is None
+                else now - timedelta(seconds=audit_retention)
+            )
+            candidates = sorted(
+                (
+                    request
+                    for request in self._requests.values()
+                    if request_cutoff is not None
+                    if request.state in TERMINAL_REQUEST_STATES
+                    and request.completed_at is not None
+                    and request.completed_at <= request_cutoff
+                ),
+                key=lambda request: (request.completed_at, request.id),
+            )[:batch_size]
+            if not dry_run:
+                for request in candidates:
+                    self._requests.pop(request.id, None)
+                    self._leases.pop(request.id, None)
+                    self._fencing_tokens.pop(request.id, None)
+                    if request.idempotency_key is not None:
+                        key = (request.owner, request.idempotency_key)
+                        existing = self._idempotency.get(key)
+                        if existing is not None and existing[1] == request.id:
+                            self._idempotency.pop(key, None)
+            expired_deferrals = sorted(
+                owner
+                for owner, not_before in self._owner_not_before.items()
+                if not_before <= now
+            )[:batch_size]
+            if not dry_run:
+                for owner in expired_deferrals:
+                    self._owner_not_before.pop(owner, None)
+            return RequestRetentionBatchResult(
+                request_cutoff=request_cutoff,
+                audit_cutoff=audit_cutoff,
+                terminal_requests_deleted=len(candidates),
+                audit_events_archived=0,
+                audit_events_deleted=0,
+                owner_deferrals_deleted=len(expired_deferrals),
+                has_more=(
+                    len(candidates) == batch_size
+                    or len(expired_deferrals) == batch_size
+                ),
+                applied=not dry_run,
+            )
+
     def _validate_claim(
         self,
         claim: RequestClaim,
@@ -596,3 +702,28 @@ class InMemoryRequestStore:
         if not math.isfinite(lease_seconds) or lease_seconds <= 0:
             raise ValueError("lease_seconds must be finite and greater than zero")
         return lease_seconds
+
+
+def _validate_optional_retention_seconds(
+    value: float | None,
+    *,
+    name: str,
+) -> float | None:
+    if value is None:
+        return None
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError(f"{name} must be finite and greater than zero")
+    return seconds
+
+
+def _validate_retention_batch_size(value: int) -> int:
+    if type(value) is not int or value <= 0 or value > 10_000:
+        raise ValueError("batch_size must be an integer between 1 and 10000")
+    return value
+
+
+def _validate_retention_dry_run(value: bool) -> bool:
+    if type(value) is not bool:
+        raise ValueError("dry_run must be a boolean")
+    return value

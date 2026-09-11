@@ -13,6 +13,7 @@ import logging
 import math
 import threading
 import uuid
+from collections.abc import Sequence
 from copy import deepcopy
 from datetime import datetime
 from types import TracebackType
@@ -35,7 +36,11 @@ from kairyu.async_requests.store import (
     InvalidRequestTransitionError,
     RequestCapacityError,
     RequestQueueMetricsSnapshot,
+    RequestRetentionBatchResult,
     StaleRequestClaimError,
+    _validate_optional_retention_seconds,
+    _validate_retention_batch_size,
+    _validate_retention_dry_run,
 )
 
 try:  # Optional deployment dependency; construction reports a useful error.
@@ -178,6 +183,32 @@ _SCHEMA_STATEMENTS = (
     """
     CREATE INDEX IF NOT EXISTS async_request_claim_audit_request_idx
         ON async_request_claim_audit (store_id, request_id, sequence)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS async_request_claim_audit_archive (
+        sequence BIGINT PRIMARY KEY,
+        store_id TEXT NOT NULL
+            REFERENCES async_request_store_registry(store_id) ON DELETE CASCADE,
+        request_id TEXT NOT NULL,
+        owner TEXT NOT NULL CHECK (owner <> ''),
+        worker_id TEXT,
+        fencing_token BIGINT NOT NULL,
+        at TIMESTAMPTZ NOT NULL,
+        event TEXT NOT NULL CHECK (
+            event IN ('claim', 'reclaim', 'renew', 'defer', 'running', 'succeed',
+                      'fail', 'cancel', 'expire')
+        ),
+        lease_until TIMESTAMPTZ,
+        details JSONB NOT NULL CHECK (jsonb_typeof(details) = 'object')
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS async_request_claim_audit_archive_request_idx
+        ON async_request_claim_audit_archive (store_id, request_id, sequence)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS async_request_claim_audit_archive_retention_idx
+        ON async_request_claim_audit_archive (store_id, at, sequence)
     """,
     """
     CREATE TABLE IF NOT EXISTS async_request_metric_totals (
@@ -413,6 +444,87 @@ _SCHEMA_STATEMENTS = (
     """,
 )
 
+_OLDEST_QUEUED_INDEX = (
+    "async_requests_oldest_queued_idx",
+    "async_requests",
+    ("store_id", "created_at", "request_id"),
+    "state='queued'",
+    """
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS async_requests_oldest_queued_idx
+    ON async_requests (store_id, created_at, request_id)
+    WHERE state = 'queued'
+    """,
+)
+_RETENTION_INDEXES = (
+    (
+        "async_requests_terminal_retention_idx",
+        "async_requests",
+        ("store_id", "completed_at", "request_id"),
+        "state=ANY(ARRAY['succeeded','failed','cancelled','expired'])",
+        """
+        CREATE INDEX CONCURRENTLY IF NOT EXISTS
+            async_requests_terminal_retention_idx
+        ON async_requests (store_id, completed_at, request_id)
+        WHERE state IN ('succeeded', 'failed', 'cancelled', 'expired')
+        """,
+    ),
+    (
+        "async_request_claim_audit_retention_idx",
+        "async_request_claim_audit",
+        ("store_id", "at", "sequence"),
+        None,
+        """
+        CREATE INDEX CONCURRENTLY IF NOT EXISTS
+            async_request_claim_audit_retention_idx
+        ON async_request_claim_audit (store_id, at, sequence)
+        """,
+    ),
+    (
+        "async_request_owner_deferrals_retention_idx",
+        "async_request_owner_deferrals",
+        ("store_id", "not_before", "owner"),
+        None,
+        """
+        CREATE INDEX CONCURRENTLY IF NOT EXISTS
+            async_request_owner_deferrals_retention_idx
+        ON async_request_owner_deferrals (store_id, not_before, owner)
+        """,
+    ),
+    (
+        "async_request_claim_audit_archive_retention_idx",
+        "async_request_claim_audit_archive",
+        ("store_id", "at", "sequence"),
+        None,
+        """
+        CREATE INDEX CONCURRENTLY IF NOT EXISTS
+            async_request_claim_audit_archive_retention_idx
+        ON async_request_claim_audit_archive (store_id, at, sequence)
+        """,
+    ),
+    (
+        "async_request_claim_audit_request_idx",
+        "async_request_claim_audit",
+        ("store_id", "request_id", "sequence"),
+        None,
+        """
+        CREATE INDEX CONCURRENTLY IF NOT EXISTS
+            async_request_claim_audit_request_idx
+        ON async_request_claim_audit (store_id, request_id, sequence)
+        """,
+    ),
+    (
+        "async_request_claim_audit_archive_request_idx",
+        "async_request_claim_audit_archive",
+        ("store_id", "request_id", "sequence"),
+        None,
+        """
+        CREATE INDEX CONCURRENTLY IF NOT EXISTS
+            async_request_claim_audit_archive_request_idx
+        ON async_request_claim_audit_archive (store_id, request_id, sequence)
+        """,
+    ),
+)
+
 
 def _validate_identity(value: str, *, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
@@ -448,6 +560,16 @@ def _submission_fingerprint(submission: AsyncRequestSubmission) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _normalize_index_expression(value: str) -> str:
+    return (
+        "".join(value.lower().split())
+        .replace('"', "")
+        .replace("::text", "")
+        .replace("(", "")
+        .replace(")", "")
+    )
+
+
 class PostgresRequestStore:
     """Shared durable RequestStore with DB-clock leases and fenced writes."""
 
@@ -459,6 +581,8 @@ class PostgresRequestStore:
         connect_timeout_s: float = 10.0,
         eager_connect: bool = True,
         max_records_per_owner: int = 64,
+        allow_store_creation: bool = True,
+        initialize_schema: bool = True,
     ) -> None:
         if psycopg is None:
             raise RuntimeError(
@@ -473,6 +597,8 @@ class PostgresRequestStore:
         if max_records_per_owner <= 0:
             raise ValueError("max_records_per_owner must be positive")
         self._max_records_per_owner = max_records_per_owner
+        self._allow_store_creation = bool(allow_store_creation)
+        self._initialize_schema_on_open = bool(initialize_schema)
         self._lock = threading.RLock()
         self._lease_lock = threading.RLock()
         self._metrics_lock = threading.RLock()
@@ -490,8 +616,11 @@ class PostgresRequestStore:
                 return
             self._connection = self._connect()
             try:
-                self._initialize_schema()
-                self._lease_connection = self._connect()
+                if self._initialize_schema_on_open:
+                    self._initialize_schema()
+                    self._lease_connection = self._connect()
+                else:
+                    self._validate_existing_schema()
             except BaseException:
                 if self._lease_connection is not None:
                     self._lease_connection.close()
@@ -609,6 +738,11 @@ class PostgresRequestStore:
                         (self._store_id, _SCHEMA_VERSION),
                     )
                     new_registry = cursor.fetchone() is not None
+                    if new_registry and not self._allow_store_creation:
+                        raise RuntimeError(
+                            "AsyncRequest store_id does not exist; refusing to "
+                            f"create {self._store_id!r} from a maintenance command"
+                        )
                     cursor.execute(
                         """
                         SELECT
@@ -625,6 +759,29 @@ class PostgresRequestStore:
                             CREATE INDEX async_requests_oldest_queued_idx
                             ON async_requests (store_id, created_at, request_id)
                             WHERE state = 'queued'
+                            """
+                        )
+                        cursor.execute(
+                            """
+                            CREATE INDEX async_requests_terminal_retention_idx
+                            ON async_requests (store_id, completed_at, request_id)
+                            WHERE state IN (
+                                'succeeded', 'failed', 'cancelled', 'expired'
+                            )
+                            """
+                        )
+                        cursor.execute(
+                            """
+                            CREATE INDEX async_request_claim_audit_retention_idx
+                            ON async_request_claim_audit (store_id, at, sequence)
+                            """
+                        )
+                        cursor.execute(
+                            """
+                            CREATE INDEX async_request_owner_deferrals_retention_idx
+                            ON async_request_owner_deferrals (
+                                store_id, not_before, owner
+                            )
                             """
                         )
                     if new_registry:
@@ -657,13 +814,59 @@ class PostgresRequestStore:
                             f"{_SCHEMA_VERSION}, got {observed!r}"
                         )
 
-    def migrate_metrics_during_maintenance(self) -> None:
-        """Backfill telemetry for an existing store during a write outage.
+    def _validate_existing_schema(self) -> None:
+        """Validate a maintenance target without creating or repairing objects."""
+        assert self._connection is not None
+        with self._connection.transaction():
+            with self._connection.cursor() as cursor:
+                cursor.execute("SET TRANSACTION READ ONLY")
+                required_relations = (
+                    "async_request_store_registry",
+                    "async_requests",
+                    "async_request_claim_audit",
+                    "async_request_claim_audit_archive",
+                    "async_request_owner_deferrals",
+                    "async_request_metric_migrations",
+                )
+                cursor.execute(
+                    """
+                    SELECT to_regclass(required.relation)
+                    FROM unnest(%s::text[]) AS required(relation)
+                    """,
+                    (list(required_relations),),
+                )
+                missing = [
+                    relation
+                    for relation, row in zip(required_relations, cursor, strict=True)
+                    if row[0] is None
+                ]
+                if missing:
+                    raise RuntimeError(
+                        "AsyncRequest maintenance requires an existing schema; "
+                        f"missing relations {missing!r}"
+                    )
+                cursor.execute(
+                    """
+                    SELECT schema_version
+                    FROM async_request_store_registry
+                    WHERE store_id = %s
+                    """,
+                    (self._store_id,),
+                )
+                row = cursor.fetchone()
+                if row is None or int(row[0]) != _SCHEMA_VERSION:
+                    observed = None if row is None else row[0]
+                    raise RuntimeError(
+                        "incompatible PostgreSQL async request schema for "
+                        f"store_id {self._store_id!r}: expected "
+                        f"{_SCHEMA_VERSION}, got {observed!r}"
+                    )
 
-        This deliberately never runs from normal Pod startup. Operators must
-        drain writers first; the table locks also protect against an accidental
-        concurrent old-version writer and make the baseline exact.
-        """
+    def _ensure_concurrent_indexes(
+        self,
+        indexes: tuple[tuple[str, str, tuple[str, ...], str | None, str], ...],
+    ) -> None:
+        """Build restartable global indexes without blocking table writers."""
         with self._lock:
             self._require_open()
             self._ensure_general_connection()
@@ -677,31 +880,21 @@ class PostgresRequestStore:
                         (1_261_587_810, 4),
                     )
                     lock_acquired = True
-                    cursor.execute(
-                        """
-                        SELECT index.indisvalid
-                        FROM pg_class AS relation
-                        JOIN pg_index AS index ON index.indexrelid = relation.oid
-                        JOIN pg_class AS target ON target.oid = index.indrelid
-                        WHERE relation.relname = 'async_requests_oldest_queued_idx'
-                          AND target.oid = 'async_requests'::regclass
-                          AND relation.relnamespace = target.relnamespace
-                        """
-                    )
-                    index_row = cursor.fetchone()
-                    if index_row is not None and not bool(index_row[0]):
-                        cursor.execute(
-                            "DROP INDEX CONCURRENTLY "
-                            "async_requests_oldest_queued_idx"
+                    for index_spec in indexes:
+                        index_name, _table_name, _columns, _predicate, create_statement = (
+                            index_spec
                         )
-                    cursor.execute(
-                        """
-                        CREATE INDEX CONCURRENTLY IF NOT EXISTS
-                            async_requests_oldest_queued_idx
-                        ON async_requests (store_id, created_at, request_id)
-                        WHERE state = 'queued'
-                        """
-                    )
+                        index_exists, index_matches = self._index_status(
+                            cursor, index_spec
+                        )
+                        if index_exists and not index_matches:
+                            assert psycopg is not None
+                            cursor.execute(
+                                psycopg.sql.SQL(
+                                    "DROP INDEX CONCURRENTLY {}"
+                                ).format(psycopg.sql.Identifier(index_name))
+                            )
+                        cursor.execute(create_statement)
                 finally:
                     try:
                         if lock_acquired:
@@ -717,6 +910,184 @@ class PostgresRequestStore:
                             )
                         finally:
                             cursor.execute(f"SET lock_timeout = {timeout_ms}")
+
+    @staticmethod
+    def _index_status(
+        cursor,
+        index_spec: tuple[str, str, tuple[str, ...], str | None, str],
+    ) -> tuple[bool, bool]:
+        index_name, table_name, expected_columns, expected_predicate, _statement = (
+            index_spec
+        )
+        cursor.execute(
+            """
+            SELECT
+                index.indisvalid,
+                index.indisready,
+                index.indisunique,
+                index.indnatts = index.indnkeyatts,
+                ARRAY(
+                    SELECT pg_get_indexdef(
+                        index.indexrelid, key_position, true
+                    )
+                    FROM generate_series(
+                        1, index.indnkeyatts
+                    ) AS key_position
+                    ORDER BY key_position
+                ),
+                COALESCE(
+                    pg_get_expr(index.indpred, index.indrelid, true),
+                    ''
+                )
+            FROM pg_class AS relation
+            JOIN pg_index AS index ON index.indexrelid = relation.oid
+            JOIN pg_class AS target ON target.oid = index.indrelid
+            WHERE relation.relname = %s
+              AND target.oid = to_regclass(%s)
+              AND relation.relnamespace = target.relnamespace
+            """,
+            (index_name, table_name),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return False, False
+        observed_columns = tuple(str(column).strip('"') for column in row[4])
+        observed_predicate = _normalize_index_expression(str(row[5]))
+        normalized_expected_predicate = (
+            ""
+            if expected_predicate is None
+            else _normalize_index_expression(expected_predicate)
+        )
+        matches = (
+            bool(row[0])
+            and bool(row[1])
+            and not bool(row[2])
+            and bool(row[3])
+            and observed_columns == expected_columns
+            and observed_predicate == normalized_expected_predicate
+        )
+        return True, matches
+
+    def prepare_retention(self) -> None:
+        """Create online purge indexes and activate retention for this store."""
+        with self._lock:
+            self._require_open()
+            self._ensure_general_connection()
+            with self._connection.transaction():
+                with self._connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT store_id, schema_version
+                        FROM async_request_store_registry
+                        WHERE schema_version <> %s
+                        LIMIT 1
+                        """,
+                        (_SCHEMA_VERSION,),
+                    )
+                    incompatible = cursor.fetchone()
+                    if incompatible is not None:
+                        raise RuntimeError(
+                            "cannot prepare retention while an AsyncRequest store "
+                            "uses an incompatible schema: "
+                            f"{incompatible[0]!r} is version {incompatible[1]!r}"
+                        )
+                    cursor.execute(
+                        """
+                        SELECT 1
+                        FROM async_request_metric_migrations
+                        WHERE store_id = %s AND migration = 'sharded-v2'
+                        """,
+                        (self._store_id,),
+                    )
+                    if cursor.fetchone() is None:
+                        raise RuntimeError(
+                            "cannot prepare retention before sharded-v2 telemetry "
+                            f"migration for store_id {self._store_id!r}"
+                        )
+        self._ensure_concurrent_indexes(_RETENTION_INDEXES)
+        with self._lock:
+            self._require_open()
+            self._ensure_general_connection()
+            with self._connection.transaction():
+                with self._connection.cursor() as cursor:
+                    readiness_error = self._retention_readiness_error(
+                        cursor,
+                        require_marker=False,
+                    )
+                    if readiness_error is not None:
+                        raise RuntimeError(readiness_error)
+                    cursor.execute(
+                        """
+                        INSERT INTO async_request_metric_migrations (
+                            store_id, migration
+                        ) VALUES (%s, 'retention-v1')
+                        ON CONFLICT (store_id, migration) DO NOTHING
+                        """,
+                        (self._store_id,),
+                    )
+
+    def _retention_readiness_error(
+        self,
+        cursor,
+        *,
+        require_marker: bool,
+    ) -> str | None:
+        cursor.execute(
+            """
+            SELECT store_id, schema_version
+            FROM async_request_store_registry
+            WHERE schema_version <> %s
+            LIMIT 1
+            """,
+            (_SCHEMA_VERSION,),
+        )
+        incompatible = cursor.fetchone()
+        if incompatible is not None:
+            return (
+                "AsyncRequest retention requires every store at schema version "
+                f"{_SCHEMA_VERSION}; {incompatible[0]!r} is "
+                f"{incompatible[1]!r}"
+            )
+        required_migrations = ["sharded-v2"]
+        if require_marker:
+            required_migrations.append("retention-v1")
+        cursor.execute(
+            """
+            SELECT migration
+            FROM async_request_metric_migrations
+            WHERE store_id = %s AND migration = ANY(%s)
+            """,
+            (self._store_id, required_migrations),
+        )
+        observed_migrations = {str(row[0]) for row in cursor}
+        missing_migrations = set(required_migrations) - observed_migrations
+        if missing_migrations:
+            return (
+                "AsyncRequest retention is not prepared for store_id "
+                f"{self._store_id!r}; missing migrations "
+                f"{sorted(missing_migrations)!r}"
+            )
+        for index_spec in _RETENTION_INDEXES:
+            index_name, table_name, _columns, _predicate, _statement = index_spec
+            _exists, matches = self._index_status(cursor, index_spec)
+            if not matches:
+                return (
+                    "AsyncRequest retention requires the expected ready index "
+                    f"{index_name!r} on {table_name!r}"
+                )
+        return None
+
+    def migrate_metrics_during_maintenance(self) -> None:
+        """Backfill telemetry for an existing store during a write outage.
+
+        This deliberately never runs from normal Pod startup. Operators must
+        drain writers first; the table locks also protect against an accidental
+        concurrent old-version writer and make the baseline exact.
+        """
+        self._ensure_concurrent_indexes((_OLDEST_QUEUED_INDEX,))
+        with self._lock:
+            self._require_open()
+            self._ensure_general_connection()
             with self._connection.transaction():
                 with self._connection.cursor() as cursor:
                     cursor.execute("SET LOCAL statement_timeout = 0")
@@ -751,13 +1122,25 @@ class PostgresRequestStore:
                             WHERE store_id = %s
                             UNION ALL
                             SELECT event, count(*)::bigint AS total
-                            FROM async_request_claim_audit
-                            WHERE store_id = %s
+                            FROM (
+                                SELECT event
+                                FROM async_request_claim_audit
+                                WHERE store_id = %s
+                                UNION ALL
+                                SELECT event
+                                FROM async_request_claim_audit_archive
+                                WHERE store_id = %s
+                            ) AS retained_audit
                             GROUP BY event
                         ) AS sources
                         GROUP BY event
                         """,
-                        (self._store_id, self._store_id, self._store_id),
+                        (
+                            self._store_id,
+                            self._store_id,
+                            self._store_id,
+                            self._store_id,
+                        ),
                     )
                     cursor.execute(
                         "DELETE FROM async_request_metric_migrations "
@@ -775,19 +1158,31 @@ class PostgresRequestStore:
                             store_id, event, shard, total
                         )
                         SELECT
-                            store_id,
-                            event,
+                            %s,
+                            retained_audit.event,
                             mod(
-                                hashtextextended(request_id, 0)
+                                hashtextextended(retained_audit.request_id, 0)
                                     & 9223372036854775807,
                                 %s
                             )::smallint,
                             count(*)
-                        FROM async_request_claim_audit
-                        WHERE store_id = %s
-                        GROUP BY store_id, event, 3
+                        FROM (
+                            SELECT request_id, event
+                            FROM async_request_claim_audit
+                            WHERE store_id = %s
+                            UNION ALL
+                            SELECT request_id, event
+                            FROM async_request_claim_audit_archive
+                            WHERE store_id = %s
+                        ) AS retained_audit
+                        GROUP BY retained_audit.event, 3
                         """,
-                        (_METRIC_SHARDS, self._store_id),
+                        (
+                            self._store_id,
+                            _METRIC_SHARDS,
+                            self._store_id,
+                            self._store_id,
+                        ),
                     )
                     cursor.execute(
                         """
@@ -1155,6 +1550,477 @@ class PostgresRequestStore:
                         oldest_queued_age_seconds=oldest_queued_age_seconds,
                         transition_counts=transition_counts,
                     )
+
+    def purge_retained_data(
+        self,
+        *,
+        request_retention_seconds: float | None,
+        audit_retention_seconds: float | None,
+        batch_size: int = 500,
+        dry_run: bool = False,
+    ) -> RequestRetentionBatchResult:
+        """Archive audit and purge one bounded, retry-safe retention batch."""
+        request_retention = _validate_optional_retention_seconds(
+            request_retention_seconds, name="request_retention_seconds"
+        )
+        audit_retention = _validate_optional_retention_seconds(
+            audit_retention_seconds, name="audit_retention_seconds"
+        )
+        batch_size = _validate_retention_batch_size(batch_size)
+        dry_run = _validate_retention_dry_run(dry_run)
+        if request_retention is None and audit_retention is None:
+            return RequestRetentionBatchResult(
+                request_cutoff=None,
+                audit_cutoff=None,
+                terminal_requests_deleted=0,
+                audit_events_archived=0,
+                audit_events_deleted=0,
+                owner_deferrals_deleted=0,
+                has_more=False,
+                applied=not dry_run,
+            )
+        with self._lock:
+            self._require_open()
+            self._ensure_general_connection()
+            with self._connection.transaction():
+                with self._connection.cursor() as cursor:
+                    if dry_run:
+                        cursor.execute(
+                            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+                        )
+                    cursor.execute(
+                        """
+                        WITH policy AS (
+                            SELECT
+                                clock_timestamp() AS now,
+                                %s::double precision AS request_seconds,
+                                %s::double precision AS audit_seconds
+                        )
+                        SELECT
+                            now,
+                            CASE WHEN request_seconds IS NULL THEN NULL
+                                 ELSE now - request_seconds * interval '1 second'
+                            END,
+                            CASE WHEN audit_seconds IS NULL THEN NULL
+                                 ELSE now - audit_seconds * interval '1 second'
+                            END
+                        FROM policy
+                        """,
+                        (request_retention, audit_retention),
+                    )
+                    now, request_cutoff, audit_cutoff = cursor.fetchone()
+                    readiness_error = self._retention_readiness_error(
+                        cursor,
+                        require_marker=True,
+                    )
+                    if readiness_error is not None:
+                        raise RuntimeError(readiness_error)
+                    if dry_run:
+                        return self._preview_retention_batch(
+                            cursor,
+                            now=now,
+                            request_cutoff=request_cutoff,
+                            audit_cutoff=audit_cutoff,
+                            batch_size=batch_size,
+                        )
+                    return self._apply_retention_batch(
+                        cursor,
+                        now=now,
+                        request_cutoff=request_cutoff,
+                        audit_cutoff=audit_cutoff,
+                        batch_size=batch_size,
+                    )
+
+    def _preview_retention_batch(
+        self,
+        cursor,
+        *,
+        now: datetime,
+        request_cutoff: datetime | None,
+        audit_cutoff: datetime | None,
+        batch_size: int,
+    ) -> RequestRetentionBatchResult:
+        request_ids: list[str] = []
+        if request_cutoff is not None:
+            cursor.execute(
+                """
+                SELECT request_id
+                FROM async_requests
+                WHERE store_id = %s
+                  AND state IN ('succeeded', 'failed', 'cancelled', 'expired')
+                  AND completed_at <= %s
+                ORDER BY completed_at, request_id
+                LIMIT %s
+                """,
+                (self._store_id, request_cutoff, batch_size),
+            )
+            request_ids = [str(row[0]) for row in cursor]
+
+        audit_delete_rows: list[tuple[str, int]] = []
+        if audit_cutoff is not None:
+            cursor.execute(
+                """
+                SELECT sequence
+                FROM async_request_claim_audit_archive
+                WHERE store_id = %s AND at <= %s
+                ORDER BY at, sequence
+                LIMIT %s
+                """,
+                (self._store_id, audit_cutoff, batch_size),
+            )
+            audit_delete_rows = [("archive", int(row[0])) for row in cursor]
+            remaining = batch_size - len(audit_delete_rows)
+            if remaining:
+                cursor.execute(
+                    """
+                    SELECT sequence
+                    FROM async_request_claim_audit
+                    WHERE store_id = %s AND at <= %s
+                    ORDER BY at, sequence
+                    LIMIT %s
+                    """,
+                    (self._store_id, audit_cutoff, remaining),
+                )
+                audit_delete_rows.extend(
+                    ("active", int(row[0])) for row in cursor
+                )
+
+        archive_sequences: list[int] = []
+        if request_ids:
+            cursor.execute(
+                """
+                SELECT sequence
+                FROM async_request_claim_audit
+                WHERE store_id = %s
+                  AND request_id = ANY(%s)
+                  AND (%s::timestamptz IS NULL OR at > %s)
+                ORDER BY sequence
+                LIMIT %s
+                """,
+                (
+                    self._store_id,
+                    request_ids,
+                    audit_cutoff,
+                    audit_cutoff,
+                    batch_size,
+                ),
+            )
+            archive_sequences = [int(row[0]) for row in cursor]
+
+        active_deleted_sequences = [
+            sequence
+            for source, sequence in audit_delete_rows
+            if source == "active"
+        ]
+        removed_active_sequences = active_deleted_sequences + archive_sequences
+        deletable_request_ids: list[str] = []
+        if request_ids:
+            cursor.execute(
+                """
+                SELECT request.request_id
+                FROM async_requests AS request
+                WHERE request.store_id = %s
+                  AND request.request_id = ANY(%s)
+                  AND request.state IN (
+                      'succeeded', 'failed', 'cancelled', 'expired'
+                  )
+                  AND request.completed_at <= %s
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM async_request_claim_audit AS audit
+                      WHERE audit.store_id = request.store_id
+                        AND audit.request_id = request.request_id
+                        AND NOT (audit.sequence = ANY(%s))
+                  )
+                """,
+                (
+                    self._store_id,
+                    request_ids,
+                    request_cutoff,
+                    removed_active_sequences,
+                ),
+            )
+            deletable_request_ids = [str(row[0]) for row in cursor]
+
+        cursor.execute(
+            """
+            SELECT owner
+            FROM async_request_owner_deferrals
+            WHERE store_id = %s AND not_before <= %s
+            ORDER BY not_before, owner
+            LIMIT %s
+            """,
+            (self._store_id, now, batch_size),
+        )
+        deferral_owners = [str(row[0]) for row in cursor]
+        deleted_audit_sequences = [sequence for _source, sequence in audit_delete_rows]
+        return RequestRetentionBatchResult(
+            request_cutoff=request_cutoff,
+            audit_cutoff=audit_cutoff,
+            terminal_requests_deleted=len(deletable_request_ids),
+            audit_events_archived=len(archive_sequences),
+            audit_events_deleted=len(audit_delete_rows),
+            owner_deferrals_deleted=len(deferral_owners),
+            has_more=self._retention_work_exists(
+                cursor,
+                now=now,
+                request_cutoff=request_cutoff,
+                audit_cutoff=audit_cutoff,
+                excluded_request_ids=deletable_request_ids,
+                excluded_audit_sequences=deleted_audit_sequences,
+                excluded_deferral_owners=deferral_owners,
+            ),
+            applied=False,
+        )
+
+    def _retention_work_exists(
+        self,
+        cursor,
+        *,
+        now: datetime,
+        request_cutoff: datetime | None,
+        audit_cutoff: datetime | None,
+        excluded_request_ids: Sequence[str] = (),
+        excluded_audit_sequences: Sequence[int] = (),
+        excluded_deferral_owners: Sequence[str] = (),
+    ) -> bool:
+        if request_cutoff is not None:
+            cursor.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM async_requests
+                    WHERE store_id = %s
+                      AND state IN (
+                          'succeeded', 'failed', 'cancelled', 'expired'
+                      )
+                      AND completed_at <= %s
+                      AND NOT (request_id = ANY(%s))
+                )
+                """,
+                (self._store_id, request_cutoff, list(excluded_request_ids)),
+            )
+            if bool(cursor.fetchone()[0]):
+                return True
+        if audit_cutoff is not None:
+            for table_name in (
+                "async_request_claim_audit_archive",
+                "async_request_claim_audit",
+            ):
+                assert psycopg is not None
+                cursor.execute(
+                    psycopg.sql.SQL(
+                        """
+                        SELECT EXISTS (
+                            SELECT 1
+                            FROM {}
+                            WHERE store_id = %s
+                              AND at <= %s
+                              AND NOT (sequence = ANY(%s))
+                        )
+                        """
+                    ).format(psycopg.sql.Identifier(table_name)),
+                    (
+                        self._store_id,
+                        audit_cutoff,
+                        list(excluded_audit_sequences),
+                    ),
+                )
+                if bool(cursor.fetchone()[0]):
+                    return True
+        cursor.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM async_request_owner_deferrals
+                WHERE store_id = %s
+                  AND not_before <= %s
+                  AND NOT (owner = ANY(%s))
+            )
+            """,
+            (self._store_id, now, list(excluded_deferral_owners)),
+        )
+        return bool(cursor.fetchone()[0])
+
+    def _apply_retention_batch(
+        self,
+        cursor,
+        *,
+        now: datetime,
+        request_cutoff: datetime | None,
+        audit_cutoff: datetime | None,
+        batch_size: int,
+    ) -> RequestRetentionBatchResult:
+        request_rows: list[tuple[str, str]] = []
+        if request_cutoff is not None:
+            cursor.execute(
+                """
+                SELECT request_id, owner
+                FROM async_requests
+                WHERE store_id = %s
+                  AND state IN ('succeeded', 'failed', 'cancelled', 'expired')
+                  AND completed_at <= %s
+                ORDER BY completed_at, request_id
+                FOR UPDATE SKIP LOCKED
+                LIMIT %s
+                """,
+                (self._store_id, request_cutoff, batch_size),
+            )
+            request_rows = [(str(row[0]), str(row[1])) for row in cursor]
+
+        audit_deleted = 0
+        if audit_cutoff is not None:
+            cursor.execute(
+                """
+                WITH candidates AS (
+                    SELECT sequence
+                    FROM async_request_claim_audit_archive
+                    WHERE store_id = %s AND at <= %s
+                    ORDER BY at, sequence
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT %s
+                )
+                DELETE FROM async_request_claim_audit_archive AS audit
+                USING candidates
+                WHERE audit.sequence = candidates.sequence
+                RETURNING audit.sequence
+                """,
+                (self._store_id, audit_cutoff, batch_size),
+            )
+            audit_deleted = len(cursor.fetchall())
+            remaining = batch_size - audit_deleted
+            if remaining:
+                cursor.execute(
+                    """
+                    WITH candidates AS (
+                        SELECT sequence
+                        FROM async_request_claim_audit
+                        WHERE store_id = %s AND at <= %s
+                        ORDER BY at, sequence
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT %s
+                    )
+                    DELETE FROM async_request_claim_audit AS audit
+                    USING candidates
+                    WHERE audit.sequence = candidates.sequence
+                    RETURNING audit.sequence
+                    """,
+                    (self._store_id, audit_cutoff, remaining),
+                )
+                audit_deleted += len(cursor.fetchall())
+
+        audit_archived = 0
+        request_ids = [row[0] for row in request_rows]
+        if request_ids:
+            cursor.execute(
+                """
+                SELECT audit.sequence
+                FROM async_request_claim_audit AS audit
+                WHERE audit.store_id = %s
+                  AND audit.request_id = ANY(%s)
+                  AND (%s::timestamptz IS NULL OR audit.at > %s)
+                ORDER BY audit.sequence
+                FOR UPDATE SKIP LOCKED
+                LIMIT %s
+                """,
+                (
+                    self._store_id,
+                    request_ids,
+                    audit_cutoff,
+                    audit_cutoff,
+                    batch_size,
+                ),
+            )
+            audit_sequences = [int(row[0]) for row in cursor]
+            if audit_sequences:
+                cursor.execute(
+                    """
+                    INSERT INTO async_request_claim_audit_archive (
+                        sequence, store_id, request_id, owner, worker_id,
+                        fencing_token, at, event, lease_until, details
+                    )
+                    SELECT
+                        audit.sequence, audit.store_id, audit.request_id,
+                        request.owner, audit.worker_id, audit.fencing_token,
+                        audit.at, audit.event, audit.lease_until, audit.details
+                    FROM async_request_claim_audit AS audit
+                    JOIN async_requests AS request
+                      ON request.store_id = audit.store_id
+                     AND request.request_id = audit.request_id
+                    WHERE audit.store_id = %s
+                      AND audit.sequence = ANY(%s)
+                    ORDER BY audit.sequence
+                    """,
+                    (self._store_id, audit_sequences),
+                )
+                cursor.execute(
+                    """
+                    DELETE FROM async_request_claim_audit
+                    WHERE store_id = %s AND sequence = ANY(%s)
+                    RETURNING sequence
+                    """,
+                    (self._store_id, audit_sequences),
+                )
+                audit_archived = len(cursor.fetchall())
+
+        requests_deleted = 0
+        if request_ids:
+            cursor.execute(
+                """
+                DELETE FROM async_requests AS request
+                WHERE request.store_id = %s
+                  AND request.request_id = ANY(%s)
+                  AND request.state IN (
+                      'succeeded', 'failed', 'cancelled', 'expired'
+                  )
+                  AND request.completed_at <= %s
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM async_request_claim_audit AS audit
+                      WHERE audit.store_id = request.store_id
+                        AND audit.request_id = request.request_id
+                  )
+                RETURNING request.request_id
+                """,
+                (self._store_id, request_ids, request_cutoff),
+            )
+            requests_deleted = len(cursor.fetchall())
+
+        cursor.execute(
+            """
+            WITH candidates AS (
+                SELECT owner
+                FROM async_request_owner_deferrals
+                WHERE store_id = %s AND not_before <= %s
+                ORDER BY not_before, owner
+                FOR UPDATE SKIP LOCKED
+                LIMIT %s
+            )
+            DELETE FROM async_request_owner_deferrals AS deferral
+            USING candidates
+            WHERE deferral.store_id = %s
+              AND deferral.owner = candidates.owner
+              AND deferral.not_before <= %s
+            RETURNING deferral.owner
+            """,
+            (self._store_id, now, batch_size, self._store_id, now),
+        )
+        deferrals_deleted = len(cursor.fetchall())
+        return RequestRetentionBatchResult(
+            request_cutoff=request_cutoff,
+            audit_cutoff=audit_cutoff,
+            terminal_requests_deleted=requests_deleted,
+            audit_events_archived=audit_archived,
+            audit_events_deleted=audit_deleted,
+            owner_deferrals_deleted=deferrals_deleted,
+            has_more=self._retention_work_exists(
+                cursor,
+                now=now,
+                request_cutoff=request_cutoff,
+                audit_cutoff=audit_cutoff,
+            ),
+            applied=True,
+        )
 
     def list(
         self,
@@ -2380,8 +3246,18 @@ class PostgresRequestStore:
                             """
                             SELECT sequence, store_id, request_id, worker_id,
                                    fencing_token, at, event, lease_until, details
-                            FROM async_request_claim_audit
-                            WHERE store_id = %s
+                            FROM (
+                                SELECT sequence, store_id, request_id, worker_id,
+                                       fencing_token, at, event, lease_until,
+                                       details
+                                FROM async_request_claim_audit
+                                UNION ALL
+                                SELECT sequence, store_id, request_id, worker_id,
+                                       fencing_token, at, event, lease_until,
+                                       details
+                                FROM async_request_claim_audit_archive
+                            ) AS retained_audit
+                            WHERE retained_audit.store_id = %s
                             ORDER BY sequence
                             """,
                             (self._store_id,),
@@ -2391,8 +3267,19 @@ class PostgresRequestStore:
                             """
                             SELECT sequence, store_id, request_id, worker_id,
                                    fencing_token, at, event, lease_until, details
-                            FROM async_request_claim_audit
-                            WHERE store_id = %s AND request_id = %s
+                            FROM (
+                                SELECT sequence, store_id, request_id, worker_id,
+                                       fencing_token, at, event, lease_until,
+                                       details
+                                FROM async_request_claim_audit
+                                UNION ALL
+                                SELECT sequence, store_id, request_id, worker_id,
+                                       fencing_token, at, event, lease_until,
+                                       details
+                                FROM async_request_claim_audit_archive
+                            ) AS retained_audit
+                            WHERE retained_audit.store_id = %s
+                              AND retained_audit.request_id = %s
                             ORDER BY sequence
                             """,
                             (self._store_id, request_id),

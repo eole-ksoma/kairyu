@@ -365,6 +365,17 @@ class AsyncRequestsSection(BaseModel):
     max_records_per_tenant: int = Field(default=64, ge=1)
     poll_interval_s: float = Field(default=0.5, ge=0.05)
     lease_seconds: float = Field(default=30.0, ge=1.0)
+    request_retention_s: float | None = Field(
+        default=None,
+        ge=60.0,
+        le=315_360_000.0,
+    )
+    audit_retention_s: float | None = Field(
+        default=None,
+        ge=60.0,
+        le=315_360_000.0,
+    )
+    retention_batch_size: int = Field(default=500, ge=1, le=10_000)
 
     @field_validator("store_id")
     @classmethod

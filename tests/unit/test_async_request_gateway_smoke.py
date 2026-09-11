@@ -94,6 +94,9 @@ def test_f1c_fixture_enables_async_requests_on_all_gateways():
         "max_records_per_tenant": 64,
         "poll_interval_s": 0.1,
         "lease_seconds": 3,
+        "request_retention_s": 60,
+        "audit_retention_s": 86400,
+        "retention_batch_size": 2,
     }
     deployments = [
         document for document in documents if document and document.get("kind") == "Deployment"

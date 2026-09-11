@@ -223,6 +223,37 @@ class Smoke:
         )
         return [json.loads(line) for line in completed.stdout.splitlines() if line]
 
+    def _sql_scalar(self, sql: str) -> str:
+        completed = self._kubectl_run(
+            "exec",
+            "deployment/f1c-postgres",
+            "--",
+            "psql",
+            "postgresql://kairyu:f1c-kind-only@127.0.0.1:5432/kairyu",
+            "-XAt",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            sql,
+        )
+        return completed.stdout.strip()
+
+    def _retention_cli(self, *args: str) -> tuple[dict[str, Any], str]:
+        completed = self._kubectl_run(
+            "exec",
+            "deployment/f1c-gateway-a",
+            "--",
+            "python",
+            "/app/scripts/async_request_retention.py",
+            "/etc/kairyu/config.yaml",
+            *args,
+            timeout=120.0,
+        )
+        output = completed.stdout.strip()
+        if not output:
+            raise AssertionError("retention CLI returned no structured result")
+        return json.loads(output.splitlines()[-1]), output
+
     def _wait_audit_event(
         self,
         request_id: str,
@@ -696,6 +727,110 @@ class Smoke:
             }
         )
 
+    def retention_and_audit_archive(self) -> None:
+        request_id = str(self.checks[0]["request_id"])
+        before_text = self._request("GET", "/metrics", gateway_id="a").text
+        before_succeeded = metric_value(
+            before_text,
+            "kairyu_async_request_state",
+            store=STORE_ID,
+            state="succeeded",
+        )
+        before_transitions = metric_value(
+            before_text,
+            "kairyu_async_request_transitions_total",
+            store=STORE_ID,
+            event="succeed",
+        )
+        self._retention_cli("--mode", "prepare", "--apply")
+        safe_request_id = request_id.replace("'", "''")
+        self._sql_scalar(
+            "UPDATE async_requests "
+            "SET completed_at = clock_timestamp() - interval '2 hours', "
+            "updated_at = clock_timestamp() - interval '2 hours' "
+            f"WHERE store_id = '{STORE_ID}' AND request_id = '{safe_request_id}'; "
+            "UPDATE async_request_claim_audit "
+            "SET at = clock_timestamp() - interval '2 hours' "
+            f"WHERE store_id = '{STORE_ID}' AND request_id = '{safe_request_id}'"
+        )
+        preview, preview_output = self._retention_cli("--mode", "purge")
+        if preview.get("applied") is not False:
+            raise AssertionError("retention preview unexpectedly mutated data")
+        self._status(request_id, "b")
+        applied, applied_output = self._retention_cli(
+            "--mode",
+            "purge",
+            "--apply",
+            "--max-batches",
+            "10",
+        )
+        if int(applied.get("terminal_requests_deleted", 0)) != 1:
+            raise AssertionError(f"retention did not delete one request: {applied}")
+        archived = int(
+            self._sql_scalar(
+                "SELECT count(*) FROM async_request_claim_audit_archive "
+                f"WHERE store_id = '{STORE_ID}' "
+                f"AND request_id = '{safe_request_id}' AND owner = 'default'"
+            )
+        )
+        if archived <= 0:
+            raise AssertionError("request audit did not survive payload retention")
+        for gateway_id in GATEWAY_IDS:
+            self._request(
+                "GET",
+                f"/v1/requests/{request_id}",
+                gateway_id=gateway_id,
+                expected_status=404,
+            )
+        deadline = time.monotonic() + self._timeout_seconds
+        while time.monotonic() < deadline:
+            current = self._request("GET", "/metrics", gateway_id="c").text
+            current_succeeded = metric_value(
+                current,
+                "kairyu_async_request_state",
+                store=STORE_ID,
+                state="succeeded",
+            )
+            current_transitions = metric_value(
+                current,
+                "kairyu_async_request_transitions_total",
+                store=STORE_ID,
+                event="succeed",
+            )
+            if (
+                current_succeeded == before_succeeded - 1
+                and current_transitions == before_transitions
+            ):
+                break
+            time.sleep(0.2)
+        else:
+            raise AssertionError("retention metrics did not converge")
+        self._sql_scalar(
+            "UPDATE async_request_claim_audit_archive "
+            "SET at = clock_timestamp() - interval '2 days' "
+            f"WHERE store_id = '{STORE_ID}' AND request_id = '{safe_request_id}'"
+        )
+        audit_purge, audit_output = self._retention_cli(
+            "--mode",
+            "purge",
+            "--apply",
+            "--max-batches",
+            "10",
+        )
+        if int(audit_purge.get("audit_events_deleted", 0)) != archived:
+            raise AssertionError("audit TTL did not remove the archived events")
+        if any(
+            request_id in output or "shared-state" in output
+            for output in (preview_output, applied_output, audit_output)
+        ):
+            raise AssertionError("retention output leaked request data")
+        self.checks.append(
+            {
+                "name": "bounded_retention_and_independent_audit_ttl",
+                "archived_audit_events": archived,
+            }
+        )
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -732,6 +867,7 @@ def main() -> int:
         smoke.owner_failover()
         smoke.database_reconnect()
         smoke.shared_queue_telemetry()
+        smoke.retention_and_audit_archive()
         report = {
             "schema_version": 1,
             "gate": "async-request-three-gateway-smoke",

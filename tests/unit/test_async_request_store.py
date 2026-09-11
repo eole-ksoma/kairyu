@@ -112,6 +112,99 @@ def test_metrics_snapshot_projects_due_deadlines_without_transition_side_effect(
     assert snapshot.transition_counts["expire"] == 1
 
 
+def test_retention_is_disabled_by_default_and_releases_terminal_capacity(
+    store: InMemoryRequestStore,
+    clock: Clock,
+) -> None:
+    intent = submission(idempotency_key="retained-key")
+    terminal = store.submit(intent)
+    claim = store.claim_next("worker-a", lease_seconds=30)
+    assert claim is not None
+    store.mark_running(claim)
+    store.succeed(claim, {"answer": 42})
+    active = store.submit(submission(owner="tenant-b"))
+
+    disabled = store.purge_retained_data(
+        request_retention_seconds=None,
+        audit_retention_seconds=None,
+    )
+    assert disabled.terminal_requests_deleted == 0
+    assert store.get(terminal.id).state is AsyncRequestState.SUCCEEDED
+
+    clock.advance(60)
+    preview = store.purge_retained_data(
+        request_retention_seconds=60,
+        audit_retention_seconds=None,
+        batch_size=1,
+        dry_run=True,
+    )
+    assert preview.applied is False
+    assert preview.terminal_requests_deleted == 1
+    assert store.get(terminal.id).state is AsyncRequestState.SUCCEEDED
+
+    applied = store.purge_retained_data(
+        request_retention_seconds=60,
+        audit_retention_seconds=None,
+        batch_size=1,
+    )
+    assert applied.applied is True
+    assert applied.terminal_requests_deleted == 1
+    with pytest.raises(KeyError):
+        store.get(terminal.id)
+    assert store.get(active.id).state is AsyncRequestState.QUEUED
+    replay_after_retention = store.submit(intent)
+    assert replay_after_retention.id != terminal.id
+    assert store.metrics_snapshot().transition_counts["succeed"] == 1
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"request_retention_seconds": 0}, "request_retention_seconds"),
+        ({"audit_retention_seconds": float("nan")}, "audit_retention_seconds"),
+        ({"dry_run": "false"}, "dry_run"),
+        ({"batch_size": True}, "batch_size"),
+        ({"batch_size": 10_001}, "batch_size"),
+    ],
+)
+def test_retention_rejects_unbounded_policy_values(
+    store: InMemoryRequestStore,
+    updates,
+    message: str,
+) -> None:
+    values = {
+        "request_retention_seconds": None,
+        "audit_retention_seconds": None,
+        "batch_size": 500,
+    }
+    values.update(updates)
+    with pytest.raises(ValueError, match=message):
+        store.purge_retained_data(**values)
+
+
+def test_retention_cutoff_includes_exact_boundary_only_after_ttl(
+    store: InMemoryRequestStore,
+    clock: Clock,
+) -> None:
+    before = store.submit(submission(deadline_at=clock.now))
+    clock.advance(1)
+    boundary = store.submit(submission(deadline_at=clock.now))
+    clock.advance(1)
+    after = store.submit(submission(deadline_at=clock.now))
+
+    result = store.purge_retained_data(
+        request_retention_seconds=1,
+        audit_retention_seconds=None,
+    )
+
+    assert result.terminal_requests_deleted == 2
+    with pytest.raises(KeyError):
+        store.get(before.id)
+    with pytest.raises(KeyError):
+        store.get(boundary.id)
+    assert store.get(after.id).state is AsyncRequestState.EXPIRED
+
+
 def test_submit_get_and_list_are_tenant_scoped(store: InMemoryRequestStore) -> None:
     first = store.submit(submission())
     second = store.submit(submission(owner="tenant-b", priority=10))

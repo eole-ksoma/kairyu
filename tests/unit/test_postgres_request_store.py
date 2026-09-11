@@ -849,6 +849,536 @@ def test_cancel_and_success_race_commits_only_one_terminal_state(store_factory) 
     assert len(terminal_events) == 1
 
 
+def test_retention_archives_audit_in_bounded_chunks_and_preserves_metrics(
+    store_factory,
+) -> None:
+    create, store_id = store_factory
+    store = create(max_records_per_owner=2)
+    store.prepare_retention()
+    intent = submission(idempotency_key="retention-key")
+    request = store.submit(intent)
+    claim = store.claim_next("worker-a", lease_seconds=30)
+    assert claim is not None
+    store.mark_running(claim)
+    for _ in range(5):
+        claim = store.renew_claim(claim, lease_seconds=30)
+    store.succeed(claim, {"answer": 42})
+    active = store.submit(submission(owner="tenant-b"))
+    before = store.metrics_snapshot()
+
+    assert psycopg is not None
+    with psycopg.connect(_POSTGRES_DSN, autocommit=True) as connection:
+        connection.execute(
+            """
+            UPDATE async_requests
+            SET completed_at = clock_timestamp() - interval '2 hours',
+                updated_at = clock_timestamp() - interval '2 hours'
+            WHERE store_id = %s AND request_id = %s
+            """,
+            (store_id, request.id),
+        )
+        connection.execute(
+            """
+            UPDATE async_request_claim_audit
+            SET at = clock_timestamp() - interval '2 hours'
+            WHERE store_id = %s AND request_id = %s
+            """,
+            (store_id, request.id),
+        )
+    original_events = store.export_claim_audit(request.id)
+    assert len(original_events) == 8
+
+    preview = store.purge_retained_data(
+        request_retention_seconds=3600,
+        audit_retention_seconds=10_800,
+        batch_size=3,
+        dry_run=True,
+    )
+    assert preview.applied is False
+    assert preview.terminal_requests_deleted == 0
+    assert preview.audit_events_archived == 3
+    assert store.get(request.id).state is AsyncRequestState.SUCCEEDED
+
+    batches = []
+    for _ in range(5):
+        batch = store.purge_retained_data(
+            request_retention_seconds=3600,
+            audit_retention_seconds=10_800,
+            batch_size=3,
+        )
+        batches.append(batch)
+        assert batch.audit_events_archived <= 3
+        if batch.terminal_requests_deleted:
+            break
+    assert sum(batch.audit_events_archived for batch in batches) == 8
+    assert sum(batch.terminal_requests_deleted for batch in batches) == 1
+    with pytest.raises(KeyError):
+        store.get(request.id)
+    assert store.get(active.id).state is AsyncRequestState.QUEUED
+    assert store.export_claim_audit(request.id) == original_events
+
+    after_request_purge = store.metrics_snapshot()
+    assert after_request_purge.state_counts[AsyncRequestState.SUCCEEDED] == 0
+    assert after_request_purge.transition_counts == before.transition_counts
+    store.migrate_metrics_during_maintenance()
+    assert store.metrics_snapshot().transition_counts == before.transition_counts
+    replay = store.submit(intent)
+    assert replay.id != request.id
+
+    audit_deleted = 0
+    for _ in range(5):
+        batch = store.purge_retained_data(
+            request_retention_seconds=None,
+            audit_retention_seconds=3600,
+            batch_size=3,
+        )
+        audit_deleted += batch.audit_events_deleted
+        if not batch.has_more:
+            break
+    assert audit_deleted == 8
+    assert store.export_claim_audit(request.id) == ()
+    assert store.metrics_snapshot().transition_counts == before.transition_counts
+    store.migrate_metrics_during_maintenance()
+    assert store.metrics_snapshot().transition_counts == before.transition_counts
+
+
+def test_retention_archive_failure_rolls_back_request_and_state_counter(
+    store_factory,
+) -> None:
+    create, store_id = store_factory
+    store = create()
+    store.prepare_retention()
+    request = store.submit(submission())
+    claim = store.claim_next("worker-a", lease_seconds=30)
+    assert claim is not None
+    store.mark_running(claim)
+    store.succeed(claim, {"answer": 42})
+    assert psycopg is not None
+    with psycopg.connect(_POSTGRES_DSN, autocommit=True) as connection:
+        connection.execute(
+            """
+            UPDATE async_requests
+            SET completed_at = clock_timestamp() - interval '2 hours'
+            WHERE store_id = %s AND request_id = %s
+            """,
+            (store_id, request.id),
+        )
+        connection.execute(
+            """
+            CREATE OR REPLACE FUNCTION reject_async_request_audit_archive()
+            RETURNS TRIGGER LANGUAGE plpgsql AS $$
+            BEGIN
+                RAISE EXCEPTION 'archive rejected for rollback test';
+            END;
+            $$
+            """
+        )
+        connection.execute(
+            """
+            CREATE TRIGGER reject_async_request_audit_archive
+            BEFORE INSERT ON async_request_claim_audit_archive
+            FOR EACH ROW EXECUTE FUNCTION reject_async_request_audit_archive()
+            """
+        )
+    try:
+        with pytest.raises(
+            psycopg.errors.RaiseException,
+            match="archive rejected for rollback test",
+        ):
+            store.purge_retained_data(
+                request_retention_seconds=3600,
+                audit_retention_seconds=None,
+                batch_size=10,
+            )
+        assert store.get(request.id).state is AsyncRequestState.SUCCEEDED
+        assert len(store.export_claim_audit(request.id)) == 3
+        assert store.metrics_snapshot().state_counts[AsyncRequestState.SUCCEEDED] == 1
+    finally:
+        with psycopg.connect(_POSTGRES_DSN, autocommit=True) as connection:
+            connection.execute(
+                "DROP TRIGGER IF EXISTS reject_async_request_audit_archive "
+                "ON async_request_claim_audit_archive"
+            )
+            connection.execute(
+                "DROP FUNCTION IF EXISTS reject_async_request_audit_archive()"
+            )
+
+
+def test_retention_skips_a_locked_oldest_request_and_rechecks_later(
+    store_factory,
+) -> None:
+    create, store_id = store_factory
+    first = create()
+    second = create()
+    first.prepare_retention()
+    oldest = first.submit(submission(idempotency_key="oldest"))
+    newer = first.submit(submission(idempotency_key="newer"))
+    first.cancel(oldest.id)
+    first.cancel(newer.id)
+    assert psycopg is not None
+    with psycopg.connect(_POSTGRES_DSN, autocommit=True) as connection:
+        connection.execute(
+            """
+            UPDATE async_requests
+            SET completed_at = clock_timestamp() - interval '2 hours'
+                - CASE WHEN request_id = %s THEN interval '1 minute'
+                       ELSE interval '0 seconds' END
+            WHERE store_id = %s AND request_id = ANY(%s)
+            """,
+            (oldest.id, store_id, [oldest.id, newer.id]),
+        )
+
+    with psycopg.connect(_POSTGRES_DSN, autocommit=True) as locker:
+        with locker.transaction():
+            locker.execute(
+                """
+                SELECT request_id
+                FROM async_requests
+                WHERE store_id = %s AND request_id = %s
+                FOR UPDATE
+                """,
+                (store_id, oldest.id),
+            )
+            batch = second.purge_retained_data(
+                request_retention_seconds=3600,
+                audit_retention_seconds=None,
+                batch_size=1,
+            )
+            assert batch.terminal_requests_deleted == 1
+            assert batch.has_more is True
+            with pytest.raises(KeyError):
+                first.get(newer.id)
+
+            locked_only = second.purge_retained_data(
+                request_retention_seconds=3600,
+                audit_retention_seconds=None,
+                batch_size=1,
+            )
+            assert locked_only.terminal_requests_deleted == 0
+            assert locked_only.audit_events_archived == 0
+            assert locked_only.has_more is True
+
+    assert first.get(oldest.id).state is AsyncRequestState.CANCELLED
+    recovered = first.purge_retained_data(
+        request_retention_seconds=3600,
+        audit_retention_seconds=None,
+        batch_size=1,
+    )
+    assert recovered.terminal_requests_deleted == 1
+    with pytest.raises(KeyError):
+        first.get(oldest.id)
+
+
+@pytest.mark.parametrize(
+    "index_name",
+    [
+        "async_request_owner_deferrals_retention_idx",
+        "async_request_claim_audit_request_idx",
+        "async_request_claim_audit_archive_request_idx",
+    ],
+)
+def test_retention_requires_every_prepared_index(store_factory, index_name) -> None:
+    create, _store_id = store_factory
+    store = create()
+    store.prepare_retention()
+    assert psycopg is not None
+    with psycopg.connect(_POSTGRES_DSN, autocommit=True) as connection:
+        connection.execute(f"DROP INDEX {index_name}")
+    try:
+        with pytest.raises(RuntimeError, match="requires the expected ready index"):
+            store.purge_retained_data(
+                request_retention_seconds=3600,
+                audit_retention_seconds=3600,
+            )
+    finally:
+        store.prepare_retention()
+
+
+def test_retention_rejects_and_repairs_wrong_same_name_index(store_factory) -> None:
+    create, _store_id = store_factory
+    store = create()
+    store.prepare_retention()
+    assert psycopg is not None
+    with psycopg.connect(_POSTGRES_DSN, autocommit=True) as connection:
+        connection.execute("DROP INDEX async_requests_terminal_retention_idx")
+        connection.execute(
+            """
+            CREATE INDEX async_requests_terminal_retention_idx
+            ON async_requests (store_id, request_id, completed_at)
+            WHERE state = 'succeeded'
+            """
+        )
+    with pytest.raises(RuntimeError, match="requires the expected ready index"):
+        store.purge_retained_data(
+            request_retention_seconds=3600,
+            audit_retention_seconds=None,
+        )
+
+    store.prepare_retention()
+    result = store.purge_retained_data(
+        request_retention_seconds=3600,
+        audit_retention_seconds=None,
+        dry_run=True,
+    )
+    assert result.applied is False
+
+
+def test_retention_preview_matches_apply_parent_and_audit_caps(store_factory) -> None:
+    create, store_id = store_factory
+    store = create()
+    store.prepare_retention()
+    oldest = store.submit(submission(idempotency_key="preview-oldest"))
+    outside_batch = store.submit(submission(idempotency_key="preview-outside"))
+    store.cancel(oldest.id)
+    store.cancel(outside_batch.id)
+    assert psycopg is not None
+    with psycopg.connect(_POSTGRES_DSN, autocommit=True) as connection:
+        connection.execute(
+            """
+            UPDATE async_requests
+            SET completed_at = clock_timestamp() - interval '2 hours'
+                - CASE WHEN request_id = %s THEN interval '1 minute'
+                       ELSE interval '0 seconds' END
+            WHERE store_id = %s AND request_id = ANY(%s)
+            """,
+            (oldest.id, store_id, [oldest.id, outside_batch.id]),
+        )
+        connection.execute(
+            """
+            UPDATE async_request_claim_audit
+            SET at = clock_timestamp()
+                - CASE WHEN request_id = %s THEN interval '4 hours'
+                       ELSE interval '2 hours' END
+            WHERE store_id = %s AND request_id = ANY(%s)
+            """,
+            (oldest.id, store_id, [oldest.id, outside_batch.id]),
+        )
+
+    preview = store.purge_retained_data(
+        request_retention_seconds=3600,
+        audit_retention_seconds=10_800,
+        batch_size=1,
+        dry_run=True,
+    )
+    assert preview.terminal_requests_deleted == 1
+    assert preview.audit_events_deleted == 1
+    assert preview.audit_events_archived == 0
+
+    applied = store.purge_retained_data(
+        request_retention_seconds=3600,
+        audit_retention_seconds=10_800,
+        batch_size=1,
+    )
+    assert applied.terminal_requests_deleted == preview.terminal_requests_deleted
+    assert applied.audit_events_deleted == preview.audit_events_deleted
+    assert applied.audit_events_archived == preview.audit_events_archived
+    with pytest.raises(KeyError):
+        store.get(oldest.id)
+    assert store.get(outside_batch.id).state is AsyncRequestState.CANCELLED
+
+
+def test_retention_only_removes_expired_owner_deferrals(store_factory) -> None:
+    create, store_id = store_factory
+    store = create()
+    store.prepare_retention()
+    assert psycopg is not None
+    with psycopg.connect(_POSTGRES_DSN, autocommit=True) as connection:
+        connection.execute(
+            """
+            INSERT INTO async_request_owner_deferrals (
+                store_id, owner, not_before
+            ) VALUES
+                (%s, 'expired-owner', clock_timestamp() - interval '1 second'),
+                (%s, 'future-owner', clock_timestamp() + interval '1 hour')
+            """,
+            (store_id, store_id),
+        )
+
+    batch = store.purge_retained_data(
+        request_retention_seconds=None,
+        audit_retention_seconds=3600,
+    )
+    assert batch.owner_deferrals_deleted == 1
+    with psycopg.connect(_POSTGRES_DSN, autocommit=True) as connection:
+        owners = connection.execute(
+            """
+            SELECT owner
+            FROM async_request_owner_deferrals
+            WHERE store_id = %s
+            ORDER BY owner
+            """,
+            (store_id,),
+        ).fetchall()
+    assert owners == [("future-owner",)]
+
+
+def test_concurrent_retention_workers_partition_terminal_rows(store_factory) -> None:
+    create, store_id = store_factory
+    first = create(max_records_per_owner=32)
+    second = create(max_records_per_owner=32)
+    first.prepare_retention()
+    requests = [
+        first.submit(submission(idempotency_key=f"purge-{index}"))
+        for index in range(20)
+    ]
+    for request in requests:
+        first.cancel(request.id)
+    assert psycopg is not None
+    with psycopg.connect(_POSTGRES_DSN, autocommit=True) as connection:
+        connection.execute(
+            """
+            UPDATE async_requests
+            SET completed_at = clock_timestamp() - interval '2 hours'
+            WHERE store_id = %s
+            """,
+            (store_id,),
+        )
+    barrier = threading.Barrier(2)
+
+    def purge(store: PostgresRequestStore):
+        barrier.wait()
+        return store.purge_retained_data(
+            request_retention_seconds=3600,
+            audit_retention_seconds=None,
+            batch_size=10,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = [
+            future.result()
+            for future in (
+                executor.submit(purge, first),
+                executor.submit(purge, second),
+            )
+        ]
+    assert sum(result.terminal_requests_deleted for result in results) == 20
+    assert sum(result.audit_events_archived for result in results) == 20
+    assert first.list(limit=32) == []
+
+
+def test_retention_refuses_unmigrated_telemetry(store_factory) -> None:
+    create, store_id = store_factory
+    store = create()
+    assert psycopg is not None
+    with psycopg.connect(_POSTGRES_DSN, autocommit=True) as connection:
+        connection.execute(
+            """
+            DELETE FROM async_request_metric_migrations
+            WHERE store_id = %s AND migration = 'sharded-v2'
+            """,
+            (store_id,),
+        )
+
+    with pytest.raises(RuntimeError, match="before sharded-v2 telemetry migration"):
+        store.prepare_retention()
+    disabled = store.purge_retained_data(
+        request_retention_seconds=None,
+        audit_retention_seconds=None,
+    )
+    assert disabled.has_more is False
+    assert disabled.terminal_requests_deleted == 0
+    with pytest.raises(RuntimeError, match="missing migrations"):
+        store.purge_retained_data(
+            request_retention_seconds=3600,
+            audit_retention_seconds=3600,
+        )
+
+
+def test_maintenance_construction_refuses_a_typo_store_id(store_factory) -> None:
+    create, _store_id = store_factory
+    create()
+    missing_store_id = f"missing-{uuid.uuid4().hex}"
+    with pytest.raises(RuntimeError, match="refusing to create"):
+        PostgresRequestStore(
+            _POSTGRES_DSN,
+            store_id=missing_store_id,
+            allow_store_creation=False,
+        )
+    assert psycopg is not None
+    with psycopg.connect(_POSTGRES_DSN, autocommit=True) as connection:
+        row = connection.execute(
+            """
+            SELECT 1
+            FROM async_request_store_registry
+            WHERE store_id = %s
+            """,
+            (missing_store_id,),
+        ).fetchone()
+    assert row is None
+
+
+def test_validate_only_maintenance_connection_never_repairs_schema(
+    store_factory,
+) -> None:
+    create, store_id = store_factory
+    store = create()
+    store.prepare_retention()
+    legacy_store_id = f"legacy-{uuid.uuid4().hex}"
+    assert psycopg is not None
+    with psycopg.connect(_POSTGRES_DSN, autocommit=True) as connection:
+        connection.execute(
+            """
+            INSERT INTO async_request_store_registry (store_id, schema_version)
+            VALUES (%s, 1)
+            """,
+            (legacy_store_id,),
+        )
+        connection.execute("DROP INDEX async_request_owner_deferrals_retention_idx")
+    maintenance = None
+    try:
+        maintenance = PostgresRequestStore(
+            _POSTGRES_DSN,
+            store_id=store_id,
+            allow_store_creation=False,
+            initialize_schema=False,
+        )
+        with psycopg.connect(_POSTGRES_DSN, autocommit=True) as connection:
+            legacy_version = connection.execute(
+                """
+                SELECT schema_version
+                FROM async_request_store_registry
+                WHERE store_id = %s
+                """,
+                (legacy_store_id,),
+            ).fetchone()
+            missing_index = connection.execute(
+                "SELECT to_regclass('async_request_owner_deferrals_retention_idx')"
+            ).fetchone()
+        assert legacy_version == (1,)
+        assert missing_index == (None,)
+        with psycopg.connect(_POSTGRES_DSN, autocommit=True) as connection:
+            connection.execute(
+                "DELETE FROM async_request_store_registry WHERE store_id = %s",
+                (legacy_store_id,),
+            )
+        maintenance.prepare_retention()
+        with psycopg.connect(_POSTGRES_DSN, autocommit=True) as connection:
+            rebuilt_index = connection.execute(
+                "SELECT to_regclass('async_request_owner_deferrals_retention_idx')"
+            ).fetchone()
+        assert rebuilt_index == ("async_request_owner_deferrals_retention_idx",)
+    finally:
+        if maintenance is not None:
+            maintenance.close()
+        with psycopg.connect(_POSTGRES_DSN, autocommit=True) as connection:
+            connection.execute(
+                "DELETE FROM async_request_store_registry WHERE store_id = %s",
+                (legacy_store_id,),
+            )
+        store.prepare_retention()
+
+
+def test_postgres_retention_rejects_non_boolean_dry_run(store_factory) -> None:
+    create, _store_id = store_factory
+    store = create()
+    with pytest.raises(ValueError, match="dry_run"):
+        store.purge_retained_data(
+            request_retention_seconds=None,
+            audit_retention_seconds=None,
+            dry_run="false",  # type: ignore[arg-type]
+        )
+
+
 async def test_async_worker_renews_and_publishes_through_postgres(store_factory) -> None:
     create, _store_id = store_factory
     store = create()

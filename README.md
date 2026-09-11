@@ -1068,6 +1068,7 @@ uv run --frozen python verification/orchestration/performance/orchestration_mock
 | `scripts/helm_integration.sh` | prerequisite-checked Helm rendering tests |
 | `scripts/postgres_integration.sh` | pinned-container PostgreSQL integration tests |
 | `scripts/kind_async_request_gate.sh` | staged CPU/kind test for three-gateway durable AsyncRequest lifecycle and failover |
+| `scripts/async_request_retention.py` | preview, prepare, and apply bounded AsyncRequest request/audit retention |
 | `pytest --fail-on-skip -m dist` | multi-process gloo tests (also included in the default run) |
 
 Conventions: all CI-facing tests run against `MockBackend` (deterministic,

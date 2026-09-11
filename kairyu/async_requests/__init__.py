@@ -16,6 +16,7 @@ from kairyu.async_requests.store import (
     InvalidRequestTransitionError,
     RequestCapacityError,
     RequestQueueMetricsSnapshot,
+    RequestRetentionBatchResult,
     RequestStoreProtocol,
     StaleRequestClaimError,
 )
@@ -35,6 +36,7 @@ __all__ = [
     "RequestClaim",
     "RequestCapacityError",
     "RequestQueueMetricsSnapshot",
+    "RequestRetentionBatchResult",
     "RequestStoreProtocol",
     "StaleRequestClaimError",
     "status_of",

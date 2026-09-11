@@ -229,3 +229,45 @@ probe colour (a non-empty check let the corrupted `ductduct…` output pass
 once). Status: GPU-verified 2026-09-04 on 8 × RTX PRO 6000 (tree hash /
 image ID pinned; all three gates PASS for both examples; results in each
 example's `MEASUREMENTS.md`).
+
+### V4.1 Flash single-replica amendment (2026-09-11)
+
+Status: GPU-verified on SM120; final evidence in the example's MEASUREMENTS.md.
+
+`examples/deepseek-v4.1-flash-8gpu` uses one TP8 replica across GPUs 0–7,
+retaining the V4 vision example's ReplicaPool, legacy OpenAI chat/tool path,
+image admission, and Chat UI. The owner's revised allocation supersedes the
+initial two-replica proposal. TP/EP, DSpark, batch limits, CUDA graphs, and
+Engram CPU/GPU placement are L1 measurement choices on the SM120 host.
+
+Omitted effort means thinking `high`. The model-author encoder at the pinned
+checkpoint maps `low/high/max` to `50/75/100`; the initial vLLM image instead
+maps `high` to 50. An image-local encoder adjustment aligns those aliases,
+with the Python frontend selected and rendered-prefix checks at build time.
+Kairyu's L2/L3 effort normalization remains the existing contract.
+
+The official V4.1 image also needs SM120 page compatibility: 64-token
+manager blocks in BLHNC, 64-token SWA pages on the SM120 subclass, and the
+existing FlashInfer dual-cache prefill template instantiated for C2 pages
+of 32 tokens (C1 uses 64). Exact-anchor image patches fail on source drift;
+the 16-case packed-cache GPU numerical gate passes using upstream DSV4
+tolerances. A V4.1-only SM120 indexer subclass also selects 64-token
+manager blocks to satisfy DeepGEMM's 32/64 compressed-page envelope. SM120
+FP8 indexer decode supports only 64-token pages, so this example selects
+MXFP4 indexer Q/K. The existing MXFP4 kernels pass four real-writer and
+prefill/decode tests against independently unpacked PyTorch logits (maximum
+absolute error 2.4e-7); dtype enablement is limited to V4.1 on SM120.
+Adaptive DSpark verification is disabled because the indexer backend rejects
+it. Bounded GPU comparisons select TP8/EP8, DSpark 5, 16K batched tokens,
+64 sequences, memory utilization 0.90 and NCCL. Retain GPU Engram and
+breakable CUDA graphs. EP-off runs out of KV memory under the same limits;
+PCIe IPC stalls during autotuning, and 8K batching shows no throughput gain.
+These trials do not establish a global optimum. The final 320-request matrix,
+thinking/tool/vision/cancellation gates, normal restart, and four retrieval
+smokes through 1,039,909 actual prompt tokens pass on the pinned configuration.
+
+Fixed-length performance rows record first model output (reasoning or
+content) separately from first visible content, which stays null if no
+content was emitted. Completed-answer/tool/image gates are independent.
+Only SHA-bound measurements in the example's `MEASUREMENTS.md` establish
+the final runtime and performance claims.

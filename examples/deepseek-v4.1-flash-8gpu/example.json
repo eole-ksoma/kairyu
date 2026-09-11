@@ -101,8 +101,7 @@
       "default",
       "low",
       "high",
-      "max",
-      "off"
+      "max"
     ]
   },
   "api_port": 8007,

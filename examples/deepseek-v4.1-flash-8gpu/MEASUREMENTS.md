@@ -1,7 +1,8 @@
 # Measurement status
 
-Implementation and GPU selection are in progress. No V4.1 performance or
-correctness gate is claimed passed until the exact run evidence is recorded.
+The initial TP8 configuration passes completed-answer, tool, vision and
+cancellation gates. L1 performance selection and final restart/long-context
+validation are in progress; initial results below are not the final selection.
 
 Hardware target: 8 × NVIDIA RTX PRO 6000 Blackwell Server Edition,
 97,887 MiB per GPU, PCIe, one TP8 replica.
@@ -68,3 +69,22 @@ Retained evidence: `sm120-indexer-parity.log`. The FP8 full-model rejection
 is retained in `block64-worker.log`. Full-model quality with the selected
 MXFP4 indexer still needs verification; the kernel test compares the actual
 quantized values, not the model's BF16 indexer quality.
+
+## Initial full-model gates
+
+Runtime image: `027bf47b2bd6` (full ID above). Served-config SHA-256:
+`ce09cf2323b40a0123f2d992a0b6ecdb7538231b43d24f6b54d89d2681ce408d`.
+All artifacts are under the NVMe example's `verification-results/` directory.
+
+| Gate | Result | Run |
+|---|---|---|
+| Reasoning default/low/high/max | 4/4 completed `323`, with reasoning | `20260911T032048Z` |
+| Tool calling and effort overrides | 7/7 | `20260911T032049Z` |
+| Vision | 2/2 completed colour answers | `20260911T032051Z` |
+| Cancellation | L1 observed active, then L1/L2 released; follow-up completed | `20260911T032052Z` |
+
+The UI uses V4's default/low/high/max choices and the standard top-level
+`reasoning_effort`. The unchanged legacy L3 rejects `chat_template_kwargs`
+on text requests; an initial experimental off toggle was removed after
+that HTTP 400 was observed (`20260911T031732Z`). The L1 tokenizer's direct
+off preflight is not a public-gateway capability claim.

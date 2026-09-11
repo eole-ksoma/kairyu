@@ -111,7 +111,7 @@ def main() -> None:
 
     reports = []
     try:
-        for name in args.candidates:
+        for candidate_index, name in enumerate(args.candidates):
             row_dir = run_dir / name
             row_dir.mkdir()
             command = candidate_command(original, name)
@@ -130,7 +130,13 @@ def main() -> None:
             }
             reports.append(report)
             try:
-                restart(override, row_dir / "startup.log")
+                # The initial runtime has already passed the exact config/image
+                # check. Reuse it for the first baseline measurement.
+                if candidate_index == 0 and name == "baseline":
+                    report["reused_verified_baseline"] = True
+                    control._validate_ready(f"http://127.0.0.1:{env['API_PORT']}")
+                else:
+                    restart(override, row_dir / "startup.log")
                 if name == "pcie-ipc":
                     logs = subprocess.check_output(
                         ["docker", "logs", env["COMPOSE_PROJECT_NAME"] + "-deepseek-0-1"],

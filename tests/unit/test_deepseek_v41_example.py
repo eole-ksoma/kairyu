@@ -78,23 +78,22 @@ def test_mxfp4_enablement_is_limited_to_verified_model_and_device(capability, mo
             namespace["guard"](config)
 
 
-def test_ui_can_switch_off_then_restore_default_and_explicit_efforts():
+def test_ui_restores_default_and_forwards_only_supported_effort_fields():
     selector = load("webui-reasoning-effort-filter").Filter()
     body = {"reasoning_effort": "high", "max_tokens": 32768}
 
     def choose(effort):
         return selector.inlet(body, {"valves": selector.UserValves(reasoning_effort=effort)})
 
-    choose("off")
-    assert "reasoning_effort" not in body
-    assert body["chat_template_kwargs"] == {"thinking": False, "enable_thinking": False}
+    body["chat_template_kwargs"] = {"thinking": False, "enable_thinking": False}
     choose("default")
     assert body == {"max_tokens": 32768}
     for effort in ("low", "high", "max"):
-        choose("off")
         choose(effort)
         assert body["reasoning_effort"] == effort
-        assert body["chat_template_kwargs"] == {"thinking": True, "enable_thinking": True}
+        assert "chat_template_kwargs" not in body
+    with pytest.raises(ValueError):
+        choose("off")
 
 
 def test_default_high_is_set_at_l1_and_ui():

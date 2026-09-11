@@ -19,9 +19,6 @@ pools:
         capabilities:
           allow_prompt_kinds:
           - multimodal
-          allow_chat_template_kwargs:
-          - thinking
-          - enable_thinking
         image_input_policy:
           max_images: 8
           max_image_bytes: 8388608

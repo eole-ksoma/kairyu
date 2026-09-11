@@ -17,19 +17,18 @@ class Filter:
     Params field. The selection is forwarded verbatim as the
     OpenAI-compatible ``reasoning_effort`` body field; the levels are the
     official checkpoint encoder's vocabulary. ``default`` leaves the effort
-    unspecified so L1's thinking-high default applies. ``off`` explicitly
-    disables thinking without sending an unsupported L3 effort value.
+    unspecified so L1's thinking-high default applies.
     """
 
     class Valves(BaseModel):
         pass
 
     class UserValves(BaseModel):
-        reasoning_effort: Literal["default", "low", "high", "max", "off"] = Field(
+        reasoning_effort: Literal["default", "low", "high", "max"] = Field(
             default="default",
             description=(
                 "Reasoning effort for DeepSeek-V4.1-Flash. "
-                "default = thinking high (75); off = direct chat."
+                "default = thinking high (75)."
             ),
         )
 
@@ -39,20 +38,10 @@ class Filter:
     def inlet(self, body: dict, __user__: dict | None = None) -> dict:
         valves = (__user__ or {}).get("valves")
         effort = getattr(valves, "reasoning_effort", None) if valves else None
-        kwargs = dict(body.get("chat_template_kwargs") or {})
-        if effort == "off":
+        if effort == "default":
             body.pop("reasoning_effort", None)
-            kwargs.update(thinking=False, enable_thinking=False)
-        elif effort == "default":
-            body.pop("reasoning_effort", None)
-            for key in ("thinking", "enable_thinking", "reasoning_effort"):
-                kwargs.pop(key, None)
         elif effort:
             body["reasoning_effort"] = effort
-            kwargs.update(thinking=True, enable_thinking=True)
-            kwargs.pop("reasoning_effort", None)
-        if kwargs:
-            body["chat_template_kwargs"] = kwargs
-        else:
-            body.pop("chat_template_kwargs", None)
+        # Legacy chat uses L1's renderer; only the top-level effort is public.
+        body.pop("chat_template_kwargs", None)
         return body

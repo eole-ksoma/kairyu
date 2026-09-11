@@ -668,12 +668,12 @@ def tool_calling(run_dir: Path) -> int:
             error = "default thinking did not reach a final answer"
         record("thinking_high_default", error)
 
-    # Explicitly disabled thinking still produces a completed visible answer.
+    # An explicit low effort overrides the high default and completes.
     status, body = _post_chat(
         {
             "model": SERVED_MODEL,
             "messages": [{"role": "user", "content": "Reply with the single word OK."}],
-            "chat_template_kwargs": {"thinking": False, "enable_thinking": False},
+            "reasoning_effort": "low",
             "max_tokens": 512,
         }
     )
@@ -684,10 +684,10 @@ def tool_calling(run_dir: Path) -> int:
         choice = body["choices"][0]
         message = choice["message"]
         if not message.get("content") or choice.get("finish_reason") != "stop":
-            error = "non-thinking request did not complete a visible answer"
-        elif message.get("reasoning_content"):
-            error = "explicitly disabled thinking produced reasoning"
-    record("explicit_non_thinking", error)
+            error = "low-effort request did not complete a visible answer"
+        elif not message.get("reasoning_content"):
+            error = "low-effort request produced no reasoning"
+    record("explicit_low_effort", error)
 
     report["passed"] = not failures
     (run_dir / "tool-calling.json").write_text(
@@ -883,7 +883,7 @@ def reasoning(run_dir: Path) -> int:
     import urllib.request
 
     reports = []
-    for effort in (None, "low", "high", "max", "off"):
+    for effort in (None, "low", "high", "max"):
         payload = {
             "model": SERVED_MODEL,
             "stream": True,
@@ -893,9 +893,7 @@ def reasoning(run_dir: Path) -> int:
                 {"role": "user", "content": "What is 17 * 19? Reply with only the integer."}
             ],
         }
-        if effort == "off":
-            payload["chat_template_kwargs"] = {"thinking": False, "enable_thinking": False}
-        elif effort is not None:
+        if effort is not None:
             payload["reasoning_effort"] = effort
         request = urllib.request.Request(
             f"http://127.0.0.1:{os.environ.get('API_PORT', SPEC['api_port'])}/v1/chat/completions",
@@ -929,7 +927,7 @@ def reasoning(run_dir: Path) -> int:
             done
             and finish == "stop"
             and content.strip() == "323"
-            and bool(trace) == (effort != "off")
+            and bool(trace)
         )
         reports.append(
             {
@@ -1034,7 +1032,7 @@ def cancellation(run_dir: Path) -> int:
         {
             "model": SERVED_MODEL,
             "max_tokens": 512,
-            "chat_template_kwargs": {"thinking": False, "enable_thinking": False},
+            "reasoning_effort": "low",
             "messages": [{"role": "user", "content": "Reply OK."}],
         }
     )
@@ -1154,7 +1152,7 @@ def main() -> None:
             "every replica"
         )
         print(
-            "reasoning     default/high/low/max/off, completed answers and time to visible content"
+            "reasoning     default/high/low/max, completed answers and time to visible content"
         )
         print("cancellation  disconnect releases the replica slot; a follow-up completes")
         print("long-context  32K/128K/256K/near-1M retrieval smokes")

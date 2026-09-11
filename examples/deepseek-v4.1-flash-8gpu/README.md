@@ -39,14 +39,13 @@ cache storage. `VERIFY_MODEL=1 ./run.sh up` rehashes the cached model.
 Omitted effort means **thinking high**, both through the API and in Chat UI.
 The pinned DeepSeek encoder defines `low=50`, `high=75`, and `max=100`.
 The example aligns the L1 encoder with those definitions. The UI's `default`
-selection inherits high, while `off` sends explicit false thinking switches.
+selection inherits high; the dropdown exposes default/low/high/max.
 
 ```json
 {"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"What is 17 * 19?"}],"max_tokens":8192}
 ```
 
-An explicit `reasoning_effort` selects `low`, `high`, or `max`. To disable
-thinking, send `"chat_template_kwargs":{"thinking":false,"enable_thinking":false}`.
+An explicit `reasoning_effort` selects `low`, `high`, or `max`.
 The existing Kairyu L3 effort aliases are preserved. Thinking needs room in
 the output budget: a length-limited reasoning trace without a final answer
 is incomplete. Chat UI retains V4's 32,768-token default; callers can set

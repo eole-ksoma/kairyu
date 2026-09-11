@@ -36,7 +36,7 @@ def main():
     runner = _SparseMLAPagedAttentionRunner(d_v=512)
     results = []
     for extra_page, tokens, topk, masked in itertools.product(
-        (64, 128), (1, 128), (128, 192), (False, True)
+        (32, 64), (1, 128), (128, 192), (False, True)
     ):
         main_cache, main_ref = cache(64)
         extra_cache, extra_ref = cache(extra_page)

@@ -246,12 +246,18 @@ maps `high` to 50. An image-local encoder adjustment aligns those aliases,
 with the Python frontend selected and rendered-prefix checks at build time.
 Kairyu's L2/L3 effort normalization remains the existing contract.
 
-The official V4.1 image also needs SM120 page compatibility: 128-token
+The official V4.1 image also needs SM120 page compatibility: 64-token
 manager blocks in BLHNC, 64-token SWA pages on the SM120 subclass, and the
-existing FlashInfer dual-cache prefill template instantiated for C1 pages
-of 128 tokens (C2 uses 64). Exact-anchor image patches fail on source drift;
+existing FlashInfer dual-cache prefill template instantiated for C2 pages
+of 32 tokens (C1 uses 64). Exact-anchor image patches fail on source drift;
 the 16-case packed-cache GPU numerical gate passes using upstream DSV4
-tolerances. Adaptive DSpark verification is disabled because the indexer
+tolerances. A V4.1-only SM120 indexer subclass also selects 64-token
+manager blocks to satisfy DeepGEMM's 32/64 compressed-page envelope. SM120
+FP8 indexer decode supports only 64-token pages, so this example selects
+MXFP4 indexer Q/K. The existing MXFP4 kernels pass four real-writer and
+prefill/decode tests against independently unpacked PyTorch logits (maximum
+absolute error 2.4e-7); dtype enablement is limited to V4.1 on SM120.
+Adaptive DSpark verification is disabled because the indexer
 backend rejects it. Full-model inference and parameter selection remain open.
 
 Fixed-length performance rows record first model output (reasoning or

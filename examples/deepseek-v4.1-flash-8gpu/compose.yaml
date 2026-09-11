@@ -26,8 +26,10 @@ services:
     - --trust-remote-code
     - --kv-cache-dtype
     - fp8
+    - --attention-config
+    - '{"indexer_kv_dtype":"mxfp4"}'
     - --block-size
-    - '128'
+    - '64'
     - --tensor-parallel-size
     - '8'
     - --enable-expert-parallel

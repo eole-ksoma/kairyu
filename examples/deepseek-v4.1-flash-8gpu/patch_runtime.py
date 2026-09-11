@@ -43,30 +43,72 @@ def align_swa_pages(source: str, *, sm120: bool = False) -> str:
     )
 
 
-def enable_compressed_page128(source: str) -> str:
-    """Instantiate existing generic dual-cache kernels for V4.1 C1 pages."""
+def enable_compressed_page32(source: str) -> str:
+    """Instantiate existing generic dual-cache kernels for V4.1 C2 pages."""
     edits = (
         (
             "(extra_page_block_size == 64 || extra_page_block_size == 2)",
-            "(extra_page_block_size == 64 || extra_page_block_size == 128 || "
+            "(extra_page_block_size == 64 || extra_page_block_size == 32 || "
             "extra_page_block_size == 2)",
         ),
         (
             "      DISPATCH_FULLTILE_BY_NH_PBSX(64);\n    } else {",
             "      DISPATCH_FULLTILE_BY_NH_PBSX(64);\n"
-            "    } else if (extra_page_block_size == 128) {\n"
-            "      DISPATCH_FULLTILE_BY_NH_PBSX(128);\n    } else {",
+            "    } else if (extra_page_block_size == 32) {\n"
+            "      DISPATCH_FULLTILE_BY_NH_PBSX(32);\n    } else {",
         ),
         (
             "    DISPATCH_BY_NH_PBSX(64);\n  } else if (extra_page_block_size == 2)",
             "    DISPATCH_BY_NH_PBSX(64);\n"
-            "  } else if (extra_page_block_size == 128) {\n"
-            "    DISPATCH_BY_NH_PBSX(128);\n  } else if (extra_page_block_size == 2)",
+            "  } else if (extra_page_block_size == 32) {\n"
+            "    DISPATCH_BY_NH_PBSX(32);\n  } else if (extra_page_block_size == 2)",
         ),
     )
     for before, after in edits:
         source = replace_once(source, before, after)
     return source
+
+
+def align_indexer_pages(source: str) -> str:
+    declaration = """class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):"""
+    backend = """class DeepseekV41SM120IndexerBackend(DeepseekV4IndexerBackend):
+    @staticmethod
+    def get_supported_kernel_block_sizes():
+        return [64]
+
+
+"""
+    source = replace_once(source, declaration, backend + declaration)
+    return replace_once(
+        source,
+        "        return DeepseekV4IndexerBackend\n",
+        "        from vllm.platforms import current_platform\n"
+        "        if current_platform.is_device_capability_family(120):\n"
+        "            return DeepseekV41SM120IndexerBackend\n"
+        "        return DeepseekV4IndexerBackend\n",
+    )
+
+
+def align_mla_pages(source: str) -> str:
+    return replace_once(
+        source,
+        "        return [128]\n",
+        "        from vllm.platforms import current_platform\n"
+        "        return [64 if current_platform.is_device_capability_family(120) else 128]\n",
+    )
+
+
+def enable_sm120_v41_indexer(source: str) -> str:
+    return replace_once(
+        source,
+        "    if use_fp4 and not current_platform.is_device_capability_family(100):\n",
+        "    sm120_v41 = (\n"
+        "        current_platform.is_device_capability_family(120)\n"
+        "        and vllm_config.model_config.hf_config.model_type == 'deepseek_v41'\n"
+        "    )\n"
+        "    if use_fp4 and not ("
+        "current_platform.is_device_capability_family(100) or sm120_v41):\n",
+    )
 
 
 def align_efforts(source: str) -> str:
@@ -113,12 +155,15 @@ def main() -> None:
     assert vllm and vllm.origin and flashinfer and flashinfer.origin
     model = Path(vllm.origin).parent / "models/deepseek_v4_1"
     attention = model / "attention.py"
-    attention.write_text(align_swa_pages(attention.read_text()))
+    attention.write_text(align_indexer_pages(align_swa_pages(attention.read_text())))
     sm120 = model / "nvidia/flashinfer_sparse.py"
-    sm120.write_text(align_swa_pages(sm120.read_text(), sm120=True))
+    sm120.write_text(align_mla_pages(align_swa_pages(sm120.read_text(), sm120=True)))
+    indexer = Path(vllm.origin).parent / "v1/attention/backends/mla/indexer.py"
+    indexer.write_text(enable_sm120_v41_indexer(indexer.read_text()))
     prefill = Path(flashinfer.origin).parent / "data/csrc/sparse_mla_sm120_prefill.cu"
-    prefill.write_text(enable_compressed_page128(prefill.read_text()))
-    print("SM120 pages: SWA=64, compressed C1=128/C2=64 (manager block=128)")
+    prefill.write_text(enable_compressed_page32(prefill.read_text()))
+    print("SM120 pages: SWA=64, compressed C1=64/C2=32 (manager block=64)")
+    print("V4.1 SM120 MXFP4 indexer enabled (real writer/prefill/decode numerical gate)")
 
 
 if __name__ == "__main__":

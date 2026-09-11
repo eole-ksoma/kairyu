@@ -36,12 +36,12 @@ pools:
         quantization_format: mixed-fp4-fp8
         cache_descriptor:
           family: deepseek-v41-swa-csa-engram
-          block_size: 128
+          block_size: 64
         tensor_parallel_size: 8
         expert_parallel_size: 8
         attention_data_parallel_size: 1
         dspark_enabled: true
-        container_image_digest: sha256:82cdd20125d935a175c790a3ba3a4d27006f8c04cf024571ef05cfeed98aa46d
+        container_image_digest: sha256:027bf47b2bd6f0d0abe54b296e7e9e3d31ee103bb6e46fa0a9807117681c2359
     unhealthy_after: 1
     queue_depth_threshold: 0
     prefix_index: true

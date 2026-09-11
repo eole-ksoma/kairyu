@@ -5,6 +5,7 @@ import importlib.util
 import json
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -42,6 +43,39 @@ def test_runtime_edits_fail_closed_on_missing_or_duplicate_anchors():
             patch.replace_once(original, "anchor\n", "anchor\naddition\n")
     changed = patch.replace_once("anchor\n", "anchor\n", "anchor\naddition\n")
     assert patch.replace_once(changed, "anchor\n", "anchor\naddition\n") == changed
+
+
+@pytest.mark.parametrize(
+    "capability,model,allowed",
+    [
+        (100, "deepseek_v4", True),
+        (120, "deepseek_v41", True),
+        (120, "deepseek_v4", False),
+        (90, "deepseek_v41", False),
+    ],
+)
+def test_mxfp4_enablement_is_limited_to_verified_model_and_device(capability, model, allowed):
+    source = (
+        "def guard(vllm_config):\n"
+        "    use_fp4 = True\n"
+        "    if use_fp4 and not current_platform.is_device_capability_family(100):\n"
+        "        raise ValueError('unsupported')\n"
+        "    return use_fp4\n"
+    )
+    namespace = {
+        "current_platform": SimpleNamespace(
+            is_device_capability_family=lambda family: family == capability
+        )
+    }
+    exec(load("patch_runtime").enable_sm120_v41_indexer(source), namespace)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type=model))
+    )
+    if allowed:
+        assert namespace["guard"](config)
+    else:
+        with pytest.raises(ValueError, match="unsupported"):
+            namespace["guard"](config)
 
 
 def test_ui_can_switch_off_then_restore_default_and_explicit_efforts():

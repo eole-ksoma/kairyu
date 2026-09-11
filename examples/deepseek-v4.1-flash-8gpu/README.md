@@ -61,11 +61,16 @@ the interactive UI default.
 
 The SM120 FlashInfer overlay starts from the same 0.6.18 source revision as
 the GPU-verified V4 Vision example. V4.1 additionally needs 64-token SWA
-pages and dual-cache prefill instantiations for its 128-token C1 compressed
+pages and dual-cache prefill instantiations for its 32-token C2 compressed
 pages. `patch_runtime.py` makes these L1 adaptations against exact source
-anchors; changed upstream sources fail the build. Manager blocks are 128
+anchors; changed upstream sources fail the build. Manager blocks are 64
 tokens with the default BLHNC layout. Adaptive DSpark verification is off
-because the pinned indexer backend does not support it.
+because the pinned indexer backend does not support it. A V4.1-only SM120
+indexer subclass selects the same 64-token manager blocks: DeepGEMM
+accepts MXFP4 compressed pages of 32 or 64 tokens. The indexer uses
+MXFP4; its real Q/K quantizers, paged store, prefill and decode are checked
+against independently dequantized PyTorch logits by
+`check_sm120_indexer.py`. Enabling it is scoped to V4.1 on SM120.
 
 `check_sm120_pages.py` runs inside the L1 image with one SM120 GPU. It checks
 decode and prefill against independent PyTorch attention using the actual

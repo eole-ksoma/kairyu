@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import json
 import subprocess
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -81,13 +82,28 @@ def main() -> None:
             "--detach",
             "--no-deps",
             "--force-recreate",
-            "--wait",
-            "--wait-timeout",
-            str(args.startup_timeout),
             "deepseek-0",
         ]
         with log.open("w") as output:
-            subprocess.run(command, env=env, stdout=output, stderr=subprocess.STDOUT, check=True)
+            subprocess.run(
+                command,
+                env=env,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                timeout=args.startup_timeout,
+                check=True,
+            )
+        deadline = time.monotonic() + args.startup_timeout
+        container = env["COMPOSE_PROJECT_NAME"] + "-deepseek-0-1"
+        while time.monotonic() < deadline:
+            item = json.loads(subprocess.check_output(["docker", "inspect", container]))[0]
+            state = item["State"]
+            if item["RestartCount"] or not state["Running"]:
+                raise RuntimeError("L1 exited during startup; see worker.log")
+            if state.get("Health", {}).get("Status") == "healthy":
+                return
+            time.sleep(2)
+        raise TimeoutError(f"L1 did not become healthy in {args.startup_timeout} seconds")
 
     reports = []
     try:

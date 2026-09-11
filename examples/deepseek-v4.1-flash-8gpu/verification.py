@@ -948,6 +948,35 @@ def reasoning(run_dir: Path) -> int:
     return int(not all(row["passed"] for row in reports))
 
 
+def _upstream_active_requests() -> float:
+    """Read the L1 scheduler gauges without publishing an extra host port."""
+    import re
+
+    container = SPEC["environment"].replace(".", "-") + "-deepseek-0-1"
+    metrics = subprocess.check_output(
+        [
+            "docker",
+            "exec",
+            container,
+            "python3",
+            "-c",
+            "import urllib.request; print(urllib.request.urlopen("
+            '"http://127.0.0.1:8000/metrics", timeout=5).read().decode())',
+        ],
+        text=True,
+        timeout=10,
+    )
+    total = 0.0
+    for gauge in ("running", "waiting"):
+        values = re.findall(
+            rf"^vllm:num_requests_{gauge}\{{[^\n]*\}} ([0-9.eE+-]+)$", metrics, re.M
+        )
+        if not values:
+            raise ValueError(f"Missing L1 {gauge} request gauge")
+        total += sum(float(value) for value in values)
+    return total
+
+
 def cancellation(run_dir: Path) -> int:
     """A client disconnect releases its slot and permits another request."""
     import re
@@ -967,6 +996,7 @@ def cancellation(run_dir: Path) -> int:
         headers={"Content-Type": "application/json"},
     )
     saw_delta = False
+    upstream_observed = False
     with urllib.request.urlopen(request, timeout=1200) as response:
         for line in response:
             if line.startswith(b"data: ") and line[6:].strip() != b"[DONE]":
@@ -980,14 +1010,24 @@ def cancellation(run_dir: Path) -> int:
                 ):
                     saw_delta = True
                     break
+        # Allow the periodic L1 metrics publisher to observe the long request
+        # before disconnecting; otherwise a stale zero could hide leaked work.
+        deadline = time.monotonic() + 15
+        while saw_delta and time.monotonic() < deadline:
+            if _upstream_active_requests() > 0:
+                upstream_observed = True
+                break
+            time.sleep(0.5)
     deadline = time.monotonic() + 30
     released = False
+    upstream_released = False
     while time.monotonic() < deadline:
         with urllib.request.urlopen(api + "/metrics", timeout=5) as response:
             metrics = response.read().decode()
         values = re.findall(r"^kairyu_replica_outstanding\{[^\n]*\} ([0-9.]+)$", metrics, re.M)
-        if values and all(float(value) == 0 for value in values):
-            released = True
+        released = bool(values) and all(float(value) == 0 for value in values)
+        upstream_released = _upstream_active_requests() == 0
+        if released and upstream_released:
             break
         time.sleep(0.25)
     status, answer = _post_chat(
@@ -1007,8 +1047,12 @@ def cancellation(run_dir: Path) -> int:
     report = {
         "received_model_delta": saw_delta,
         "slot_released": released,
+        "upstream_request_observed": upstream_observed,
+        "upstream_request_released": upstream_released,
         "follow_up_completed": usable,
-        "passed": bool(saw_delta and released and usable),
+        "passed": bool(
+            saw_delta and released and upstream_observed and upstream_released and usable
+        ),
     }
     (run_dir / "cancellation.json").write_text(json.dumps(report, indent=2) + "\n")
     return int(not report["passed"])

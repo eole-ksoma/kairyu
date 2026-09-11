@@ -10,6 +10,7 @@
 | [`qwen3.8-27b-dp8-8gpu`](qwen3.8-27b-dp8-8gpu/README.md) | Qwen TP1 x 8 replicas, one per card | one public model with OpenAI tool calling; Kairyu L2 is the replica pool only (even, prefix-aware placement) |
 | [`deepseek-v4-flash-0731-dp2-8gpu`](deepseek-v4-flash-0731-dp2-8gpu/README.md) | DeepSeek TP4+EP4 x 2 replicas (GPU 0-3, 4-7) | one public model with OpenAI tool calling; Kairyu L2 is the replica pool only (even, prefix-aware placement) |
 | [`deepseek-v4-flash-vision-exp-dp2-8gpu`](deepseek-v4-flash-vision-exp-dp2-8gpu/README.md) | DeepSeek-V4-Flash-Vision-Exp TP4+EP4 x 2 replicas (GPU 0-3, 4-7) | one public text + image model with OpenAI tool calling and a Chat UI reasoning-effort dropdown (default/low/high/max); replica pool only |
+| [`deepseek-v4.1-flash-8gpu`](deepseek-v4.1-flash-8gpu/README.md) | DeepSeek-V4.1-Flash, one TP8 replica (GPU 0-7) | text + image, OpenAI tools, default thinking high; V4 ReplicaPool/API/UI structure |
 | [`qwen3.8-flash-next-dp2-8gpu`](qwen3.8-flash-next-dp2-8gpu/README.md) | Qwen3.8-Flash-Next-FP8 TP4 x 2 replicas (GPU 0-3, 4-7) | one public text + image model with OpenAI tool calling and a Chat UI reasoning-effort dropdown (default/low/medium/xhigh); replica pool only |
 
 All seven use Kairyu as L3, vLLM as L1, and Open WebUI as the public chat surface.

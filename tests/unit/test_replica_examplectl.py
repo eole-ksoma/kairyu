@@ -25,6 +25,7 @@ EXAMPLES = {
     "deepseek-v4-flash-0731-dp2-8gpu": "deepseek",
     "deepseek-v4-flash-vision-exp-dp2-8gpu": "deepseek",
     "qwen3.8-flash-next-dp2-8gpu": "qwen",
+    "deepseek-v4.1-flash-8gpu": "deepseek",
 }
 # vLLM-side tool parser and non-thinking default kwarg per example.
 TOOL_PARSER = {
@@ -32,12 +33,14 @@ TOOL_PARSER = {
     "deepseek-v4-flash-0731-dp2-8gpu": "deepseek_v4",
     "deepseek-v4-flash-vision-exp-dp2-8gpu": "deepseek_v4",
     "qwen3.8-flash-next-dp2-8gpu": "qwen3_xml",
+    "deepseek-v4.1-flash-8gpu": "deepseek_v41",
 }
 THINKING_KEY = {
     "qwen3.8-27b-dp8-8gpu": "enable_thinking",
     "deepseek-v4-flash-0731-dp2-8gpu": "thinking",
     "deepseek-v4-flash-vision-exp-dp2-8gpu": "thinking",
     "qwen3.8-flash-next-dp2-8gpu": "enable_thinking",
+    "deepseek-v4.1-flash-8gpu": "thinking",
 }
 VISION_EXAMPLE = ROOT / "examples/deepseek-v4-flash-vision-exp-dp2-8gpu"
 FLASH_NEXT_EXAMPLE = ROOT / "examples/qwen3.8-flash-next-dp2-8gpu"
@@ -131,7 +134,9 @@ def test_allocation_compose_and_pool_agree(environment: str) -> None:
         assert "--enable-auto-tool-choice" in command
         assert command[command.index("--tool-call-parser") + 1] == parser
         default_kwargs = command[command.index("--default-chat-template-kwargs") + 1]
-        assert json.loads(default_kwargs)[thinking_key] is False
+        assert json.loads(default_kwargs)[thinking_key] is (
+            spec["model"].get("default_reasoning_effort") is not None
+        )
 
 
 def test_vision_examples_share_one_sm120_image_and_admit_images() -> None:
@@ -154,8 +159,9 @@ def test_vision_examples_share_one_sm120_image_and_admit_images() -> None:
         deployment = load_deployment_spec((path / "kairyu.yaml").read_text())
         options = deployment.pools[spec["allocation"]["model"]].replicas[0].options
         assert options["capabilities"]["allow_prompt_kinds"] == ["multimodal"]
-        assert options["image_input_policy"]["max_processed_prompt_tokens"] == (
-            spec["model"]["max_context_tokens"]
+        assert (
+            options["image_input_policy"]["max_processed_prompt_tokens"]
+            == (spec["model"]["max_context_tokens"])
         )
         compose = yaml.safe_load((path / "compose.yaml").read_text())
         assert compose["services"]["kairyu"]["build"]["args"] == {"KAIRYU_VISION": "1"}
@@ -314,9 +320,7 @@ def test_qwen_eight_replica_gate_rejects_material_skew(tmp_path: Path) -> None:
 
     offset = module._placement_offset(log)
     balanced = [
-        {"kind": "replica", "replica_id": str(replica)}
-        for replica in range(8)
-        for _ in range(8)
+        {"kind": "replica", "replica_id": str(replica)} for replica in range(8) for _ in range(8)
     ]
     _write_log(log, balanced)
     report = module._placement_report(
@@ -458,7 +462,7 @@ def test_tool_result_turn_requires_a_parsed_tool_call(
     streamed_call = "\n".join(
         [
             'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
-            '"function":{"name":"bash","arguments":"{\\\"command\\\":\\\"ls\\\"}"}}]}}]}',
+            '"function":{"name":"bash","arguments":"{\\"command\\":\\"ls\\"}"}}]}}]}',
             'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
             "data: [DONE]",
         ]
@@ -475,6 +479,11 @@ def test_tool_result_turn_requires_a_parsed_tool_call(
             (200, {"choices": [thinking_choice]}),
             (200, {"choices": [{"message": {"content": "OK"}}]}),
         ]
+        + (
+            [(200, {"choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}]})]
+            if module.SPEC["model"].get("default_reasoning_effort")
+            else []
+        )
     )
     request_ids = iter(f"req-{index}" for index in range(2 * module.REPLICAS))
 
@@ -532,11 +541,16 @@ def test_tool_placement_gate_ignores_unrelated_requests(
     counts = module._placement_counts(log, 0, request_ids=tool_request_ids)
 
     assert counts == {"0": fan}
-    assert module._tool_placement_error(
+    error = module._tool_placement_error(
         counts,
         expected_requests=fan,
         replicas=module.REPLICAS,
-    ) == f"only 1 of {module.REPLICAS} replicas served tool calls: {{'0': {fan}}}"
+    )
+    assert error == (
+        None
+        if module.REPLICAS == 1
+        else f"only 1 of {module.REPLICAS} replicas served tool calls: {{'0': {fan}}}"
+    )
 
 
 @pytest.mark.parametrize("environment", sorted(EXAMPLES))
@@ -564,8 +578,11 @@ def test_tool_placement_gate_waits_for_async_log_writes(
     )
 
     assert counts == final_counts
-    assert module._tool_placement_error(
-        counts,
-        expected_requests=fan,
-        replicas=module.REPLICAS,
-    ) is None
+    assert (
+        module._tool_placement_error(
+            counts,
+            expected_requests=fan,
+            replicas=module.REPLICAS,
+        )
+        is None
+    )

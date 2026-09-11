@@ -1,0 +1,101 @@
+# DeepSeek V4.1 Flash on eight RTX PRO 6000 GPUs
+
+One DeepSeek-V4.1-Flash replica uses all eight 96 GB RTX PRO 6000 Blackwell
+GPUs. The existing V4 vision example's L2 ReplicaPool and L3 OpenAI-compatible
+API / Open WebUI structure are retained. vLLM renders messages, images, and
+tools with the V4.1 encoder and parses V4.1 DSML tool calls.
+
+```text
+Open WebUI (:3007) -> Kairyu (:8007) -> ReplicaPool -> vLLM (TP8, GPUs 0–7)
+```
+
+## Start
+
+```sh
+./run.sh up
+./run.sh status
+./verify.sh tool-calling --no-start
+./verify.sh vision --no-start
+./verify.sh serving --no-start
+./verify.sh reasoning --no-start
+./verify.sh cancellation --no-start
+./verify.sh long-context --no-start
+```
+
+The model is approximately 510 GB. `run.sh` checks the exact GPU inventory,
+uses NVMe storage under `/mnt/nvme/kairyu`, pins CPU affinity, builds the
+runtime, downloads the fixed model revision, verifies its SHA-256 manifest,
+and checks readiness, a tool call, and an image answer. Existing inference
+services must release GPUs 0–7 before starting this example.
+
+API: `http://127.0.0.1:8007/v1`, model `deepseek-v4.1-flash`.
+Chat UI: `http://127.0.0.1:3007` (same local, auth-disabled UI as V4 Vision).
+Override ports with `API_PORT` / `CHAT_UI_PORT`.
+`./run.sh down` stops the stack while preserving model, UI, and compilation
+cache storage. `VERIFY_MODEL=1 ./run.sh up` rehashes the cached model.
+
+## Thinking and sampling
+
+Omitted effort means **thinking high**, both through the API and in Chat UI.
+The pinned DeepSeek encoder defines `low=50`, `high=75`, and `max=100`.
+The example aligns the L1 encoder with those definitions. The UI's `default`
+selection inherits high, while `off` sends explicit false thinking switches.
+
+```json
+{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"What is 17 * 19?"}],"max_tokens":8192}
+```
+
+An explicit `reasoning_effort` selects `low`, `high`, or `max`. To disable
+thinking, send `"chat_template_kwargs":{"thinking":false,"enable_thinking":false}`.
+The existing Kairyu L3 effort aliases are preserved. Thinking needs room in
+the output budget: a length-limited reasoning trace without a final answer
+is incomplete. Chat UI retains V4's 32,768-token default; callers can set
+their own limit within the context budget.
+
+Sampling defaults are `temperature=1.0`, `top_p=1.0`, within the model card's
+recommended range. Explicit request sampling remains supported. The model
+card's evaluation output allowance (at least 256K tokens) is distinct from
+the interactive UI default.
+
+## L1 selection and evidence
+
+The SM120 FlashInfer overlay uses the same 0.6.18 source revision as the
+GPU-verified V4 Vision example; its 128/192-token sparse attention shapes
+cover the V4.1 window and DSpark draft.
+
+Runtime, model, and configuration pins live in `example.json`,
+`model-manifest.json`, and `kairyu.yaml`. See `MEASUREMENTS.md` for the tested
+configuration, comparisons, and limitations. The initial TP8/EP8, Marlin,
+FP8 KV, prefix-cache and DSpark settings are candidates until measured.
+
+For bounded L1 comparisons after startup:
+
+```sh
+../../.venv/bin/python tune.py baseline no-spec no-ep
+```
+
+The tuner records each actual command and restores the baseline in `finally`.
+Run additional named batch/memory/graph candidates only after the first stage
+identifies a correct baseline. Final measurements use `verify.sh`.
+
+`serving` uses unique prompt prefixes, approximately 8K input tokens,
+exactly 256 generated tokens, and concurrency 1/8/16/32/64. It verifies all
+requests were placed on the single replica. These fixed-length rows include
+reasoning tokens and do not measure completed-answer quality.
+`tool-calling` and `vision` separately require completed, usable outputs.
+`reasoning` checks default and explicit efforts and records time to final
+content. `cancellation` checks slot release. `long-context` retains retrieval
+smokes at 32K/128K/256K and near the 1M context boundary; these are retrieval
+smokes, not a comprehensive long-context quality evaluation.
+
+Results are written under the example's NVMe `verification-results` directory;
+each run records the served-config hash. Sampling outcomes are evidence for
+the retained cases, not a universal model-quality guarantee.
+
+## Primary references
+
+- [DeepSeek model card](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)
+- [Pinned official encoder specification](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/encoding/README.md)
+- [vLLM recipe](https://recipes.vllm.ai/deepseek-ai/DeepSeek-V4.1-Flash)
+
+The official recipe's GB200 results are not measurements of RTX PRO 6000.

@@ -12,11 +12,12 @@ chat/tool path, and Chat UI. Default thinking effort is the model author's
 - [x] Implement lifecycle, UI defaults, model attestation, and verification.
 - [x] Run CPU contract tests and lint.
 - [x] Save the existing stack's restart information; release its GPUs.
-- [ ] Establish a correct TP8 baseline; compare EP, DSpark, batch/sequence
-  limits, memory placement, and supported graphs in bounded stages.
-- [ ] Run final serving, tool, thinking/default/override, vision, cancellation,
+- [x] Establish a correct TP8 baseline; compare EP, DSpark, PCIe IPC and
+  batch limits in bounded stages. Retain GPU Engram, graphs and sequence
+  limit 64; unmeasured alternatives are explicitly identified in measurements.
+- [x] Run final serving, tool, thinking/default/override, vision, cancellation,
   restart, and long-context checks; retain exact evidence and limitations.
-- [ ] Document measurements and design/progress changes; create the PR.
+- [x] Document measurements and design/progress changes; create PR #597.
 
 ## Sources
 

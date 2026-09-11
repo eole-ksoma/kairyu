@@ -862,6 +862,11 @@ def runtime_evidence() -> dict:
         for key, value in expected_env.items():
             if environment.get(key) != str(value):
                 raise ValueError(f"Running L1 environment differs at {key}")
+        # This candidate keeps the baseline command unchanged. Reject a stale
+        # opt-in even when the committed configuration omits the variable.
+        pcie_flag = "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"
+        if environment.get(pcie_flag, "0") != str(expected_env.get(pcie_flag, "0")):
+            raise ValueError("Running L1 PCIe IPC setting differs from compose.yaml")
         rows.append(
             {
                 "name": container["Name"],
@@ -1145,7 +1150,7 @@ def main() -> None:
         )
         print(
             "tool-calling  OpenAI bash-tool agent contract (auto call, tool-result turn, "
-            "streaming, thinking high default, explicit non-thinking) on every replica"
+            "streaming, thinking high default, explicit low effort) on every replica"
         )
         print(
             "vision        OpenAI image-part requests answered with visible content on "

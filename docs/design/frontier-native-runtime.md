@@ -232,7 +232,7 @@ example's `MEASUREMENTS.md`).
 
 ### V4.1 Flash single-replica amendment (2026-09-11)
 
-Status: accepted; implementation and GPU validation in progress.
+Status: GPU-verified on SM120; final evidence in the example's MEASUREMENTS.md.
 
 `examples/deepseek-v4.1-flash-8gpu` uses one TP8 replica across GPUs 0–7,
 retaining the V4 vision example's ReplicaPool, legacy OpenAI chat/tool path,
@@ -257,8 +257,14 @@ FP8 indexer decode supports only 64-token pages, so this example selects
 MXFP4 indexer Q/K. The existing MXFP4 kernels pass four real-writer and
 prefill/decode tests against independently unpacked PyTorch logits (maximum
 absolute error 2.4e-7); dtype enablement is limited to V4.1 on SM120.
-Adaptive DSpark verification is disabled because the indexer
-backend rejects it. Full-model inference and parameter selection remain open.
+Adaptive DSpark verification is disabled because the indexer backend rejects
+it. Bounded GPU comparisons select TP8/EP8, DSpark 5, 16K batched tokens,
+64 sequences, memory utilization 0.90 and NCCL. Retain GPU Engram and
+breakable CUDA graphs. EP-off runs out of KV memory under the same limits;
+PCIe IPC stalls during autotuning, and 8K batching shows no throughput gain.
+These trials do not establish a global optimum. The final 320-request matrix,
+thinking/tool/vision/cancellation gates, normal restart, and four retrieval
+smokes through 1,039,909 actual prompt tokens pass on the pinned configuration.
 
 Fixed-length performance rows record first model output (reasoning or
 content) separately from first visible content, which stays null if no

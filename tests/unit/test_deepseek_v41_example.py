@@ -109,6 +109,33 @@ def test_default_high_is_set_at_l1_and_ui():
     assert spec["model"]["reasoning_effort_budgets"]["high"] == 75
 
 
+def test_evidence_rejects_stale_pcie_candidate_with_identical_command(monkeypatch):
+    verification = load("verification")
+    compose = yaml.safe_load((EXAMPLE / "compose.yaml").read_text())
+    worker = compose["services"]["deepseek-0"]
+    environment = dict(worker["environment"])
+    container = {
+        "Name": "test-worker",
+        "Image": verification.SPEC["vllm"]["image_id"],
+        "Config": {"Cmd": worker["command"]},
+        "State": {"StartedAt": "test-start"},
+        "HostConfig": {"DeviceRequests": []},
+    }
+
+    def inspect(command, **kwargs):
+        if command[1] == "inspect":
+            container["Config"]["Env"] = [f"{key}={value}" for key, value in environment.items()]
+            return json.dumps([container])
+        return (EXAMPLE / "kairyu.yaml").read_bytes()
+
+    monkeypatch.setattr(verification.subprocess, "check_output", inspect)
+    assert verification.runtime_evidence()["replicas"][0]["started_at"] == "test-start"
+    flag = "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC"
+    environment[flag] = "0" if environment.get(flag, "0") == "1" else "1"
+    with pytest.raises(ValueError, match="PCIe IPC"):
+        verification.runtime_evidence()
+
+
 def test_readiness_rejects_absent_tool_calls(monkeypatch):
     control = load("control")
     monkeypatch.setattr(

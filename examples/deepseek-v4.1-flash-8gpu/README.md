@@ -76,10 +76,27 @@ decode and prefill against independent PyTorch attention using the actual
 packed cache bytes, C1/C2 page sizes, padded block strides, masks and sinks.
 Its tolerances follow the pinned FlashInfer DSV4 correctness tests.
 
+To reproduce the two kernel gates before starting the stack, from this
+directory with GPU 0 available:
+
+```sh
+for check in check_sm120_pages.py check_sm120_indexer.py; do
+  docker run --rm --gpus device=0 --ipc=host \
+    -v "$PWD:/checks:ro" --entrypoint python3 \
+    local/vllm-openai:deepseek-v41-sm120 "/checks/$check"
+done
+```
+
 Runtime, model, and configuration pins live in `example.json`,
 `model-manifest.json`, and `kairyu.yaml`. See `MEASUREMENTS.md` for the tested
-configuration, comparisons, and limitations. The initial TP8/EP8, Marlin,
-FP8 KV, prefix-cache and DSpark settings are candidates until measured.
+configuration, comparisons, and limitations. The measured selection uses
+TP8/EP8, Marlin, FP8 KV, MXFP4 indexer, prefix caching, DSpark 5, a 16K
+batch limit, 64 sequences, GPU-resident Engram and breakable CUDA graphs.
+The default all-reduce backend is NCCL.
+
+The local image ID is an evidence pin. A fresh source build can produce a
+different ID; startup then stops until both image pins are updated and the
+GPU gates are rerun for that build.
 
 For bounded L1 comparisons after startup:
 
@@ -88,8 +105,9 @@ For bounded L1 comparisons after startup:
 ```
 
 The tuner records each actual command and restores the baseline in `finally`.
-Run additional named batch/memory/graph candidates only after the first stage
-identifies a correct baseline. Final measurements use `verify.sh`.
+The retained comparisons cover EP, DSpark, PCIe IPC and an 8K batch limit.
+Additional named batch/memory/graph candidates are optional experiments;
+final measurements use `verify.sh` against the committed configuration.
 
 `serving` uses unique prompt prefixes, approximately 8K input tokens,
 exactly 256 generated tokens, and concurrency 1/8/16/32/64. It verifies all

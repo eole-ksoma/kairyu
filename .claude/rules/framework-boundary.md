@@ -4,6 +4,13 @@ Apply this rule to the entire PR diff against main, including earlier commits.
 
 ## Framework admission
 
+Start with no framework changes. First attempt to compose the example using
+existing Kairyu capabilities; minimize any remaining framework diff. Generality
+alone is insufficient: a change must demonstrably improve an existing shared
+contract or add independently reusable value to the framework. Apply this gate
+while planning, not only during implementation or review. Changes that fail it
+must not appear in the plan.
+
 `kairyu/` owns independently reusable inference, transport, orchestration,
 resource-accounting, and lifecycle contracts. Before changing it, identify:
 

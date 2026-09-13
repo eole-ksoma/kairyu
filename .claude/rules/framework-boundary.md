@@ -30,6 +30,9 @@ policies. A generic quota mechanism may know reservation, dispatch, and usage;
 it must not know which candidate, review, audit, or page is being executed.
 
 Prefer existing extension points and narrow programmatic dependency injection.
+Construct example orchestration with Kairyu's DSL and configuration; do not add
+Python orchestration implementations to examples. Missing shared capabilities
+must satisfy the framework admission criteria above.
 Do not monkeypatch framework globals, copy an entire framework implementation
 into an example, or establish a second input/HTTP/lifecycle stack merely to
 avoid a justified shared transport change.

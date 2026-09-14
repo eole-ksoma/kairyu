@@ -13,6 +13,7 @@ from kairyu.runners.models import (
     RunnerStartupReport,
     RunnerState,
     RunnerStatus,
+    RunnerTerminationAuthorization,
 )
 
 
@@ -46,12 +47,8 @@ _ALLOWED_RUNNER_TRANSITIONS = {
     RunnerState.BUSY: frozenset(
         {RunnerState.READY, RunnerState.DRAINING, RunnerState.UNHEALTHY}
     ),
-    RunnerState.DRAINING: frozenset(
-        {RunnerState.TERMINATING, RunnerState.UNHEALTHY}
-    ),
-    RunnerState.UNHEALTHY: frozenset(
-        {RunnerState.DRAINING, RunnerState.TERMINATING}
-    ),
+    RunnerState.DRAINING: frozenset({RunnerState.TERMINATING}),
+    RunnerState.UNHEALTHY: frozenset({RunnerState.DRAINING}),
     RunnerState.TERMINATING: frozenset({RunnerState.TERMINATED}),
     RunnerState.TERMINATED: frozenset(),
 }
@@ -129,7 +126,7 @@ def validate_startup_report_update(
             )
 
 
-def transition_runner_status(
+def _transition_runner_status(
     status: RunnerStatus,
     target: RunnerState,
     *,
@@ -137,8 +134,9 @@ def transition_runner_status(
     active_requests: int | None = None,
     startup: RunnerStartupReport | None = None,
     failure: RunnerFailure | None = None,
+    termination_authorization: RunnerTerminationAuthorization | None = None,
 ) -> RunnerStatus:
-    """Return a validated new snapshot without mutating the input status."""
+    """Core transition path; termination authorization stays module-private."""
 
     if not isinstance(status, RunnerStatus):
         raise TypeError("status must be a RunnerStatus")
@@ -150,6 +148,57 @@ def transition_runner_status(
         raise InvalidRunnerTransitionError(
             "failure can only be supplied for an unhealthy Runner"
         )
+    if termination_authorization is not None and target is not RunnerState.TERMINATING:
+        raise InvalidRunnerTransitionError(
+            "termination authorization can only enter the terminating state"
+        )
+    authorization = status.termination_authorization
+    if target is RunnerState.TERMINATING:
+        if status.state is RunnerState.TERMINATING:
+            if (
+                termination_authorization is not None
+                and termination_authorization != authorization
+            ):
+                raise InvalidRunnerTransitionError(
+                    "termination authorization is immutable"
+                )
+        else:
+            authorization = termination_authorization
+        if authorization is None:
+            raise InvalidRunnerTransitionError(
+                "terminating requires drain/dispatch-fence authorization"
+            )
+        if status.state is RunnerState.DRAINING:
+            if active_requests != 0:
+                raise InvalidRunnerTransitionError(
+                    "terminating requires an explicit active request count of zero"
+                )
+            if (
+                authorization.runner_id != status.runner_id
+                or authorization.pod_uid != status.pod_uid
+            ):
+                raise InvalidRunnerTransitionError(
+                    "termination authorization does not match the Runner"
+                )
+            if authorization.drain_state_version != status.state_version:
+                raise InvalidRunnerTransitionError(
+                    "termination authorization references a stale drain state"
+                )
+            if authorization.dispatch_stopped_at < status.state_changed_at:
+                raise InvalidRunnerTransitionError(
+                    "termination authorization predates the draining transition"
+                )
+            if (
+                status.runtime_observed_at is not None
+                and authorization.activity_observed_at < status.runtime_observed_at
+            ):
+                raise InvalidRunnerTransitionError(
+                    "termination authorization predates runtime activity"
+                )
+            if authorization.authorized_at != at:
+                raise InvalidRunnerTransitionError(
+                    "termination transition time must match its authorization"
+                )
     if startup is not None and status.startup is not None:
         validate_startup_report_update(status.startup, startup)
     same_state = target is status.state
@@ -171,9 +220,37 @@ def transition_runner_status(
             "active_requests": next_active_requests,
             "startup": status.startup if startup is None else startup,
             "failure": next_failure if target is RunnerState.UNHEALTHY else None,
+            "termination_authorization": (
+                authorization
+                if target is RunnerState.TERMINATING
+                else status.termination_authorization
+                if target is RunnerState.TERMINATED
+                else None
+            ),
         }
     )
     return RunnerStatus.model_validate(values)
+
+
+def transition_runner_status(
+    status: RunnerStatus,
+    target: RunnerState,
+    *,
+    at: datetime,
+    active_requests: int | None = None,
+    startup: RunnerStartupReport | None = None,
+    failure: RunnerFailure | None = None,
+) -> RunnerStatus:
+    """Return a validated snapshot; drain authorization owns termination entry."""
+
+    return _transition_runner_status(
+        status,
+        target,
+        at=at,
+        active_requests=active_requests,
+        startup=startup,
+        failure=failure,
+    )
 
 
 def start_startup_phase(

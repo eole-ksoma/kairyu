@@ -7,6 +7,11 @@ import json
 from collections.abc import Mapping
 from datetime import datetime, timedelta
 
+from kairyu.runners.drain import (
+    RunnerDispatchFence,
+    RunnerDrainController,
+    authorize_runner_termination,
+)
 from kairyu.runners.lifecycle import (
     InvalidRunnerStartupReportError,
     transition_runner_status,
@@ -551,6 +556,33 @@ class RunnerStatusReconciler:
             now=now,
             max_observation_age=max_observation_age,
         )
+
+    def authorize_termination(
+        self,
+        fence: RunnerDispatchFence,
+        *,
+        controller: RunnerDrainController,
+        at: datetime,
+    ) -> RunnerStatus:
+        """Persist one fence-bound transition in the in-memory status view."""
+
+        status = self._statuses.get(fence.runner_id)
+        if status is None:
+            raise InvalidRunnerObservationError(
+                "termination fence references an unknown Runner"
+            )
+        authorized = authorize_runner_termination(
+            status,
+            fence,
+            controller=controller,
+            at=at,
+        )
+        updated = dict(self._statuses)
+        updated[fence.runner_id] = authorized
+        self._statuses = updated
+        self._serving_gates[fence.runner_id] = False
+        self._gate_loss_started_at.pop(fence.runner_id, None)
+        return authorized
 
     def reconcile(self, batch: RunnerObservationBatch) -> dict[str, RunnerStatus]:
         """Apply one complete epoch atomically and infer disappeared Pods."""

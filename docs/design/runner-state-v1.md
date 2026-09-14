@@ -5,9 +5,10 @@ not a projection of Kubernetes Pod phase: a running container remains
 `image_pull`, `model_loading`, or `warming` until the corresponding serving
 evidence is complete.
 
-This slice fixes the controller-neutral contract and a read-only Kubernetes
-observation/reconciliation boundary. Persistence, leader election, routing
-mutation, drain authorization, and scale writes remain later work.
+This slice fixes the controller-neutral contract, a read-only Kubernetes
+observation/reconciliation boundary, and a fence-bound drain/termination
+handshake. Persistence, leader election, Kubernetes termination writes, and
+scale actuation remain later work.
 
 ## Identity and snapshot rules
 
@@ -44,13 +45,15 @@ requested → scheduling → image_pull → model_loading → warming → ready 
           active states ────────────────────────────────→ unhealthy
 
 ready/busy → draining → terminating → terminated
-unhealthy  → draining or terminating
+unhealthy  → draining
 ```
 
 Self-transitions are accepted as idempotent observations. Skipping readiness
-stages, returning a draining Runner to service, or resurrecting a terminated
-Runner is rejected. Recovery creates a new Runner generation/status rather
-than rewriting terminated history.
+stages, changing a fenced draining Runner back to unhealthy, returning it to
+service, or resurrecting a terminated Runner is rejected. Fatal evidence found
+during drain is recorded operationally while the logical drain remains sticky;
+recovery creates a new Runner generation/status rather than rewriting fenced or
+terminated history.
 
 ## Startup phase report
 
@@ -137,20 +140,51 @@ the underlying OOM/GPU/exit cause during a CrashLoopBackOff.
 
 A Pod deletion or confirmed full-list disappearance enters and remains
 `draining`, preserving identity, startup evidence, and the latest trustworthy
-active count. This slice deliberately does not infer `terminating` from a zero
-count: only the next drain-handshake slice may authorize termination after new
-dispatch is fenced and the request store confirms post-fence zero.
+active count. Reconciliation alone never infers `terminating` from a zero count.
 `RunnerStatusReconciler.routing_eligible()` exposes the stateful, freshness-
 checked `ready | busy` decision for later routing integration.
 
-This component does not patch Kubernetes objects, alter `ReplicaPool`, choose a
-replica count, persist status, elect a writer, mutate routing, or authorize Pod
-termination.
+## Drain and termination handshake
+
+Termination uses three immutable, versioned pieces of evidence:
+
+1. `RunnerDispatchFence` binds a unique fence ID and monotonic sequence to the
+   Runner Pod UID, drain-state version, and concrete replica generation. It
+   records when new dispatch stopped and routing exclusion completed.
+2. `RunnerDrainActivityObservation` binds an authoritative active-request count
+   to that exact fence and generation. An observation from before the routing
+   exclusion, from another fence, or from a re-added replica is rejected.
+3. `RunnerTerminationAuthorization` persists the matching fence and post-fence
+   zero evidence in `RunnerStatus`, so authorization remains auditable and
+   idempotent across controller restart.
+
+`ReplicaPoolDrainController` is the executable single-pool adapter. Acquiring
+its drain lease immediately removes the Runner from new placement and also
+invalidates an already-prepared placement lease before backend dispatch. It
+retains the lease while observing outstanding work. Its `commit_termination`
+operation revalidates the retained fence and replica generation, reads zero,
+and creates authorization without an asynchronous yield between those steps.
+The backend-neutral `RunnerDrainController` protocol requires the same atomic
+commit boundary from a production shared dispatcher/request store; that
+implementation must use one transaction or compare-and-swap operation across
+the durable fence, generation, active count, and authorization record.
+
+`RunnerStatusReconciler.authorize_termination()` delegates to that atomic commit
+and accepts only a `draining` status with matching post-fence
+`active_requests == 0`. Stale zero observed
+before the fence, a non-zero count, a different Pod/generation/state version,
+or evidence older than the latest runtime observation fails closed. The
+resulting `terminating` status must carry the persisted authorization; only a
+subsequent full Kubernetes epoch that confirms Pod disappearance advances it
+to `terminated`.
+
+This slice mutates local `ReplicaPool` eligibility but does not patch or delete
+Kubernetes objects, choose a replica count, persist controller status, or elect
+a writer. A multi-gateway deployment must implement the protocol with a shared,
+durable dispatch fence before using its authorization for Pod deletion.
 
 ## Next integration boundary
 
-The next slice should implement the drain/termination handshake: stop queue
-dispatch, remove routing eligibility, continue reading the request store until
-`active_requests == 0`, and only then authorize Kubernetes termination. Scale
-actuation, persistence, crash backoff, and leader election remain separate
-changes.
+The next slice should implement crash backoff and quarantine keyed by revision,
+node, and GPU failure domain. Scale actuation, persistence, Kubernetes deletion,
+and leader election remain separate changes.

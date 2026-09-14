@@ -1,5 +1,13 @@
 """Logical Runner lifecycle contracts used by serving controllers."""
 
+from kairyu.runners.drain import (
+    InvalidRunnerDrainEvidenceError,
+    ReplicaPoolDrainController,
+    RunnerDispatchFence,
+    RunnerDrainActivityObservation,
+    RunnerDrainController,
+    authorize_runner_termination,
+)
 from kairyu.runners.kubernetes import (
     GPU_UUIDS_ANNOTATION,
     MODEL_ID_ANNOTATION,
@@ -32,6 +40,7 @@ from kairyu.runners.models import (
     RunnerStartupReport,
     RunnerState,
     RunnerStatus,
+    RunnerTerminationAuthorization,
 )
 from kairyu.runners.observation import (
     KubernetesPodPhase,
@@ -53,6 +62,7 @@ __all__ = [
     "InvalidRunnerStartupReportError",
     "InvalidRunnerTransitionError",
     "InvalidRunnerObservationError",
+    "InvalidRunnerDrainEvidenceError",
     "KubernetesPodPhase",
     "KubernetesRunnerPodSnapshot",
     "KubernetesRunnerWatcher",
@@ -63,6 +73,9 @@ __all__ = [
     "MODEL_REVISION_ANNOTATION",
     "GPU_UUIDS_ANNOTATION",
     "RunnerFailure",
+    "RunnerDispatchFence",
+    "RunnerDrainActivityObservation",
+    "RunnerDrainController",
     "RunnerObservation",
     "RunnerObservationBatch",
     "RunnerPodObservation",
@@ -74,6 +87,9 @@ __all__ = [
     "RunnerState",
     "RunnerStatus",
     "RunnerStatusReconciler",
+    "RunnerTerminationAuthorization",
+    "ReplicaPoolDrainController",
+    "authorize_runner_termination",
     "complete_startup_phase",
     "parse_ready_endpoint_uids",
     "parse_runner_pods",

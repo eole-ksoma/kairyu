@@ -210,6 +210,58 @@ class RunnerStartupReport(BaseModel):
         return self.phases[-1].failure
 
 
+class RunnerTerminationAuthorization(BaseModel):
+    """Persisted proof that a drained Runner may enter termination."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["runner-termination-authorization-v1"] = (
+        "runner-termination-authorization-v1"
+    )
+    runner_id: str = Field(max_length=255)
+    pod_uid: str = Field(max_length=255)
+    fence_id: str = Field(max_length=255)
+    fence_sequence: int = Field(gt=0)
+    drain_state_version: int = Field(ge=0)
+    replica_generation: str = Field(max_length=255)
+    dispatch_stopped_at: datetime
+    routing_excluded_at: datetime
+    activity_observed_at: datetime
+    authorized_at: datetime
+
+    @field_validator("runner_id", "pod_uid", "fence_id", "replica_generation")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _non_empty(value, name=info.field_name)
+
+    @field_validator("fence_sequence", "drain_state_version", mode="before")
+    @classmethod
+    def validate_integer(cls, value: object, info) -> object:
+        if type(value) is not int:
+            raise ValueError(f"{info.field_name} must be an integer")
+        return value
+
+    @field_validator(
+        "dispatch_stopped_at",
+        "routing_excluded_at",
+        "activity_observed_at",
+        "authorized_at",
+    )
+    @classmethod
+    def validate_timestamp(cls, value: datetime, info) -> datetime:
+        return _aware(value, name=info.field_name)
+
+    @model_validator(mode="after")
+    def validate_timeline(self) -> RunnerTerminationAuthorization:
+        if self.routing_excluded_at < self.dispatch_stopped_at:
+            raise ValueError("routing exclusion cannot predate dispatch stop")
+        if self.activity_observed_at < self.routing_excluded_at:
+            raise ValueError("activity observation must be post-fence")
+        if self.authorized_at < self.activity_observed_at:
+            raise ValueError("authorization cannot predate activity observation")
+        return self
+
+
 class RunnerStatus(BaseModel):
     """Immutable controller-facing view of one logical inference Runner."""
 
@@ -233,6 +285,7 @@ class RunnerStatus(BaseModel):
         default=None,
         pattern=r"^[0-9a-f]{64}$",
     )
+    termination_authorization: RunnerTerminationAuthorization | None = None
     startup: RunnerStartupReport | None = None
     failure: RunnerFailure | None = None
 
@@ -282,6 +335,29 @@ class RunnerStatus(BaseModel):
         ):
             raise ValueError(
                 "runtime observation fingerprint requires runtime_observed_at"
+            )
+        if self.state in {RunnerState.TERMINATING, RunnerState.TERMINATED}:
+            authorization = self.termination_authorization
+            if authorization is None:
+                raise ValueError(
+                    "terminating or terminated runners require authorization"
+                )
+            if authorization.runner_id != self.runner_id:
+                raise ValueError("termination authorization runner_id must match status")
+            if authorization.pod_uid != self.pod_uid:
+                raise ValueError("termination authorization pod_uid must match status")
+            version_delta = (
+                1 if self.state is RunnerState.TERMINATING else 2
+            )
+            if self.state_version != authorization.drain_state_version + version_delta:
+                raise ValueError(
+                    "termination state version must directly follow its drain state"
+                )
+            if authorization.authorized_at > self.observed_at:
+                raise ValueError("termination authorization cannot exceed observed_at")
+        elif self.termination_authorization is not None:
+            raise ValueError(
+                "only terminating or terminated runners may carry authorization"
             )
         if self.state is RunnerState.UNHEALTHY:
             if self.failure is None:

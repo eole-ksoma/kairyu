@@ -109,7 +109,6 @@ def test_normal_runner_lifecycle_and_busy_ready_loop_are_legal() -> None:
         RunnerState.WARMING,
         RunnerState.READY,
         RunnerState.BUSY,
-        RunnerState.DRAINING,
     ],
 )
 def test_active_runner_states_can_fail_closed(state: RunnerState) -> None:
@@ -123,7 +122,9 @@ def test_active_runner_states_can_fail_closed(state: RunnerState) -> None:
         (RunnerState.SCHEDULING, RunnerState.MODEL_LOADING),
         (RunnerState.WARMING, RunnerState.BUSY),
         (RunnerState.DRAINING, RunnerState.READY),
+        (RunnerState.DRAINING, RunnerState.UNHEALTHY),
         (RunnerState.UNHEALTHY, RunnerState.READY),
+        (RunnerState.UNHEALTHY, RunnerState.TERMINATING),
         (RunnerState.TERMINATING, RunnerState.READY),
         (RunnerState.TERMINATED, RunnerState.REQUESTED),
     ],
@@ -391,8 +392,6 @@ def test_transition_to_ready_busy_and_failure_uses_explicit_evidence() -> None:
     ("source", "target"),
     [
         (RunnerState.BUSY, RunnerState.READY),
-        (RunnerState.DRAINING, RunnerState.TERMINATING),
-        (RunnerState.UNHEALTHY, RunnerState.TERMINATING),
     ],
 )
 def test_transition_never_erases_inflight_work_without_an_explicit_zero(
@@ -423,6 +422,17 @@ def test_transition_never_erases_inflight_work_without_an_explicit_zero(
     )
     assert transitioned.state is target
     assert transitioned.active_requests == 0
+
+
+def test_transition_to_terminating_requires_handshake_authorization() -> None:
+    draining = _status(RunnerState.DRAINING, pod_uid="runner-a")
+    with pytest.raises(InvalidRunnerTransitionError, match="dispatch-fence"):
+        transition_runner_status(
+            draining,
+            RunnerState.TERMINATING,
+            at=NOW + timedelta(seconds=1),
+            active_requests=0,
+        )
 
 
 def test_startup_report_update_is_monotonic_and_completed_history_is_immutable() -> None:

@@ -19,7 +19,9 @@ from kairyu.runners import (
     RunnerStartupPhaseOutcome,
     RunnerStartupReport,
     RunnerState,
+    RunnerStatus,
     RunnerStatusReconciler,
+    RunnerTerminationAuthorization,
     complete_startup_phase,
     reconcile_runner_status,
     runner_is_routing_eligible,
@@ -152,6 +154,26 @@ def _ready_observation(
             active_requests=active_requests,
             startup=_complete_startup(),
         ),
+    )
+
+
+def _termination_authorization(
+    status,
+    *,
+    at: datetime,
+) -> RunnerTerminationAuthorization:
+    assert status.pod_uid is not None
+    return RunnerTerminationAuthorization(
+        runner_id=status.runner_id,
+        pod_uid=status.pod_uid,
+        fence_id="fence-a",
+        fence_sequence=1,
+        drain_state_version=status.state_version,
+        replica_generation="generation-a",
+        dispatch_stopped_at=at,
+        routing_excluded_at=at,
+        activity_observed_at=at,
+        authorized_at=at,
     )
 
 
@@ -706,12 +728,20 @@ def test_terminating_state_ignores_late_container_failure_evidence(
         at=NOW + timedelta(seconds=21),
         active_requests=0,
     )
-    terminating = transition_runner_status(
+    authorization = _termination_authorization(
         draining,
-        RunnerState.TERMINATING,
         at=NOW + timedelta(seconds=22),
-        active_requests=0,
     )
+    values = draining.model_dump()
+    values.update(
+        state=RunnerState.TERMINATING,
+        state_version=draining.state_version + 1,
+        state_changed_at=authorization.authorized_at,
+        observed_at=authorization.authorized_at,
+        active_requests=0,
+        termination_authorization=authorization,
+    )
+    terminating = RunnerStatus.model_validate(values)
     observed = reconcile_runner_status(
         terminating,
         _observation(

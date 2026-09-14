@@ -228,6 +228,11 @@ class RunnerStatus(BaseModel):
     pod_uid: str | None = Field(default=None, max_length=255)
     gpu_uuids: tuple[str, ...] = Field(default=(), max_length=64)
     active_requests: int = Field(default=0, ge=0)
+    runtime_observed_at: datetime | None = None
+    runtime_observation_fingerprint: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     startup: RunnerStartupReport | None = None
     failure: RunnerFailure | None = None
 
@@ -258,9 +263,11 @@ class RunnerStatus(BaseModel):
             raise ValueError("gpu_uuids must be unique")
         return validated
 
-    @field_validator("state_changed_at", "observed_at")
+    @field_validator("state_changed_at", "observed_at", "runtime_observed_at")
     @classmethod
-    def validate_timestamp(cls, value: datetime, info) -> datetime:
+    def validate_timestamp(cls, value: datetime | None, info) -> datetime | None:
+        if value is None:
+            return None
         return _aware(value, name=info.field_name)
 
     @model_validator(mode="after")
@@ -269,8 +276,13 @@ class RunnerStatus(BaseModel):
             raise ValueError("observed_at cannot be earlier than state_changed_at")
         if self.startup is not None and self.startup.runner_id != self.runner_id:
             raise ValueError("startup runner_id must match status runner_id")
-        if self.startup is not None and self.startup.observed_at > self.observed_at:
-            raise ValueError("startup observed_at cannot exceed status observed_at")
+        if (
+            self.runtime_observation_fingerprint is not None
+            and self.runtime_observed_at is None
+        ):
+            raise ValueError(
+                "runtime observation fingerprint requires runtime_observed_at"
+            )
         if self.state is RunnerState.UNHEALTHY:
             if self.failure is None:
                 raise ValueError("unhealthy runners require failure")

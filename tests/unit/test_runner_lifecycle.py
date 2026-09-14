@@ -274,18 +274,25 @@ def test_runner_status_is_frozen_bounded_and_identity_consistent() -> None:
         RunnerStatus(**status.model_dump(), secret="do-not-accept")
     with pytest.raises(ValidationError, match="startup runner_id"):
         _status(startup=RunnerStartupReport(runner_id="other", observed_at=NOW))
-    with pytest.raises(ValidationError, match="startup observed_at"):
-        _status(
-            startup=RunnerStartupReport(
-                runner_id="runner-a",
-                observed_at=NOW + timedelta(seconds=1),
-            ),
-            observed_at=NOW,
-        )
+    skewed = _status(
+        startup=RunnerStartupReport(
+            runner_id="runner-a",
+            observed_at=NOW + timedelta(seconds=1),
+        ),
+        observed_at=NOW,
+    )
+    assert skewed.startup is not None
     with pytest.raises(ValidationError, match="gpu_uuids must be unique"):
         _status(gpu_uuids=("GPU-a", "GPU-a"))
     with pytest.raises(ValidationError, match="state_version must be an integer"):
         _status(state_version=True)
+    with pytest.raises(ValidationError, match="requires runtime_observed_at"):
+        _status(runtime_observation_fingerprint="0" * 64)
+    with pytest.raises(ValidationError, match="String should match pattern"):
+        _status(
+            runtime_observed_at=NOW,
+            runtime_observation_fingerprint="not-a-sha256",
+        )
     with pytest.raises(ValidationError, match="at most 255 characters"):
         _status(runner_id="r" * 256)
     with pytest.raises(ValidationError, match="attempt must be an integer"):

@@ -1,5 +1,17 @@
 """Logical Runner lifecycle contracts used by serving controllers."""
 
+from kairyu.runners.kubernetes import (
+    GPU_UUIDS_ANNOTATION,
+    MODEL_ID_ANNOTATION,
+    MODEL_REVISION_ANNOTATION,
+    RELEASE_ID_ANNOTATION,
+    RUNNER_CONTAINER_ANNOTATION,
+    KubernetesRunnerPodSnapshot,
+    KubernetesRunnerWatcher,
+    RunnerRuntimeSource,
+    parse_ready_endpoint_uids,
+    parse_runner_pods,
+)
 from kairyu.runners.lifecycle import (
     InvalidRunnerStartupReportError,
     InvalidRunnerTransitionError,
@@ -21,20 +33,52 @@ from kairyu.runners.models import (
     RunnerState,
     RunnerStatus,
 )
+from kairyu.runners.observation import (
+    KubernetesPodPhase,
+    RunnerObservation,
+    RunnerObservationBatch,
+    RunnerPodObservation,
+    RunnerRuntimeObservation,
+)
+from kairyu.runners.reconciler import (
+    InvalidRunnerObservationError,
+    RunnerStatusReconciler,
+    reconcile_runner_status,
+    runner_is_routing_eligible,
+)
 
 __all__ = [
     "RUNNER_STARTUP_PHASES",
     "OPTIONAL_RUNNER_STARTUP_PHASES",
     "InvalidRunnerStartupReportError",
     "InvalidRunnerTransitionError",
+    "InvalidRunnerObservationError",
+    "KubernetesPodPhase",
+    "KubernetesRunnerPodSnapshot",
+    "KubernetesRunnerWatcher",
+    "RunnerRuntimeSource",
+    "RELEASE_ID_ANNOTATION",
+    "RUNNER_CONTAINER_ANNOTATION",
+    "MODEL_ID_ANNOTATION",
+    "MODEL_REVISION_ANNOTATION",
+    "GPU_UUIDS_ANNOTATION",
     "RunnerFailure",
+    "RunnerObservation",
+    "RunnerObservationBatch",
+    "RunnerPodObservation",
+    "RunnerRuntimeObservation",
     "RunnerStartupPhase",
     "RunnerStartupPhaseOutcome",
     "RunnerStartupPhaseReport",
     "RunnerStartupReport",
     "RunnerState",
     "RunnerStatus",
+    "RunnerStatusReconciler",
     "complete_startup_phase",
+    "parse_ready_endpoint_uids",
+    "parse_runner_pods",
+    "reconcile_runner_status",
+    "runner_is_routing_eligible",
     "skip_startup_phase",
     "start_startup_phase",
     "transition_runner_status",

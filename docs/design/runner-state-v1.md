@@ -281,8 +281,37 @@ responsible for propagating this token into the scale decision generation/CAS
 boundary. The current slice performs no Kubernetes mutation and does not add
 cluster RBAC.
 
+## Model-class scaling policy
+
+`ScalingPolicy` (`runner-scaling-policy-v1`) is the immutable input contract for
+one bounded model class. Its durable identity is `(model_class,
+policy_revision)`; `ScalingPolicyCatalog` adds a separately versioned, bounded
+collection and rejects duplicate class keys. WP3.2 decision records must copy
+both the catalog revision and resolved policy identity instead of referring to
+mutable configuration by name alone.
+
+The policy separates minimum and maximum replicas, absolute and ratio-based
+warm buffer, scale-up delay, idle keep-alive, decision cooldown, maximum
+request multiplexing per Runner, and maximum per-decision scale-up/down steps.
+The buffer is exactly the larger of `warm_buffer_replicas` and
+`ceil(demand_replicas * warm_buffer_ratio)`; the ratio is based on unbuffered
+demand replica count capped at `max_replicas`, not current or desired capacity.
+The later decision engine will add that buffer, then clamp the target and each
+step to the hard bounds. No field in this schema changes the existing
+`autoscale_decision()` behavior yet.
+
+The safe default is one fixed warm, non-multiplexed replica. A zero minimum is
+valid only when `scale_to_zero=true` and a non-empty measurement/review approval
+ID is present. Its absolute buffer must be zero; the ratio buffer still permits
+headroom under load but evaluates to zero at zero demand. An approval ID is
+rejected when scale-to-zero is disabled. This makes the plan's model-class
+approval rule machine-checkable rather than an operator convention. Public
+identity, buffer, and catalog lookup paths revalidate serialized content so
+unchecked Pydantic copies cannot cross the control-plane boundary.
+
 ## Next integration boundary
 
-The next slice should define the model-class `ScalingPolicy` schema and durable
-observation/decision log before adding Kubernetes scale actuation. Durable
-Runner-status persistence and Kubernetes deletion remain separate changes.
+The next slice should define the durable observation window and decision log,
+including stale-input behavior and exact policy revision capture, before adding
+Kubernetes scale actuation. Durable Runner-status persistence and Kubernetes
+deletion remain separate changes.

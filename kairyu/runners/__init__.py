@@ -86,6 +86,7 @@ from kairyu.runners.reconciler import (
     reconcile_runner_status,
     runner_is_routing_eligible,
 )
+from kairyu.runners.scaling import ScalingPolicy, ScalingPolicyCatalog
 
 __all__ = [
     "RUNNER_STARTUP_PHASES",
@@ -140,6 +141,8 @@ __all__ = [
     "RunnerStatusReconciler",
     "RunnerTerminationAuthorization",
     "RunnerWriterAuthority",
+    "ScalingPolicy",
+    "ScalingPolicyCatalog",
     "StaleRunnerLeaderLeaseError",
     "ReplicaPoolDrainController",
     "authorize_runner_termination",

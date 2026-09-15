@@ -97,15 +97,21 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
   retention-expanded Kind rerun remains pending on Docker registry access.
 - Runner State v1 includes Kubernetes observation/reconciliation, fenced
   drain/termination, failure-domain backoff/quarantine, and a lease-fenced
-  single-writer gate with a PostgreSQL shared lease backend. Deployment wiring,
-  durable Runner status, Kubernetes mutations, and runtime instrumentation
-  remain open.
+  single-writer gate with a PostgreSQL shared lease backend. WP3.1 adds bounded,
+  model-class scaling policy schemas. Decision logging, deployment wiring,
+  durable Runner status, Kubernetes mutations, and runtime instrumentation remain open.
 - Human sign-off pending on M2–M4 design reviews
 
 ## Change Log
 
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
+
+### 2026-09-15 — [design] Model-class scaling policy v1
+- What: added bounded min/max, buffer, timing, scale-to-zero approval,
+  multiplexing, and per-decision step contracts plus a versioned policy catalog.
+- Why: autoscaler decisions need immutable safety bounds before durable input logging.
+- Refs: docs/design/runner-state-v1.md; kairyu/runners/scaling.py
 
 ### 2026-09-15 — [progress] Runner control-plane safety through WP2.6
 - What: added Kubernetes reconciliation, drain authorization, revision/node/GPU

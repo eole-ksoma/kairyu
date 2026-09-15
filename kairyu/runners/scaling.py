@@ -7,6 +7,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+_MAX_SIGNED_BIGINT = 2**63 - 1
+
 
 def _non_empty(value: str, *, name: str) -> str:
     if not value.strip() or "\x00" in value:
@@ -30,7 +32,7 @@ class ScalingPolicy(BaseModel):
 
     schema_version: Literal["runner-scaling-policy-v1"] = "runner-scaling-policy-v1"
     model_class: str = Field(max_length=128)
-    policy_revision: int = Field(ge=1)
+    policy_revision: int = Field(ge=1, le=_MAX_SIGNED_BIGINT)
     min_replicas: int = Field(default=1, ge=0, le=100_000)
     max_replicas: int = Field(default=1, ge=1, le=100_000)
     warm_buffer_replicas: int = Field(default=0, ge=0, le=100_000)
@@ -38,6 +40,7 @@ class ScalingPolicy(BaseModel):
     scale_up_delay_seconds: float = Field(default=0.0, ge=0, le=86_400)
     keep_alive_seconds: float = Field(default=60.0, ge=0, le=604_800)
     cooldown_seconds: float = Field(default=60.0, ge=0, le=604_800)
+    max_observation_age_seconds: float = Field(default=30.0, gt=0, le=86_400)
     scale_to_zero: bool = False
     scale_to_zero_approval_id: str | None = Field(default=None, max_length=255)
     max_multiplexing: int = Field(default=1, ge=1, le=1024)
@@ -84,6 +87,7 @@ class ScalingPolicy(BaseModel):
         "scale_up_delay_seconds",
         "keep_alive_seconds",
         "cooldown_seconds",
+        "max_observation_age_seconds",
         mode="before",
     )
     @classmethod
@@ -151,7 +155,7 @@ class ScalingPolicyCatalog(BaseModel):
     schema_version: Literal["runner-scaling-policy-catalog-v1"] = (
         "runner-scaling-policy-catalog-v1"
     )
-    catalog_revision: int = Field(ge=1)
+    catalog_revision: int = Field(ge=1, le=_MAX_SIGNED_BIGINT)
     policies: tuple[ScalingPolicy, ...] = Field(min_length=1, max_length=4096)
 
     @field_validator("catalog_revision", mode="before")

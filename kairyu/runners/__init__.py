@@ -80,6 +80,7 @@ from kairyu.runners.observation import (
     RunnerRuntimeObservation,
 )
 from kairyu.runners.postgres_leadership import PostgresRunnerLeaderLeaseStore
+from kairyu.runners.postgres_scaling_log import PostgresScalingDecisionLog
 from kairyu.runners.reconciler import (
     InvalidRunnerObservationError,
     RunnerStatusReconciler,
@@ -87,11 +88,28 @@ from kairyu.runners.reconciler import (
     runner_is_routing_eligible,
 )
 from kairyu.runners.scaling import ScalingPolicy, ScalingPolicyCatalog
+from kairyu.runners.scaling_log import (
+    InMemoryScalingDecisionLog,
+    ScalingDecisionAction,
+    ScalingDecisionCapacityError,
+    ScalingDecisionConflictError,
+    ScalingDecisionLog,
+    ScalingDecisionReason,
+    ScalingDecisionRecord,
+    ScalingObservation,
+    ScalingObservationWindow,
+    ScalingQueueSnapshot,
+    ScalingResourceSnapshot,
+    ScalingRunnerSnapshot,
+    ScalingStartupPhaseMetrics,
+    ScalingStartupSnapshot,
+)
 
 __all__ = [
     "RUNNER_STARTUP_PHASES",
     "OPTIONAL_RUNNER_STARTUP_PHASES",
     "PostgresRunnerLeaderLeaseStore",
+    "PostgresScalingDecisionLog",
     "InvalidRunnerStartupReportError",
     "InvalidRunnerTransitionError",
     "InvalidRunnerObservationError",
@@ -143,6 +161,20 @@ __all__ = [
     "RunnerWriterAuthority",
     "ScalingPolicy",
     "ScalingPolicyCatalog",
+    "InMemoryScalingDecisionLog",
+    "ScalingDecisionAction",
+    "ScalingDecisionCapacityError",
+    "ScalingDecisionConflictError",
+    "ScalingDecisionLog",
+    "ScalingDecisionReason",
+    "ScalingDecisionRecord",
+    "ScalingObservation",
+    "ScalingObservationWindow",
+    "ScalingQueueSnapshot",
+    "ScalingResourceSnapshot",
+    "ScalingRunnerSnapshot",
+    "ScalingStartupPhaseMetrics",
+    "ScalingStartupSnapshot",
     "StaleRunnerLeaderLeaseError",
     "ReplicaPoolDrainController",
     "authorize_runner_termination",

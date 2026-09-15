@@ -50,6 +50,7 @@ def test_safe_defaults_keep_one_warm_non_multiplexed_replica() -> None:
     assert policy.scale_up_delay_seconds == 0
     assert policy.keep_alive_seconds == 60
     assert policy.cooldown_seconds == 60
+    assert policy.max_observation_age_seconds == 30
     assert policy.scale_to_zero is False
     assert policy.scale_to_zero_approval_id is None
     assert policy.max_multiplexing == 1
@@ -146,6 +147,7 @@ def test_integer_fields_reject_coercion(field: str, value: object) -> None:
         "scale_up_delay_seconds",
         "keep_alive_seconds",
         "cooldown_seconds",
+        "max_observation_age_seconds",
     ],
 )
 @pytest.mark.parametrize("value", [True, "1", math.inf, -math.inf, math.nan])
@@ -173,6 +175,8 @@ def test_scale_to_zero_requires_a_real_boolean(value: object) -> None:
         {"scale_up_delay_seconds": -1},
         {"keep_alive_seconds": 604_801},
         {"cooldown_seconds": 604_801},
+        {"max_observation_age_seconds": 0},
+        {"max_observation_age_seconds": 86_401},
         {"max_multiplexing": 0},
         {"max_multiplexing": 1025},
     ],
@@ -255,6 +259,8 @@ def test_catalog_rejects_empty_duplicate_and_coerced_revision() -> None:
         )
     with pytest.raises(ValidationError, match="integer"):
         ScalingPolicyCatalog(catalog_revision=True, policies=(_policy(),))
+    with pytest.raises(ValidationError, match="less than or equal"):
+        ScalingPolicyCatalog(catalog_revision=2**63, policies=(_policy(),))
 
 
 def test_catalog_policy_lookup_rejects_invalid_identity() -> None:

@@ -98,14 +98,23 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 - Runner State v1 includes Kubernetes observation/reconciliation, fenced
   drain/termination, failure-domain backoff/quarantine, and a lease-fenced
   single-writer gate with a PostgreSQL shared lease backend. WP3.1 adds bounded,
-  model-class scaling policy schemas. Decision logging, deployment wiring,
-  durable Runner status, Kubernetes mutations, and runtime instrumentation remain open.
+  model-class scaling policy schemas. WP3.2 adds source-timestamped observation
+  windows and an append-only PostgreSQL decision log with stale-input safety.
+  Scale actuation, deployment wiring, durable Runner status, Kubernetes mutations,
+  and runtime instrumentation remain open.
 - Human sign-off pending on M2–M4 design reviews
 
 ## Change Log
 
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
+
+### 2026-09-15 — [progress] Durable autoscaler observation and decision log
+- What: added bounded source-timestamped scaling windows, exact policy/input
+  decision records, stale-input scale-down rejection, and a shared PostgreSQL
+  append-only log with idempotency, fixed capacity, and strict schema checks.
+- Refs: docs/design/runner-state-v1.md; kairyu/runners/scaling_log.py;
+  kairyu/runners/postgres_scaling_log.py
 
 ### 2026-09-15 — [design] Model-class scaling policy v1
 - What: added bounded min/max, buffer, timing, scale-to-zero approval,

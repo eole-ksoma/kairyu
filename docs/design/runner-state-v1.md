@@ -8,8 +8,9 @@ evidence is complete.
 This slice fixes the controller-neutral contract, a read-only Kubernetes
 observation/reconciliation boundary, a fence-bound drain/termination handshake,
 bounded failure-domain backoff/quarantine, and a lease-fenced single-writer
-boundary. Durable Runner-state persistence, Kubernetes termination writes, and
-scale actuation remain later work.
+boundary. It also defines the immutable model-class scaling policy, observation
+window, and durable decision-log boundary. Durable Runner-state persistence,
+Kubernetes termination writes, and scale actuation remain later work.
 
 ## Identity and snapshot rules
 
@@ -293,6 +294,8 @@ mutable configuration by name alone.
 The policy separates minimum and maximum replicas, absolute and ratio-based
 warm buffer, scale-up delay, idle keep-alive, decision cooldown, maximum
 request multiplexing per Runner, and maximum per-decision scale-up/down steps.
+`max_observation_age_seconds` fixes the freshness lease in the copied policy,
+so replaying a record cannot reinterpret whether its inputs were stale.
 The buffer is exactly the larger of `warm_buffer_replicas` and
 `ceil(demand_replicas * warm_buffer_ratio)`; the ratio is based on unbuffered
 demand replica count capped at `max_replicas`, not current or desired capacity.
@@ -309,9 +312,68 @@ approval rule machine-checkable rather than an operator convention. Public
 identity, buffer, and catalog lookup paths revalidate serialized content so
 unchecked Pydantic copies cannot cross the control-plane boundary.
 
+## Autoscaler observation window and decision log
+
+`ScalingObservation` captures one coherent, source-timestamped input snapshot
+for exactly one model class. Queue inputs include total and interactive/batch
+depth, oldest age, arrival rate, deadline percentiles, predicted TTFT, and
+goodput ratio. Runner inputs retain current, busy, ready, loading, unhealthy,
+and draining counts. Optional resource inputs cover GPU, HBM, KV-cache,
+multiplexing, and batch occupancy; optional startup inputs retain model-cache
+residency and bounded EMA/p95 metrics for each canonical startup phase. Source
+timestamps cannot postdate the assembled observation, class counts cannot
+exceed their totals, and every numeric field is finite and bounded.
+
+`ScalingObservationWindow` (`runner-scaling-window-v1`) is a non-empty,
+time-bounded sequence of these snapshots. Observation times must be strictly
+increasing and inside the window, IDs must be unique, and all rows must match
+the window model class. A canonical SHA-256 fingerprint binds the complete
+window. These rules prevent partial, reordered, cross-class, or unchecked
+Pydantic copies from entering a decision.
+
+`ScalingDecisionRecord` (`runner-scaling-decision-v1`) copies the exact window,
+catalog revision, and immutable resolved policy rather than pointing at mutable
+configuration. It records action, enumerated primary reason and bounded detail,
+unbuffered demand, the policy-derived buffered target, desired replicas, and
+delta from the latest observed replica count. Validation recomputes the policy
+buffer, target delta, min/max bounds, and per-decision step limit. Staleness is
+derived from the oldest source timestamp in the latest observation (including
+optional resource/startup evidence when present) and the copied policy's
+freshness lease; the persisted boolean and reason must agree with that result.
+Stale input may hold or perform a policy-step-bounded scale-up, but can never
+authorize scale-down. A canonical record fingerprint makes an exact retry
+idempotent and a changed retry under the same decision ID a conflict.
+
+If a newly resolved policy puts the currently observed replica count outside
+its bounds, one decision may remain outside the new range only while moving by
+at most the configured step toward the nearest bound. Holding is still valid
+when a freshness or cooldown safety rule prevents mutation. Moving farther
+away or crossing past the bound is rejected. The buffered target is explicitly
+the pre-clamp demand-plus-buffer value; its field bound includes the maximum
+legal demand and ratio buffer, while `desired_replicas` remains the actuated
+step target.
+
+`ScalingDecisionLog` is the backend-neutral append/get/list contract. The
+in-memory implementation is a bounded, thread-safe reference backend only.
+`PostgresScalingDecisionLog` is the shared production backend: an environment
+uses an explicit store ID, and that store durably fixes its capacity so two
+controllers cannot silently apply different bounds. A row lock on the registry
+serializes capacity checks and inserts. The primary key provides exactly-once
+decision IDs; reads revalidate both the JSON payload and its duplicated indexed
+metadata/fingerprint before returning it.
+
+PostgreSQL objects live in the explicitly qualified `public` schema. Startup
+fails closed unless ordered columns, nullability, primary/foreign/check
+constraints, the model/time lookup index (including sort direction), permanent
+table persistence, and schema version all match. The namespace OID is pinned
+and rechecked after reconnect. The schema is append-only through the public API;
+retention/export policy is deliberately deferred until evidence establishes an
+operational horizon.
+
 ## Next integration boundary
 
-The next slice should define the durable observation window and decision log,
-including stale-input behavior and exact policy revision capture, before adding
-Kubernetes scale actuation. Durable Runner-status persistence and Kubernetes
-deletion remain separate changes.
+WP3.3 should consume these validated records to calculate and apply a bounded
+desired replica count, without yet weakening the single-writer fence. WP3.4
+then propagates the leader fencing token through the decision/CAS mutation
+boundary. Durable Runner-status persistence and Kubernetes deletion remain
+separate changes.

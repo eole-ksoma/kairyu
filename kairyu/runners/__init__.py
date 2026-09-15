@@ -37,6 +37,18 @@ from kairyu.runners.kubernetes import (
     parse_ready_endpoint_uids,
     parse_runner_pods,
 )
+from kairyu.runners.leadership import (
+    InMemoryRunnerLeaderLeaseStore,
+    InvalidRunnerLeadershipError,
+    LeaderFencedRunnerController,
+    RunnerLeaderCapacityError,
+    RunnerLeaderElector,
+    RunnerLeaderLease,
+    RunnerLeaderLeaseStore,
+    RunnerNotLeaderError,
+    RunnerWriterAuthority,
+    StaleRunnerLeaderLeaseError,
+)
 from kairyu.runners.lifecycle import (
     InvalidRunnerStartupReportError,
     InvalidRunnerTransitionError,
@@ -67,6 +79,7 @@ from kairyu.runners.observation import (
     RunnerPodObservation,
     RunnerRuntimeObservation,
 )
+from kairyu.runners.postgres_leadership import PostgresRunnerLeaderLeaseStore
 from kairyu.runners.reconciler import (
     InvalidRunnerObservationError,
     RunnerStatusReconciler,
@@ -77,11 +90,14 @@ from kairyu.runners.reconciler import (
 __all__ = [
     "RUNNER_STARTUP_PHASES",
     "OPTIONAL_RUNNER_STARTUP_PHASES",
+    "PostgresRunnerLeaderLeaseStore",
     "InvalidRunnerStartupReportError",
     "InvalidRunnerTransitionError",
     "InvalidRunnerObservationError",
     "InvalidRunnerDrainEvidenceError",
     "InvalidRunnerFailureEvidenceError",
+    "InvalidRunnerLeadershipError",
+    "InMemoryRunnerLeaderLeaseStore",
     "KubernetesPodPhase",
     "KubernetesRunnerPodSnapshot",
     "KubernetesRunnerWatcher",
@@ -100,6 +116,7 @@ __all__ = [
     "RunnerFailureGuard",
     "RunnerFailureGuardSnapshot",
     "RunnerFailureObservation",
+    "LeaderFencedRunnerController",
     "RunnerBackoffDecision",
     "RunnerBackoffPolicy",
     "RunnerDispatchFence",
@@ -109,6 +126,11 @@ __all__ = [
     "RunnerObservationBatch",
     "RunnerPodObservation",
     "RunnerRuntimeObservation",
+    "RunnerLeaderCapacityError",
+    "RunnerLeaderElector",
+    "RunnerLeaderLease",
+    "RunnerLeaderLeaseStore",
+    "RunnerNotLeaderError",
     "RunnerStartupPhase",
     "RunnerStartupPhaseOutcome",
     "RunnerStartupPhaseReport",
@@ -117,6 +139,8 @@ __all__ = [
     "RunnerStatus",
     "RunnerStatusReconciler",
     "RunnerTerminationAuthorization",
+    "RunnerWriterAuthority",
+    "StaleRunnerLeaderLeaseError",
     "ReplicaPoolDrainController",
     "authorize_runner_termination",
     "candidate_failure_domains",

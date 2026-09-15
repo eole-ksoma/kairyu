@@ -7,8 +7,9 @@ evidence is complete.
 
 This slice fixes the controller-neutral contract, a read-only Kubernetes
 observation/reconciliation boundary, a fence-bound drain/termination handshake,
-and bounded failure-domain backoff/quarantine. Durable persistence, leader
-election, Kubernetes termination writes, and scale actuation remain later work.
+bounded failure-domain backoff/quarantine, and a lease-fenced single-writer
+boundary. Durable Runner-state persistence, Kubernetes termination writes, and
+scale actuation remain later work.
 
 ## Identity and snapshot rules
 
@@ -231,8 +232,57 @@ persistence seam for the later single-writer controller; this slice itself
 performs no database or Kubernetes writes and assumes one event-loop/controller
 owner.
 
+## Leader election and single-writer fencing
+
+`RunnerLeaderLeaseStore` is the shared coordination contract for every Runner
+controller contender. `acquire()` elects at most one unexpired holder for an
+election ID, `renew()` extends only the same tenure, and `authorize()` uses the
+store-owned clock to issue one immediate `RunnerWriterAuthority`. Lease expiry
+is exclusive: at `lease_until` the old holder has no authority and takeover may
+start. Every takeover or release/reacquire increments a durable, monotonic
+`fencing_token`; renewal never changes it.
+
+Controller `holder_id` values must be globally unique per live process (for
+example Pod UID plus process boot UUID). The production store must be shared,
+linearizable, durable across controller restarts, retain token tombstones, and
+derive all expiry decisions from its own authoritative clock. The included
+`InMemoryRunnerLeaderLeaseStore` is a bounded, thread-safe executable
+specification for tests and single-process development; it is not an HA backend.
+`PostgresRunnerLeaderLeaseStore` is the production implementation: each
+environment uses an explicit store ID, PostgreSQL advisory locks and row locks
+serialize contenders, `clock_timestamp()` owns expiry, and the retained row
+preserves the fencing-token tombstone across release and process restart. Store
+DDL, catalog checks, and lease operations all use the explicitly qualified
+`public` control schema; connection `search_path` cannot select an independent
+election. Startup fails closed unless both tables resolve to that namespace and
+their relation kind, ordered column types/nullability, primary key, foreign key
+target, and validated check constraints exactly match schema version 1. Both
+must be permanent rather than unlogged tables so crash recovery cannot reset
+the fencing-token tombstone; a version marker alone is not accepted as
+readiness evidence. The namespace OID is pinned for the store lifetime and
+revalidated after reconnect, preventing silent attachment to recreated state.
+
+`LeaderFencedRunnerController` obtains a freshly store-validated authority
+immediately before each synchronous, bounded callback. Validation requires the
+exact held tenure and lease deadline and cannot predate its latest renewal. Its
+`reconcile()` gate covers both the reconciler and its attached failure guard;
+`authorize_termination()` covers the final drain transition; and
+`mutate_autoscaler()` is the required entry point for the later scale actuator.
+Followers, expired holders, cached/conflicting authority, stale tokens, clock
+rollback, capacity exhaustion, and fencing-token regression fail closed before
+the callback runs.
+
+The authority check never holds the coordination store lock while application
+code runs, so an expired leader cannot prevent takeover by hanging. Therefore
+the authority token must be persisted with any external decision and checked
+atomically by its mutation target; output from a callback that outlives its
+lease is stale even if the local function returns normally. WP3.4 remains
+responsible for propagating this token into the scale decision generation/CAS
+boundary. The current slice performs no Kubernetes mutation and does not add
+cluster RBAC.
+
 ## Next integration boundary
 
-The next slice should implement leader election and bind reconciler, failure
-guard, and later autoscaler mutations to one fenced writer. Scale actuation,
-durable persistence, and Kubernetes deletion remain separate changes.
+The next slice should define the model-class `ScalingPolicy` schema and durable
+observation/decision log before adding Kubernetes scale actuation. Durable
+Runner-status persistence and Kubernetes deletion remain separate changes.

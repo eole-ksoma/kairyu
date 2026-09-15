@@ -23,7 +23,7 @@ beat frontier APIs as measured by the committed harness (G6 gate P-C1).
 
 ## Current Status
 
-Snapshot date: 2026-09-01. Hardware context: all GPU evidence so far is on
+Snapshot date: 2026-09-15. Hardware context: all GPU evidence so far is on
 8× RTX PRO 6000 Blackwell (SM120), PCIe-only interconnect (P2P 30–37 GB/s);
 NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 `bench/results/` (see `index.json`); decisions and rationale in `docs/design/`.
@@ -95,15 +95,23 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
   state/result/cancel routes, a lease-fenced worker, shared queue telemetry,
   bounded request/audit retention, and multi-gateway CPU evidence. The current
   retention-expanded Kind rerun remains pending on Docker registry access.
-- Runner State v1 now fixes the controller-neutral logical state, transition,
-  identity, active-request, failure, and ordered startup-phase contracts. The
-  Kubernetes watcher/reconciler and runtime instrumentation remain open.
+- Runner State v1 includes Kubernetes observation/reconciliation, fenced
+  drain/termination, failure-domain backoff/quarantine, and a lease-fenced
+  single-writer gate with a PostgreSQL shared lease backend. Deployment wiring,
+  durable Runner status, Kubernetes mutations, and runtime instrumentation
+  remain open.
 - Human sign-off pending on M2–M4 design reviews
 
 ## Change Log
 
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
+
+### 2026-09-15 — [progress] Runner control-plane safety through WP2.6
+- What: added Kubernetes reconciliation, drain authorization, revision/node/GPU
+  backoff, and PostgreSQL lease-fenced single-writer gates for controller and
+  autoscaler work.
+- Refs: docs/design/runner-state-v1.md; kairyu/runners; tests/unit/test_runner_*.py
 
 ### 2026-09-11 — [design] Runner State v1 and startup evidence
 - What: added immutable, versioned Runner status and startup phase schemas,

@@ -1,0 +1,66 @@
+server:
+  host: 0.0.0.0
+  port: 8000
+  api_keys_env: null
+  # 2 replicas x 32 vLLM sequences: admit exactly what L1 can run at once.
+  max_concurrency: 64
+  # A bounded queue wait fails a stuck request fast instead of parking it
+  # (issue #495 rationale, shared with the tiered example).
+  admission_wait_timeout_s: 600
+  max_chat_body_bytes: 16777216
+
+# One pool, two identical TP4+EP4 replicas. Kairyu L2 does no orchestration
+# here: it only places each request on a replica (see the pool knobs below).
+pools:
+  deepseek-v4-flash-0731:
+    replicas:
+      - backend: openai
+        health_url: http://deepseek-0:8000/health
+        options: &deepseek
+          base_url: http://deepseek-0:8000/v1
+          model: deepseek-v4-flash-0731
+          api_key_env: null
+          # Bounded so a hung upstream call fails instead of holding its
+          # replica slot for a day (issue #495).
+          timeout_s: 1800
+          upstream: vllm
+          # vLLM owns the prompt: it renders chat with the checkpoint's own
+          # encoder (tokenizer-mode deepseek_v4), so Kairyu forwards messages,
+          # tools, tool_choice, parallel_tool_calls, and reasoning_effort to
+          # /chat/completions and normalizes the parsed tool calls (the same
+          # path the Qwen examples use).
+          capabilities:
+            allow_chat_template_kwargs: [thinking, enable_thinking]
+          model_revision: 9e165c30e2704aec5d9d593cce3eebd58bbef1cb
+          max_model_len: 1048576
+          quantization_format: mixed-fp4-fp8
+          cache_descriptor:
+            family: deepseek-v4-hca-csa-dsa
+            block_size: 256
+          tensor_parallel_size: 4
+          expert_parallel_size: 4
+          attention_data_parallel_size: 1
+          dspark_enabled: true
+          container_image_digest: sha256:99756b54424a4697f69476b29aa02fb7f8112aaa74fa8203a7bf8a0bae4ca6f1
+      - backend: openai
+        health_url: http://deepseek-1:8000/health
+        options: {<<: *deepseek, base_url: http://deepseek-1:8000/v1}
+    unhealthy_after: 1
+    # Placement policy: a request whose prompt prefix is already warm on a
+    # replica goes there only while that replica is idle; the moment it has
+    # one in-flight request the valve (threshold 0, strict >) falls through
+    # to least-outstanding, so concurrent traffic alternates between the two
+    # replicas before either takes a second request. Sessionless traffic with
+    # no warm prefix is pure least-outstanding (ties -> lowest replica id).
+    queue_depth_threshold: 0
+    prefix_index: true
+    probe_interval_s: 2.0
+    # One JSONL row per placement (replica id, reason, hashed session);
+    # verify.sh reads it to prove the per-row distribution.
+    placement_log_path: /var/lib/kairyu/placement/deepseek-v4-flash-0731.jsonl
+
+# vLLM renders the checkpoint's own chat encoding (including DSML tools) and
+# parses tool calls, so Kairyu uses its legacy chat path here, exactly as in
+# the Qwen examples. Ordinary requests default to direct chat; an explicit
+# reasoning_effort selects thinking mode (vLLM maps it to enable_thinking).
+legacy_chat_models: [deepseek-v4-flash-0731]

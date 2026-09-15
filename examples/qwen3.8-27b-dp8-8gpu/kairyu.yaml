@@ -1,0 +1,85 @@
+server:
+  host: 0.0.0.0
+  port: 8000
+  api_keys_env: null
+  # 8 replicas x 32 vLLM sequences: admit exactly what L1 can run at once.
+  max_concurrency: 256
+  # A bounded queue wait fails a stuck request fast instead of parking it
+  # (issue #495 rationale, shared with the tiered example).
+  admission_wait_timeout_s: 600
+  max_chat_body_bytes: 16777216
+
+# One pool, eight identical TP1 replicas. Kairyu L2 does no orchestration
+# here: it only places each request on a replica (see the pool knobs below).
+pools:
+  qwen3.8-27b:
+    replicas:
+      - backend: openai
+        health_url: http://qwen-0:8000/health
+        options: &qwen
+          base_url: http://qwen-0:8000/v1
+          model: qwen3.8-27b
+          api_key_env: null
+          # Bounded so a hung upstream call fails instead of holding its
+          # replica slot for a day (issue #495).
+          timeout_s: 1800
+          upstream: vllm
+          capabilities:
+            allow_prompt_kinds: [multimodal]
+            allow_chat_template_kwargs: [enable_thinking]
+          image_input_policy:
+            max_images: 1
+            max_image_bytes: 8388608
+            max_total_image_bytes: 8388608
+            max_image_pixels: 2097152
+            max_total_image_pixels: 2097152
+            max_image_dimension: 4096
+            max_image_aspect_ratio: 200
+            max_processed_prompt_tokens: 262144
+          model_revision: 017b9c7af6b5689d5dd426a76e0bc077eb5ca20a
+          max_model_len: 262144
+          quantization_format: fp8
+          cache_descriptor:
+            family: qwen3.8-hybrid-mamba-paged-kv
+          tensor_parallel_size: 1
+          mtp_enabled: false
+          container_image_digest: sha256:6d8429e38e3747723ca07ee1b17972e09bb9c51c4032b266f24fb1cc3b22ed8f
+      - backend: openai
+        health_url: http://qwen-1:8000/health
+        options: {<<: *qwen, base_url: http://qwen-1:8000/v1}
+      - backend: openai
+        health_url: http://qwen-2:8000/health
+        options: {<<: *qwen, base_url: http://qwen-2:8000/v1}
+      - backend: openai
+        health_url: http://qwen-3:8000/health
+        options: {<<: *qwen, base_url: http://qwen-3:8000/v1}
+      - backend: openai
+        health_url: http://qwen-4:8000/health
+        options: {<<: *qwen, base_url: http://qwen-4:8000/v1}
+      - backend: openai
+        health_url: http://qwen-5:8000/health
+        options: {<<: *qwen, base_url: http://qwen-5:8000/v1}
+      - backend: openai
+        health_url: http://qwen-6:8000/health
+        options: {<<: *qwen, base_url: http://qwen-6:8000/v1}
+      - backend: openai
+        health_url: http://qwen-7:8000/health
+        options: {<<: *qwen, base_url: http://qwen-7:8000/v1}
+    unhealthy_after: 1
+    # Placement policy: a request whose prompt prefix is already warm on a
+    # replica goes there only while that replica is idle; the moment it has
+    # one in-flight request the valve (threshold 0, strict >) falls through
+    # to least-outstanding, so concurrent traffic spreads one-per-replica
+    # before any replica takes a second request. Sessionless traffic with no
+    # warm prefix is pure least-outstanding (ties -> lowest replica id).
+    queue_depth_threshold: 0
+    prefix_index: true
+    probe_interval_s: 2.0
+    # One JSONL row per placement (replica id, reason, hashed session);
+    # verify.sh reads it to prove the per-row distribution.
+    placement_log_path: /var/lib/kairyu/placement/qwen3.8-27b.jsonl
+
+# vLLM renders the mounted Qwen chat template (enable_thinking / reasoning
+# effort kwargs pass through), so Kairyu uses its legacy chat path here,
+# exactly as in the single-GPU example.
+legacy_chat_models: [qwen3.8-27b]

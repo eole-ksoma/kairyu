@@ -1,0 +1,83 @@
+server:
+  host: 0.0.0.0
+  port: 8000
+  api_keys_env: null
+  # 2 replicas x 16 vLLM sequences (the official rtx_pro_6000_4x FP8 layout):
+  # admit exactly what L1 can run at once.
+  max_concurrency: 32
+  # A bounded queue wait fails a stuck request fast instead of parking it
+  # (issue #495 rationale, shared with the tiered example).
+  admission_wait_timeout_s: 600
+  # Base64 image parts ride inside the chat body; the image policy below
+  # bounds them to 32 MiB total, so the body cap must clear that.
+  max_chat_body_bytes: 67108864
+
+# One pool, two identical TP4 replicas. Kairyu L2 does no orchestration here:
+# it only places each request on a replica (see the pool knobs below).
+pools:
+  qwen3.8-flash-next:
+    replicas:
+      - backend: openai
+        health_url: http://qwen-0:8000/health
+        options: &qwen
+          base_url: http://qwen-0:8000/v1
+          model: qwen3.8-flash-next
+          api_key_env: null
+          # Bounded so a hung upstream call fails instead of holding its
+          # replica slot for a day (issue #495).
+          timeout_s: 1800
+          upstream: vllm
+          # vLLM owns the prompt: it renders chat with the example-local
+          # template (official template + L3 effort alias), so Kairyu
+          # forwards messages (including OpenAI image parts), tools,
+          # tool_choice, parallel_tool_calls, and reasoning_effort to
+          # /chat/completions and normalizes the parsed tool calls.
+          capabilities:
+            allow_prompt_kinds: [multimodal]
+            allow_chat_template_kwargs: [enable_thinking]
+          # The checkpoint's preprocessor accepts 65,536 - 16,777,216 px per
+          # image with no per-request image cap, so these are Kairyu-side
+          # admission bounds: 4 images of up to 16 Mpx / 8 MiB each, within
+          # the 256K-token context.
+          image_input_policy:
+            max_images: 4
+            max_image_bytes: 8388608
+            max_total_image_bytes: 33554432
+            max_image_pixels: 16777216
+            max_total_image_pixels: 67108864
+            max_image_dimension: 8192
+            max_image_aspect_ratio: 200
+            max_processed_prompt_tokens: 262144
+          model_revision: 236dfdf285828023ca3bcd3f37366c58a3469b13
+          max_model_len: 262144
+          quantization_format: fp8
+          cache_descriptor:
+            family: qwen3.8-flash-next-hybrid-gdn-qsa
+          tensor_parallel_size: 4
+          attention_data_parallel_size: 1
+          mtp_enabled: false
+          container_image_digest: sha256:b47e22101829b471e8d3b0702a50ab884f58390cc2dfd50cb83aaf43ae30e9d4
+      - backend: openai
+        health_url: http://qwen-1:8000/health
+        options: {<<: *qwen, base_url: http://qwen-1:8000/v1}
+    unhealthy_after: 1
+    # Placement policy: a request whose prompt prefix is already warm on a
+    # replica goes there only while that replica is idle; the moment it has
+    # one in-flight request the valve (threshold 0, strict >) falls through
+    # to least-outstanding, so concurrent traffic alternates between the two
+    # replicas before either takes a second request. Sessionless traffic with
+    # no warm prefix is pure least-outstanding (ties -> lowest replica id).
+    queue_depth_threshold: 0
+    prefix_index: true
+    probe_interval_s: 2.0
+    # One JSONL row per placement (replica id, reason, hashed session);
+    # verify.sh reads it to prove the per-row distribution.
+    placement_log_path: /var/lib/kairyu/placement/qwen3.8-flash-next.jsonl
+
+# vLLM renders the chat template (including XML tools and image placeholders)
+# and parses tool calls, so Kairyu uses its legacy chat path here, exactly as
+# in the sibling replica examples. Ordinary requests default to direct chat;
+# an explicit reasoning_effort selects thinking mode. Kairyu normalizes the
+# wire values medium -> high and xhigh -> max; the example-local template
+# maps them back to Qwen's official low/medium/xhigh vocabulary.
+legacy_chat_models: [qwen3.8-flash-next]

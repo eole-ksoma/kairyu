@@ -704,6 +704,91 @@ async def test_async_prepare_rejects_noninitial_final_sampling_policy() -> None:
     assert tier2.generated == []
 
 
+def test_validate_request_rejects_unsupported_chat_continuation_retry() -> None:
+    class RejectAssistantPrefillBackend(_PreparingBackend):
+        def validate_request(self, request: GenerationRequest) -> None:
+            super().validate_request(request)
+            if request.assistant_prefill is not None:
+                raise ValueError("assistant prefill unsupported")
+
+    backend = RejectAssistantPrefillBackend("tier2", [])
+    orchestrator = _orchestrator(
+        engines={"tier2": backend},
+        roles=(
+            RoleSpec(
+                name="final",
+                worker="tier2",
+                role_type="publisher",
+                prompt="[final] {query}",
+                reasoning_close_tag="</THINK>",
+                reasoning_continuation="chat",
+                reasoning_open_tag="<THINK>",
+            ),
+        ),
+        public_output_floor=64,
+    )
+    call = OrchestrationRequest(
+        prompt=COMPLEX,
+        sampling_params=SamplingParams(max_tokens=512),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"^final orchestration intent is unsupported: "
+            r"tier2: assistant prefill unsupported$"
+        ),
+    ):
+        orchestrator.validate_request(call)
+
+    assert [request.assistant_prefill for request in backend.validated] == [
+        None,
+        "<THINK>\n\n</THINK>\n\n",
+    ]
+    assert backend.generated == []
+
+
+async def test_async_prepare_keeps_chat_retry_intent_validation_only() -> None:
+    events: list[tuple[str, str]] = []
+    backend = _PreparingBackend("tier2", events)
+    orchestrator = _orchestrator(
+        engines={"tier2": backend},
+        roles=(
+            RoleSpec(
+                name="final",
+                worker="tier2",
+                role_type="publisher",
+                prompt="[final] {query}",
+                reasoning_close_tag="</THINK>",
+                reasoning_continuation="chat",
+                reasoning_open_tag="<THINK>",
+            ),
+        ),
+        public_output_floor=64,
+    )
+    call = OrchestrationRequest(
+        prompt=COMPLEX,
+        sampling_params=SamplingParams(max_tokens=512),
+    )
+
+    prepared = await orchestrator.prepare_request(call)
+
+    assert [request.assistant_prefill for request in backend.validated] == [
+        None,
+        "<THINK>\n\n</THINK>\n\n",
+        None,
+    ]
+    assert [request.assistant_prefill for request in backend.prepared] == [
+        None,
+        None,
+    ]
+    assert backend.prepared[0].request_id.startswith("preflight-tier2-")
+    assert backend.prepared[1].request_id.startswith("preflight-role-final-")
+
+    await orchestrator.run(call, prepared=prepared)
+    assert backend.generated == [backend.prepared[1]]
+
+
 async def test_async_prepare_rejects_exact_initial_role_prompt_before_dispatch() -> None:
     events: list[tuple[str, str]] = []
 
@@ -2095,3 +2180,23 @@ async def test_judge_and_non_thinking_final_disable_thinking_explicitly():
     await orchestrator.run(primary_call)
     assert tier1.generated[-1].chat_template_kwargs == {"enable_thinking": False}
     assert tier1.generated[-1].reasoning_effort is None
+def test_trace_envelope_starts_at_judge_queued_at() -> None:
+    """A judge event queued one clock-millisecond before its started_at must
+    stay inside the trace envelope (serving_bench rejects the whole trace
+    otherwise)."""
+    from kairyu.orchestration.orchestrator import _trace_started_at_from
+    from kairyu.orchestration.trace import TraceEvent, TraceTiming
+
+    event = TraceEvent(
+        node="profile_judge",
+        kind="judged",
+        operation="classification",
+        role="profile_judge",
+        timing=TraceTiming(
+            queued_at="2026-08-25T13:28:04.528Z",
+            started_at="2026-08-25T13:28:04.529Z",
+            completed_at="2026-08-25T13:28:04.813Z",
+        ),
+    )
+    assert _trace_started_at_from(event) == "2026-08-25T13:28:04.528Z"
+    assert _trace_started_at_from(None)  # falls back to a fresh timestamp

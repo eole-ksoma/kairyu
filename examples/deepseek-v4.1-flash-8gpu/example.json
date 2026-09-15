@@ -1,0 +1,130 @@
+{
+  "schema_version": 1,
+  "environment": "deepseek-v4.1-flash-8gpu",
+  "hardware": {
+    "gpu_count": 8,
+    "product": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "minimum_compute_capability": 12.0,
+    "minimum_vram_mib": 90000
+  },
+  "storage": {
+    "root": "/mnt/nvme/kairyu",
+    "minimum_free_gib": 600
+  },
+  "allocation": {
+    "model": "deepseek-v4.1-flash",
+    "gpu_ids": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "replicas": 1,
+    "replica_gpu_ids": [
+      [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ]
+    ],
+    "tensor_parallel_size": 8,
+    "expert_parallel_size": 8
+  },
+  "pool": {
+    "queue_depth_threshold": 0,
+    "prefix_index": true,
+    "unhealthy_after": 1,
+    "placement_log": "/var/lib/kairyu/placement/deepseek-v4.1-flash.jsonl"
+  },
+  "model": {
+    "repo": "deepseek-ai/DeepSeek-V4.1-Flash",
+    "revision": "dba1be0a40aa45a94ad051997016db3960a90277",
+    "tree_sha256": "d21211ca29ad7eba1fda84e49b1a34a73214ec9b84b23928cde63902c3318bfd",
+    "slug": "deepseek-v4.1-flash",
+    "served_name": "deepseek-v4.1-flash",
+    "max_context_tokens": 1048576,
+    "quantization": "mixed-fp4-fp8",
+    "modalities": [
+      "text",
+      "image"
+    ],
+    "default_reasoning_effort": "high",
+    "reasoning_effort_budgets": {
+      "low": 50,
+      "high": 75,
+      "max": 100
+    },
+    "sampling": {
+      "temperature": 1.0,
+      "top_p": 1.0
+    }
+  },
+  "vllm": {
+    "image": "local/vllm-openai:deepseek-v41-sm120",
+    "image_id": "sha256:027bf47b2bd6f0d0abe54b296e7e9e3d31ee103bb6e46fa0a9807117681c2359",
+    "distribution": "overlay",
+    "dockerfile": "vllm-sm120.Dockerfile",
+    "base_image": "vllm/vllm-openai:deepseekv41-flash-0909@sha256:00d577a6a63281e15336029d5bcee4e9a2cf182214a4f20ba6111b1c8e79893d",
+    "source_repository": "https://github.com/vllm-project/vllm",
+    "source_revision": "179dd0fa9",
+    "flashinfer_repository": "https://github.com/flashinfer-ai/flashinfer.git",
+    "flashinfer_revision": "60b49158ab4fb81718aef486c2d3c89aec4c1901",
+    "tensor_parallel_size": 8,
+    "expert_parallel_size": 8,
+    "moe_backend": "marlin",
+    "dspark_speculative_tokens": 5,
+    "max_num_batched_tokens": 16384,
+    "max_num_seqs": 64,
+    "kv_cache_dtype": "fp8",
+    "block_size": 64,
+    "source_version": "0.1.dev20904+g179dd0fa9",
+    "engram_cpu_offload": false,
+    "flashinfer_version": "0.6.18",
+    "adaptive_verification": false,
+    "kv_cache_layout": "BLHNC",
+    "sm120_swa_block_size": 64,
+    "indexer_kv_dtype": "mxfp4"
+  },
+  "webui": {
+    "image": "ghcr.io/open-webui/open-webui:v0.11.0-slim@sha256:3698bd4e9628b7ae3768808721098616e669b4a05a6bceb2f5da2d84a3282a01",
+    "port": 3007,
+    "reasoning_effort_levels": [
+      "default",
+      "low",
+      "high",
+      "max"
+    ]
+  },
+  "api_port": 8007,
+  "verification": {
+    "serving": {
+      "prompt_tokens_approx": 8192,
+      "output_tokens": 256,
+      "concurrency": [
+        1,
+        8,
+        16,
+        32,
+        64
+      ],
+      "requests_per_concurrency": 64,
+      "placement_gate": {
+        "min_concurrency": 1,
+        "max_share_of_mean": 1.25
+      }
+    },
+    "vision": {
+      "requests_per_replica": 2,
+      "max_tokens": 8192
+    }
+  }
+}

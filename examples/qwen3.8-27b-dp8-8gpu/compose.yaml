@@ -1,0 +1,307 @@
+name: kairyu-qwen38-27b-dp8-8gpu
+
+# Eight identical Qwen3.8-27B-FP8 TP1 vLLM replicas (one per GPU) behind one
+# Kairyu L3 endpoint. Kairyu L2 is only the replica pool: warm-prefix reuse
+# when that replica is idle, otherwise least-outstanding placement, so
+# concurrent traffic spreads evenly over all eight GPUs (kairyu.yaml).
+x-qwen: &qwen
+  image: ${QWEN_VLLM_IMAGE:-vllm/vllm-openai:v0.23.0@sha256:6d8429e38e3747723ca07ee1b17972e09bb9c51c4032b266f24fb1cc3b22ed8f}
+  ipc: host
+  environment:
+    HF_HOME: /models/.cache
+    HF_HUB_OFFLINE: "1"
+    HF_HUB_DISABLE_TELEMETRY: "1"
+    VLLM_NO_USAGE_STATS: "1"
+    VLLM_USE_DEEP_GEMM: "0"
+    PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    SAFETENSORS_FAST_GPU: "1"
+    XDG_CACHE_HOME: /root/.cache
+    TORCHINDUCTOR_CACHE_DIR: /root/.cache/torchinductor
+    TRITON_CACHE_DIR: /root/.cache/triton
+    TILELANG_CACHE_DIR: /root/.cache/tilelang
+    TILELANG_TMP_DIR: /root/.cache/tilelang/tmp
+  # The single-GPU example's measured L1 envelope (its MEASUREMENTS.md):
+  # 32K batched tokens, 32 sequences, FP8 KV, piecewise CUDA Graphs, MTP off.
+  command:
+    - /models/qwen3.8-27b-fp8
+    - --served-model-name
+    - qwen3.8-27b
+    - --max-model-len
+    - "262144"
+    - --mm-processor-kwargs
+    - '{"min_pixels":65536,"max_pixels":2097152}'
+    - --limit-mm-per-prompt.image
+    - "1"
+    - --limit-mm-per-prompt.video
+    - "0"
+    - --dtype
+    - bfloat16
+    - --kv-cache-dtype
+    - fp8
+    - --mamba-cache-dtype
+    - float16
+    - --mamba-ssm-cache-dtype
+    - float16
+    - --mamba-cache-mode
+    - align
+    - --enable-prefix-caching
+    - --enable-chunked-prefill
+    - --max-num-batched-tokens
+    - "32768"
+    - --max-num-seqs
+    - "32"
+    - --gpu-memory-utilization
+    - "0.95"
+    - --attention-backend
+    - FLASHINFER
+    - --enable-flashinfer-autotune
+    - --compilation-config
+    - '{"cudagraph_mode":"PIECEWISE"}'
+    - --generation-config
+    - vllm
+    - --chat-template
+    - /etc/kairyu/qwen3.8-chat.jinja
+    - --reasoning-parser
+    - qwen3
+    # The Kairyu-owned template already renders non-thinking prompts unless
+    # reasoning_effort is set; this tells vLLM's qwen3 reasoning parser the
+    # same default, otherwise a direct answer (no </think>) is misfiled as
+    # reasoning_content and content comes back empty.
+    - --default-chat-template-kwargs
+    - '{"enable_thinking": false}'
+    - --enable-auto-tool-choice
+    - --tool-call-parser
+    - qwen3_coder
+    - --disable-uvicorn-access-log
+  healthcheck: &health
+    test: [CMD, python3, -c, 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/health", timeout=2)']
+    interval: 5s
+    timeout: 3s
+    retries: 1440
+    start_period: 30s
+  restart: unless-stopped
+
+services:
+  qwen-0:
+    <<: *qwen
+    cpuset: ${QWEN_0_CPUSET}
+    volumes:
+      - type: bind
+        source: ${QWEN_MODEL_STORAGE_PATH}
+        target: /models
+        read_only: true
+      - type: bind
+        source: ${QWEN_CACHE_0_PATH}
+        target: /root/.cache
+      - ../qwen3.8-27b-1gpu/chat_template.jinja:/etc/kairyu/qwen3.8-chat.jinja:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+
+  qwen-1:
+    <<: *qwen
+    cpuset: ${QWEN_1_CPUSET}
+    volumes:
+      - type: bind
+        source: ${QWEN_MODEL_STORAGE_PATH}
+        target: /models
+        read_only: true
+      - type: bind
+        source: ${QWEN_CACHE_1_PATH}
+        target: /root/.cache
+      - ../qwen3.8-27b-1gpu/chat_template.jinja:/etc/kairyu/qwen3.8-chat.jinja:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]
+
+  qwen-2:
+    <<: *qwen
+    cpuset: ${QWEN_2_CPUSET}
+    volumes:
+      - type: bind
+        source: ${QWEN_MODEL_STORAGE_PATH}
+        target: /models
+        read_only: true
+      - type: bind
+        source: ${QWEN_CACHE_2_PATH}
+        target: /root/.cache
+      - ../qwen3.8-27b-1gpu/chat_template.jinja:/etc/kairyu/qwen3.8-chat.jinja:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["2"]
+              capabilities: [gpu]
+
+  qwen-3:
+    <<: *qwen
+    cpuset: ${QWEN_3_CPUSET}
+    volumes:
+      - type: bind
+        source: ${QWEN_MODEL_STORAGE_PATH}
+        target: /models
+        read_only: true
+      - type: bind
+        source: ${QWEN_CACHE_3_PATH}
+        target: /root/.cache
+      - ../qwen3.8-27b-1gpu/chat_template.jinja:/etc/kairyu/qwen3.8-chat.jinja:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["3"]
+              capabilities: [gpu]
+
+  qwen-4:
+    <<: *qwen
+    cpuset: ${QWEN_4_CPUSET}
+    volumes:
+      - type: bind
+        source: ${QWEN_MODEL_STORAGE_PATH}
+        target: /models
+        read_only: true
+      - type: bind
+        source: ${QWEN_CACHE_4_PATH}
+        target: /root/.cache
+      - ../qwen3.8-27b-1gpu/chat_template.jinja:/etc/kairyu/qwen3.8-chat.jinja:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["4"]
+              capabilities: [gpu]
+
+  qwen-5:
+    <<: *qwen
+    cpuset: ${QWEN_5_CPUSET}
+    volumes:
+      - type: bind
+        source: ${QWEN_MODEL_STORAGE_PATH}
+        target: /models
+        read_only: true
+      - type: bind
+        source: ${QWEN_CACHE_5_PATH}
+        target: /root/.cache
+      - ../qwen3.8-27b-1gpu/chat_template.jinja:/etc/kairyu/qwen3.8-chat.jinja:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["5"]
+              capabilities: [gpu]
+
+  qwen-6:
+    <<: *qwen
+    cpuset: ${QWEN_6_CPUSET}
+    volumes:
+      - type: bind
+        source: ${QWEN_MODEL_STORAGE_PATH}
+        target: /models
+        read_only: true
+      - type: bind
+        source: ${QWEN_CACHE_6_PATH}
+        target: /root/.cache
+      - ../qwen3.8-27b-1gpu/chat_template.jinja:/etc/kairyu/qwen3.8-chat.jinja:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["6"]
+              capabilities: [gpu]
+
+  qwen-7:
+    <<: *qwen
+    cpuset: ${QWEN_7_CPUSET}
+    volumes:
+      - type: bind
+        source: ${QWEN_MODEL_STORAGE_PATH}
+        target: /models
+        read_only: true
+      - type: bind
+        source: ${QWEN_CACHE_7_PATH}
+        target: /root/.cache
+      - ../qwen3.8-27b-1gpu/chat_template.jinja:/etc/kairyu/qwen3.8-chat.jinja:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["7"]
+              capabilities: [gpu]
+
+  kairyu:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      args:
+        KAIRYU_VISION: "1"
+    image: ${KAIRYU_IMAGE:-local/kairyu:qwen38-dp8-example}
+    command: [/etc/kairyu/kairyu.yaml]
+    environment:
+      KAIRYU_CONTAINER_IMAGE_DIGEST: ${KAIRYU_IMAGE_ID:-local-build}
+    volumes:
+      - type: bind
+        source: ${QWEN_MODEL_STORAGE_PATH}
+        target: /models
+        read_only: true
+      # Per-placement JSONL evidence (replica id + reason per request) that
+      # verify.sh reads to prove the even spread; session ids are hashed.
+      - type: bind
+        source: ${PLACEMENT_LOG_PATH}
+        target: /var/lib/kairyu/placement
+      - ./kairyu.yaml:/etc/kairyu/kairyu.yaml:ro
+    depends_on:
+      qwen-0: {condition: service_healthy}
+      qwen-1: {condition: service_healthy}
+      qwen-2: {condition: service_healthy}
+      qwen-3: {condition: service_healthy}
+      qwen-4: {condition: service_healthy}
+      qwen-5: {condition: service_healthy}
+      qwen-6: {condition: service_healthy}
+      qwen-7: {condition: service_healthy}
+    ports:
+      - 127.0.0.1:${API_PORT:-8004}:8000
+    healthcheck:
+      test: [CMD, python3, -c, 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/readyz", timeout=2)']
+      interval: 5s
+      timeout: 3s
+      retries: 120
+    restart: unless-stopped
+
+  chat-ui:
+    image: ${OPEN_WEBUI_IMAGE:-ghcr.io/open-webui/open-webui:v0.11.0-slim@sha256:3698bd4e9628b7ae3768808721098616e669b4a05a6bceb2f5da2d84a3282a01}
+    environment:
+      OPENAI_API_BASE_URL: http://kairyu:8000/v1
+      OPENAI_API_KEY: sk-local-kairyu
+      DEFAULT_MODELS: qwen3.8-27b
+      DEFAULT_MODEL_PARAMS: '{"max_tokens":32768,"temperature":1.0,"top_p":0.95}'
+      ENABLE_SIGNUP: ${ENABLE_SIGNUP:-true}
+      WEBUI_AUTH: "true"
+      WEBUI_URL: ${WEBUI_URL:-http://localhost:3000}
+      WEBUI_ADMIN_EMAIL: ${WEBUI_ADMIN_EMAIL:-}
+      WEBUI_ADMIN_PASSWORD: ${WEBUI_ADMIN_PASSWORD:-}
+      WEBUI_ADMIN_NAME: ${WEBUI_ADMIN_NAME:-Kairyu Admin}
+      ENABLE_OLLAMA_API: "false"
+      RAG_EMBEDDING_ENGINE: ""
+    volumes:
+      - type: bind
+        source: ${WEBUI_STORAGE_PATH}
+        target: /app/backend/data
+    depends_on:
+      kairyu: {condition: service_healthy}
+    ports:
+      - ${CHAT_UI_BIND_ADDRESS:-127.0.0.1}:${CHAT_UI_PORT:-3000}:8080
+    restart: unless-stopped

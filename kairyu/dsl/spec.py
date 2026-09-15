@@ -169,6 +169,18 @@ class RoleNodeSpec(BaseModel):
     # config; public_output_floor uses it to force-close deliberation in the
     # final unit's empty-output re-dispatch (issue #542).
     reasoning_close_tag: str = ""
+    # How the public-output floor continues exhausted deliberation (DTO-D15).
+    # "prefix": the role's own text scaffold opened the span, so the captured
+    # reasoning plus reasoning_close_tag is appended to the prompt. "chat":
+    # the worker's upstream chat template opened the span, so the captured
+    # reasoning plus the close tag is sent as an assistant-turn prefill the
+    # template re-renders as a closed thinking turn and generation continues.
+    reasoning_continuation: Literal["prefix", "chat"] = "prefix"
+    # The literal that opens the span for "chat" continuation (e.g.
+    # "<think>"): vLLM continues the final assistant message only when it
+    # appears verbatim in the rendered chat, so the prefill must reproduce the
+    # template's closed thinking turn "<open>\n<reasoning>\n<close>\n\n".
+    reasoning_open_tag: str = ""
     # Dispatch condition. "image": the role runs only when the request carries
     # image input; on text requests it is skipped entirely (no model call, no
     # budget step), its dependents run as if it were absent, and its template
@@ -229,6 +241,18 @@ class RoleNodeSpec(BaseModel):
             raise ValueError(
                 f"role {self.name!r}: reasoning_close_tag declares an open "
                 "reasoning span and cannot combine with reasoning_closed"
+            )
+        if self.reasoning_continuation == "chat" and not (
+            self.reasoning_close_tag and self.reasoning_open_tag
+        ):
+            raise ValueError(
+                f"role {self.name!r}: reasoning_continuation 'chat' requires "
+                "reasoning_open_tag and reasoning_close_tag"
+            )
+        if self.reasoning_open_tag and self.reasoning_continuation != "chat":
+            raise ValueError(
+                f"role {self.name!r}: reasoning_open_tag is only used by "
+                "reasoning_continuation 'chat'"
             )
         return self
 

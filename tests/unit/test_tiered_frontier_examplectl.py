@@ -143,8 +143,8 @@ def test_tiered_example_allocates_four_qwen_replicas_and_one_deepseek_tp4() -> N
         }
         assert _option(service["command"], "--limit-mm-per-prompt.image") == "1"
         assert _option(service["command"], "--limit-mm-per-prompt.video") == "0"
-        # Low-effort thinking is declared per role in auto-max.yaml, not via
-        # a service-wide default.
+        # Medium-effort thinking is declared per role in auto-max.yaml, not
+        # via a service-wide default.
         assert "--default-chat-template-kwargs" not in service["command"]
         assert _option(service["command"], "--max-num-seqs") == "32"
         assert _option(service["command"], "--max-num-batched-tokens") == "32768"
@@ -157,8 +157,7 @@ def test_tiered_example_allocates_four_qwen_replicas_and_one_deepseek_tp4() -> N
         assert "--speculative-config" not in service["command"]
         assert service["volumes"][-2]["target"] == "/root/.cache"
         assert service["volumes"][-1] == (
-            "../qwen3.8-27b-1gpu/chat_template.jinja:"
-            "/etc/kairyu/qwen3.8-chat.jinja:ro"
+            "./qwen3.8-chat.jinja:/etc/kairyu/qwen3.8-chat.jinja:ro"
         )
         assert service["environment"] | {
             "XDG_CACHE_HOME": "/root/.cache",
@@ -382,24 +381,25 @@ def test_tiered_l2_pins_only_the_dual_track_dag() -> None:
         "audit",
     ]
     by_name = {role.name: role for role in maximum.roles}
-    # Effort policy (DTO-D6): Qwen roles are fixed spec policy — draft and
-    # the answerers think at low, the head declares no effort and stays
+    # Effort policy (DTO-D6/D14): Qwen thinking roles are fixed spec policy
+    # — draft and the answerers think at medium (spec level `high` under the
+    # L3 medium→high alias), the head declares no effort and stays
     # non-thinking. DeepSeek roles inherit the caller's L3 effort, and an
     # effortless request runs at the spec default of high.
     assert maximum.default_reasoning_effort == "high"
     efforts = {role.name: role.reasoning_effort for role in maximum.roles}
     assert efforts == {
         "head": None,
-        "draft": "low",
-        "image_description": "low",
-        "answer_1": "low",
-        "answer_2": "low",
-        "answer_3": "low",
-        "answer_4": "low",
+        "draft": "high",
+        "image_description": "high",
+        "answer_1": "high",
+        "answer_2": "high",
+        "answer_3": "high",
+        "answer_4": "high",
         "policies": "inherit",
         "critique": "inherit",
         "synthesis": "inherit",
-        "audit": "inherit",
+        "audit": "high",
     }
     head = by_name["head"]
     assert head.role_type == "head" and head.worker == "tier1"
@@ -455,16 +455,21 @@ def test_tiered_l2_pins_only_the_dual_track_dag() -> None:
     # in the empty-output re-dispatch via this tag.
     assert synthesis.reasoning_close_tag == "</think>"
     assert synthesis.prompt_headless
-    # DTO-D10: the audit verifier gates publication of the final unit with
-    # the first-line PASS/FAIL protocol; never greedy (issue #509).
+    # DTO-D10/D14: the audit verifier gates publication of the final unit
+    # with the first-line PASS/FAIL protocol; never greedy (issue #509). It
+    # runs on Qwen at fixed medium effort with one think+verdict cap.
     audit = by_name["audit"]
-    assert audit.role_type == "verifier" and audit.worker == "tier2"
+    assert audit.role_type == "verifier" and audit.worker == "tier1"
     assert audit.verifies == "synthesis"
     assert audit.depends_on == ("synthesis", "head", "image_description")
     assert audit.sampling.temperature > 0.0
     assert "PASS" in audit.prompt and "FAIL" in audit.prompt
+    assert audit.reasoning_effort == "high"
+    assert audit.sampling.top_k == 20 and audit.sampling.max_tokens == 16384
+    assert audit.sampling.max_tokens_by_effort is None
+    assert audit.prompt_suffix == ""
     # DTO-D7: every DeepSeek role deliberates — all scaffolds end open.
-    for role_name in ("policies", "critique", "synthesis", "audit"):
+    for role_name in ("policies", "critique", "synthesis"):
         assert by_name[role_name].prompt_suffix == "<｜Assistant｜><think>"
     # Untrusted-data delimiters (MoA pattern) guard every cross-role payload.
     for role_name in ("critique", "synthesis"):
@@ -485,7 +490,7 @@ def test_tiered_l2_pins_only_the_dual_track_dag() -> None:
         {"label": choice.label, "profile": choice.profile} for choice in judge.choices
     ] == expected_judge["choices"] == [
         {"label": "QWEN", "profile": "qwen_direct"},
-        {"label": "QWEN_THINK", "profile": "qwen_think_low"},
+        {"label": "QWEN_THINK", "profile": "qwen_think_medium"},
         {"label": "DEEPSEEK", "profile": "deepseek_direct"},
         {"label": "DEEPSEEK_THINK", "profile": "deepseek_think"},
         {"label": "ENSEMBLE", "profile": "primary"},
@@ -504,7 +509,7 @@ def test_tiered_l2_pins_only_the_dual_track_dag() -> None:
     caps = config["orchestration"]["direct_route_max_tokens"]
     assert {name: role.sampling.max_tokens for name, role in finals.items()} == caps == {
         "qwen_direct": 131072,
-        "qwen_think_low": 131072,
+        "qwen_think_medium": 131072,
         "deepseek_direct": 393216,
         "deepseek_think": 393216,
     }
@@ -521,8 +526,8 @@ def test_tiered_l2_pins_only_the_dual_track_dag() -> None:
     assert qwen_answer.worker == "tier1" and qwen_answer.reasoning_effort is None
     assert (qwen_answer.sampling.temperature, qwen_answer.sampling.top_p) == (0.7, 0.8)
     assert qwen_answer.sampling.top_k == 20 and qwen_answer.sampling.presence_penalty == 1.5
-    qwen_think = finals["qwen_think_low"]
-    assert qwen_think.worker == "tier1" and qwen_think.reasoning_effort == "low"
+    qwen_think = finals["qwen_think_medium"]
+    assert qwen_think.worker == "tier1" and qwen_think.reasoning_effort == "high"
     assert (qwen_think.sampling.temperature, qwen_think.sampling.top_p) == (1.0, 0.95)
     assert qwen_think.sampling.top_k == 20 and qwen_think.sampling.presence_penalty is None
     deepseek_answer = finals["deepseek_direct"]
@@ -649,7 +654,7 @@ def test_tiered_readiness_posts_two_input_embedding_probe(
                             {"label": label, "profile": profile, "criteria": "x"}
                             for label, profile in (
                                 ("QWEN", "qwen_direct"),
-                                ("QWEN_THINK", "qwen_think_low"),
+                                ("QWEN_THINK", "qwen_think_medium"),
                                 ("DEEPSEEK", "deepseek_direct"),
                                 ("DEEPSEEK_THINK", "deepseek_think"),
                                 ("ENSEMBLE", "primary"),
@@ -1030,7 +1035,7 @@ def test_tiered_product_serving_judged_routes_accept_one_direct_final(
     _write_product_serving_result(tmp_path, [judge, direct])
     assert validate() == 0
     routes = json.loads((tmp_path / "routes.json").read_text())
-    assert routes["routes"] == {"qwen_think_low": {"requests": 1, "ttft_p50_ms": None}}
+    assert routes["routes"] == {"qwen_think_medium": {"requests": 1, "ttft_p50_ms": None}}
     _write_product_serving_result(tmp_path, [judge, *primary])
     assert validate() == 0
     # No judge stage, an ambiguous pair of finals, or a primary sample missing

@@ -171,6 +171,10 @@ class VLLMBackend:
             raise ValueError(
                 "vLLM backend does not support request field chat_template_kwargs"
             )
+        if request.assistant_prefill is not None:
+            raise ValueError(
+                "vLLM backend does not support request field assistant_prefill"
+            )
         if isinstance(prompt, MultimodalPrompt):
             raise ValueError(
                 "vLLM backend does not support multimodal prompts through "

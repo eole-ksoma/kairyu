@@ -12,6 +12,10 @@ milestone status, and blockers.
 
 @.claude/rules/progress-log.md
 
+## Framework and example ownership
+
+@.claude/rules/framework-boundary.md
+
 ## Test policy
 
 Apply these rules whenever a change adds, removes, moves, or reclassifies product

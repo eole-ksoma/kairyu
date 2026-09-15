@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "environment": "deepseek-v4-flash-vision-exp-dp2-8gpu",
+  "hardware": {
+    "gpu_count": 8,
+    "product": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "minimum_compute_capability": 12.0,
+    "minimum_vram_mib": 90000
+  },
+  "storage": {
+    "root": "/mnt/nvme/kairyu",
+    "minimum_free_gib": 250
+  },
+  "allocation": {
+    "model": "deepseek-v4-flash-vision-exp",
+    "gpu_ids": [0, 1, 2, 3, 4, 5, 6, 7],
+    "replicas": 2,
+    "replica_gpu_ids": [[0, 1, 2, 3], [4, 5, 6, 7]],
+    "tensor_parallel_size": 4,
+    "expert_parallel_size": 4
+  },
+  "pool": {
+    "queue_depth_threshold": 0,
+    "prefix_index": true,
+    "unhealthy_after": 1,
+    "placement_log": "/var/lib/kairyu/placement/deepseek-v4-flash-vision-exp.jsonl"
+  },
+  "model": {
+    "repo": "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
+    "revision": "6821d6ad3681a4b137b066b76094fa82ebd0a380",
+    "tree_sha256": "7bd9e830b8400fdc3a4ac407910f82121d2e975a583c830015d84219e671f0a6",
+    "slug": "deepseek-v4-flash-vision-exp",
+    "served_name": "deepseek-v4-flash-vision-exp",
+    "max_context_tokens": 1048576,
+    "quantization": "mixed-fp4-fp8",
+    "modalities": ["text", "image"]
+  },
+  "vllm": {
+    "image": "local/vllm-openai:sm120-27a94d1-flashinfer-60b4915",
+    "image_id": "sha256:b47e22101829b471e8d3b0702a50ab884f58390cc2dfd50cb83aaf43ae30e9d4",
+    "distribution": "overlay",
+    "dockerfile": "vllm-sm120.Dockerfile",
+    "base_image": "vllm/vllm-openai:nightly-27a94d1ce4e3fc100c4732439ccec10f8246a804@sha256:7d5128a92db05e6d70661a18f10e40c17cd2d8fcaad9226e170a0d69f822b795",
+    "source_repository": "https://github.com/vllm-project/vllm.git",
+    "source_revision": "27a94d1ce4e3fc100c4732439ccec10f8246a804",
+    "flashinfer_repository": "https://github.com/flashinfer-ai/flashinfer.git",
+    "flashinfer_revision": "60b49158ab4fb81718aef486c2d3c89aec4c1901",
+    "tensor_parallel_size": 4,
+    "expert_parallel_size": 4,
+    "moe_backend": "marlin",
+    "dspark_speculative_tokens": 3,
+    "max_num_batched_tokens": 16384,
+    "max_num_seqs": 32,
+    "kv_cache_dtype": "fp8",
+    "block_size": 256
+  },
+  "webui": {
+    "image": "ghcr.io/open-webui/open-webui:v0.11.0-slim@sha256:3698bd4e9628b7ae3768808721098616e669b4a05a6bceb2f5da2d84a3282a01",
+    "port": 3005,
+    "reasoning_effort_levels": ["default", "low", "high", "max"]
+  },
+  "api_port": 8005,
+  "verification": {
+    "serving": {
+      "prompt_tokens_approx": 8192,
+      "output_tokens": 256,
+      "concurrency": [1, 8, 16, 32, 64],
+      "requests_per_concurrency": 64,
+      "placement_gate": {
+        "min_concurrency": 8,
+        "max_share_of_mean": 1.25
+      }
+    },
+    "vision": {
+      "requests_per_replica": 2,
+      "max_tokens": 256
+    }
+  }
+}

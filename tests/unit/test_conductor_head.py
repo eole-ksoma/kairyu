@@ -1121,7 +1121,13 @@ class ThinkExhaustedBackend:
                     text="",
                     token_ids=(),
                     finish_reason="length",
+                    # Delta-native shape of a reasoning-only OpenAI stream:
+                    # no public text was ever offset.
+                    text_delta="",
+                    text_offset=0,
                     reasoning_content=reasoning or None,
+                    reasoning_delta=reasoning,
+                    reasoning_offset=0,
                 ),
             ),
             usage=GenerationUsage(prompt_tokens=3, completion_tokens=4),
@@ -1295,6 +1301,56 @@ async def test_public_output_floor_second_empty_still_marks_run_unusable():
     assert any(
         e.kind == "failed" and e.detail == "empty_output" for e in result.trace
     )
+
+
+def _chat_floor_roles() -> tuple[RoleSpec, ...]:
+    return (
+        RoleSpec(
+            name="continuation",
+            worker="cw",
+            role_type="publisher",
+            prompt="[cont] {query}",
+            reasoning_close_tag="</THINK>",
+            reasoning_continuation="chat",
+            reasoning_open_tag="<THINK>",
+        ),
+    )
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_public_output_floor_chat_continuation_prefills_closed_thinking_turn(
+    stream,
+):
+    """DTO-D15: a chat-template worker whose upstream template opened the
+    reasoning span continues it as a verbatim assistant prefill, not by
+    appending to the user prompt."""
+
+    backend = ThinkExhaustedBackend(["deliberating...", "The answer is 5."])
+    conductor = Conductor(
+        _chat_floor_roles(),
+        {"cw": backend},
+        final_sampling_params=SamplingParams(max_tokens=512),
+        public_output_floor=64,
+    )
+    if stream:
+        events = await _collect(conductor.stream("task"))
+        result = events[-1].result
+        assert result is not None
+        assert "".join(e.text for e in events if e.kind == "delta") == "The answer is 5."
+    else:
+        result = await conductor.run("task")
+
+    assert result.final_text == "The answer is 5."
+    assert result.final_unit_ok
+    first, retry = backend.requests_seen
+    assert first.prompt == retry.prompt == "[cont] task"
+    assert first.assistant_prefill is None
+    assert retry.assistant_prefill == "<THINK>\ndeliberating...\n</THINK>\n\n"
+    assert first.sampling_params.max_tokens == 448
+    assert retry.sampling_params.max_tokens == 64
+    retry_event = next(e for e in result.trace if e.kind == "retry:empty_output")
+    assert retry_event.metadata.get("continuation") == "think_close"
+    assert retry_event.metadata.get("mode") == "chat"
 
 
 def test_public_output_floor_requires_final_reasoning_close_tag():

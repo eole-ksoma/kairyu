@@ -23,7 +23,7 @@ def _load(path: Path, name: str):
     return module
 
 
-def test_examples_surface_contains_the_three_hardware_examples() -> None:
+def test_examples_surface_contains_the_seven_hardware_examples() -> None:
     environments = sorted(
         path.name
         for path in (ROOT / "examples").iterdir()
@@ -31,8 +31,13 @@ def test_examples_surface_contains_the_three_hardware_examples() -> None:
     )
     assert environments == [
         "deepseek-v4-flash-0731-8gpu",
+        "deepseek-v4-flash-0731-dp2-8gpu",
+        "deepseek-v4-flash-vision-exp-dp2-8gpu",
+        "deepseek-v4.1-flash-8gpu",
         "qwen3.8-27b-1gpu",
+        "qwen3.8-27b-dp8-8gpu",
         "qwen3.8-deepseek-v4-8gpu",
+        "qwen3.8-flash-next-dp2-8gpu",
     ]
     qwen = json.loads((QWEN_EXAMPLE / "example.json").read_text())
     deepseek = json.loads((EXAMPLE / "example.json").read_text())

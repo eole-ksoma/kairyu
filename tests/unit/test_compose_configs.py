@@ -285,6 +285,9 @@ def test_webui_compose_pins_full_authenticated_browser_topology():
     }
     assert environment["WEBUI_AUTH"] == "true"
     assert environment["ENABLE_SIGNUP"] == "true"
+    # The admin update-available toast intercepted model-selector clicks and
+    # made the browser gate flaky; the check must stay disabled in CI.
+    assert environment["ENABLE_VERSION_UPDATE_CHECK"] == "false"
     assert "WEBUI_SECRET_KEY" not in environment
     assert (
         environment["WEBUI_SECRET_KEY_FILE"]

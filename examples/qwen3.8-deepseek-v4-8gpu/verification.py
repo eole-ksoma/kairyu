@@ -865,6 +865,7 @@ def _served_config_sha256() -> str:
         "router.json",
         "deepseek-thinking.jinja",
         "deepseek-role-effort.jinja",
+        "qwen3.8-chat.jinja",
         "sandbox/Dockerfile",
         "sandbox/runner.py",
     ):

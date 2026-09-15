@@ -1,0 +1,185 @@
+name: kairyu-qwen3.8-flash-next-dp2-8gpu
+
+# Two identical Qwen3.8-Flash-Next-FP8 TP4 vLLM replicas (four GPUs each)
+# behind one Kairyu L3 endpoint. Kairyu L2 is only the replica pool:
+# warm-prefix reuse when that replica is idle, otherwise least-outstanding
+# placement, so concurrent traffic alternates evenly between the two halves
+# (kairyu.yaml).
+x-qwen: &qwen
+  image: ${QWEN_VLLM_IMAGE:-local/vllm-openai:sm120-27a94d1-flashinfer-60b4915}
+  ipc: host
+  environment:
+    HF_HOME: /models/.cache
+    HF_HUB_OFFLINE: "1"
+    HF_HUB_DISABLE_TELEMETRY: "1"
+    VLLM_NO_USAGE_STATS: "1"
+    PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    SAFETENSORS_FAST_GPU: "1"
+    XDG_CACHE_HOME: /root/.cache
+    TORCHINDUCTOR_CACHE_DIR: /root/.cache/torchinductor
+    TRITON_CACHE_DIR: /root/.cache/triton
+    TILELANG_CACHE_DIR: /root/.cache/tilelang
+    TILELANG_TMP_DIR: /root/.cache/tilelang/tmp
+  # The official vLLM recipe's verified rtx_pro_6000_4x layout for the FP8
+  # checkpoint (TP4, 16 sequences, 8K batch tokens, prefix caching,
+  # FlashInfer autotune off, qwen3_xml/qwen3 parsers) at the
+  # checkpoint's native 256K context, minus the recipe's MTP k=3: on this
+  # vLLM revision prefix caching + MTP silently corrupts ~5% of batched
+  # answers on hybrid GDN models (upstream vllm-project/vllm#53912, reproduced
+  # here 13/274 at 2-12 concurrent; 0/1508 with either one off). Prefix reuse
+  # is kept because Kairyu's prefix-aware placement and multi-turn/agent
+  # traffic depend on it. --kv-cache-memory pins the KV budget to the value
+  # vLLM derives for the recipe's 0.95 utilization on a warm start (43.16
+  # GiB, 3.45M tokens per replica) and supersedes the utilization-based
+  # sizing: without it a cold torch.compile cache inflates the start-up
+  # memory profile by ~35 GiB and the replica boots with 741K tokens. TP8 is
+  # incompatible with the 128-wide FP8 blocks and pipeline parallel is
+  # unsupported, so 2 x TP4 is the only eight-GPU split.
+  command:
+    - /models/qwen3.8-flash-next
+    - --served-model-name
+    - qwen3.8-flash-next
+    - --max-model-len
+    - "262144"
+    - --tensor-parallel-size
+    - "4"
+    - --reasoning-parser
+    - qwen3
+    # vLLM renders chat with the example-local template (the official one
+    # plus the L3 effort alias, see qwen3.8-flash-next-chat.jinja) and parses
+    # Qwen's XML tool calls into OpenAI tool_calls. Thinking defaults off to
+    # keep the direct-chat contract; an explicit reasoning_effort re-enables
+    # it. Video is closed because the Kairyu image policy validates images
+    # only.
+    - --enable-auto-tool-choice
+    - --tool-call-parser
+    - qwen3_xml
+    - --chat-template
+    - /etc/kairyu/qwen3.8-flash-next-chat.jinja
+    - --default-chat-template-kwargs
+    - '{"enable_thinking": false}'
+    - --limit-mm-per-prompt.video
+    - "0"
+    - --enable-prefix-caching
+    - --no-enable-flashinfer-autotune
+    - --gpu-memory-utilization
+    - "0.95"
+    - --kv-cache-memory
+    - "46346979738"
+    - --max-num-seqs
+    - "16"
+    - --max-num-batched-tokens
+    - "8192"
+    - --disable-uvicorn-access-log
+  healthcheck: &health
+    test: [CMD, python3, -c, 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/health", timeout=2)']
+    interval: 5s
+    timeout: 3s
+    retries: 1440
+    start_period: 30s
+  restart: unless-stopped
+
+services:
+  qwen-0:
+    <<: *qwen
+    cpuset: ${QWEN_0_CPUSET}
+    volumes:
+      - type: bind
+        source: ${QWEN_MODEL_STORAGE_PATH}
+        target: /models
+        read_only: true
+      - type: bind
+        source: ${QWEN_CACHE_0_PATH}
+        target: /root/.cache
+      - ./qwen3.8-flash-next-chat.jinja:/etc/kairyu/qwen3.8-flash-next-chat.jinja:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0", "1", "2", "3"]
+              capabilities: [gpu]
+
+  qwen-1:
+    <<: *qwen
+    cpuset: ${QWEN_1_CPUSET}
+    volumes:
+      - type: bind
+        source: ${QWEN_MODEL_STORAGE_PATH}
+        target: /models
+        read_only: true
+      - type: bind
+        source: ${QWEN_CACHE_1_PATH}
+        target: /root/.cache
+      - ./qwen3.8-flash-next-chat.jinja:/etc/kairyu/qwen3.8-flash-next-chat.jinja:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["4", "5", "6", "7"]
+              capabilities: [gpu]
+
+  kairyu:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      args:
+        # Image validation (image_input_policy in kairyu.yaml) needs the
+        # `vision` extra.
+        KAIRYU_VISION: "1"
+    image: ${KAIRYU_IMAGE:-local/kairyu:qwen38-flash-next-dp2-example}
+    command: [/etc/kairyu/kairyu.yaml]
+    environment:
+      KAIRYU_CONTAINER_IMAGE_DIGEST: ${KAIRYU_IMAGE_ID:-local-build}
+    volumes:
+      # Per-placement JSONL evidence (replica id + reason per request) that
+      # verify.sh reads to prove the even spread; session ids are hashed.
+      - type: bind
+        source: ${PLACEMENT_LOG_PATH}
+        target: /var/lib/kairyu/placement
+      - ./kairyu.yaml:/etc/kairyu/kairyu.yaml:ro
+    depends_on:
+      qwen-0: {condition: service_healthy}
+      qwen-1: {condition: service_healthy}
+    ports:
+      - 127.0.0.1:${API_PORT:-8007}:8000
+    healthcheck:
+      test: [CMD, python3, -c, 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/readyz", timeout=2)']
+      interval: 5s
+      timeout: 3s
+      retries: 120
+    restart: unless-stopped
+
+  chat-ui:
+    image: ${OPEN_WEBUI_IMAGE:-ghcr.io/open-webui/open-webui:v0.11.0-slim@sha256:3698bd4e9628b7ae3768808721098616e669b4a05a6bceb2f5da2d84a3282a01}
+    environment:
+      OPENAI_API_BASE_URL: http://kairyu:8000/v1
+      OPENAI_API_KEY: sk-local-kairyu
+      DEFAULT_MODELS: qwen3.8-flash-next
+      # Qwen's published non-thinking (instruct) sampling values; the
+      # Reasoning Effort filter drops them when an effort is selected so vLLM
+      # applies the checkpoint's thinking generation_config instead.
+      DEFAULT_MODEL_PARAMS: '{"max_tokens":32768,"temperature":0.7,"top_p":0.8,"presence_penalty":1.5}'
+      # Auth-less single-admin UI (as in the tiered example): `run.sh up`
+      # signs in through the auth-disabled session to install the Reasoning
+      # Effort dropdown (webui-reasoning-effort-filter.py).
+      ENABLE_PERSISTENT_CONFIG: "false"
+      RESET_CONFIG_ON_START: "true"
+      ENABLE_SIGNUP: "false"
+      ENABLE_LOGIN_FORM: "false"
+      WEBUI_AUTH: "false"
+      WEBUI_URL: ${WEBUI_URL:-http://localhost:3007}
+      WEBUI_ADMIN_NAME: ${WEBUI_ADMIN_NAME:-Kairyu Admin}
+      ENABLE_OLLAMA_API: "false"
+      ENABLE_EVALUATION_ARENA_MODELS: "false"
+      RAG_EMBEDDING_ENGINE: ""
+    volumes:
+      - type: bind
+        source: ${WEBUI_STORAGE_PATH}
+        target: /app/backend/data
+    depends_on:
+      kairyu: {condition: service_healthy}
+    ports:
+      - ${CHAT_UI_BIND_ADDRESS:-127.0.0.1}:${CHAT_UI_PORT:-3007}:8080
+    restart: unless-stopped

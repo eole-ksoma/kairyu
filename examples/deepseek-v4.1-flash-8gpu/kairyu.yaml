@@ -1,0 +1,48 @@
+server:
+  host: 0.0.0.0
+  port: 8000
+  api_keys_env: null
+  max_concurrency: 64
+  admission_wait_timeout_s: 600
+  max_chat_body_bytes: 100663296
+pools:
+  deepseek-v4.1-flash:
+    replicas:
+    - backend: openai
+      health_url: http://deepseek-0:8000/health
+      options:
+        base_url: http://deepseek-0:8000/v1
+        model: deepseek-v4.1-flash
+        api_key_env: null
+        timeout_s: 1800
+        upstream: vllm
+        capabilities:
+          allow_prompt_kinds:
+          - multimodal
+        image_input_policy:
+          max_images: 8
+          max_image_bytes: 8388608
+          max_total_image_bytes: 67108864
+          max_image_pixels: 16777216
+          max_total_image_pixels: 134217728
+          max_image_dimension: 8192
+          max_image_aspect_ratio: 200
+          max_processed_prompt_tokens: 1048576
+        model_revision: dba1be0a40aa45a94ad051997016db3960a90277
+        max_model_len: 1048576
+        quantization_format: mixed-fp4-fp8
+        cache_descriptor:
+          family: deepseek-v41-swa-csa-engram
+          block_size: 64
+        tensor_parallel_size: 8
+        expert_parallel_size: 8
+        attention_data_parallel_size: 1
+        dspark_enabled: true
+        container_image_digest: sha256:027bf47b2bd6f0d0abe54b296e7e9e3d31ee103bb6e46fa0a9807117681c2359
+    unhealthy_after: 1
+    queue_depth_threshold: 0
+    prefix_index: true
+    probe_interval_s: 2.0
+    placement_log_path: /var/lib/kairyu/placement/deepseek-v4.1-flash.jsonl
+legacy_chat_models:
+- deepseek-v4.1-flash

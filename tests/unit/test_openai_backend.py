@@ -736,6 +736,54 @@ async def test_vllm_templated_prompt_uses_completions_without_second_chat_templa
     await backend.shutdown()
 
 
+@pytest.mark.parametrize("key", ["reasoning_content", "reasoning"])
+@pytest.mark.parametrize("stream", [False, True])
+async def test_chat_reasoning_span_is_read_under_either_upstream_key(key, stream):
+    """vLLM emits the private span as ``reasoning_content`` or, in the
+    pinned Qwen image, ``reasoning``; both must reach the completion, or the
+    floor continuation and the reasoning_closed reclaim see nothing."""
+
+    if stream:
+        transport = _sse_chunks_transport(
+            {"choices": [{"index": 0, "delta": {"role": "assistant", key: "plan"}}]},
+            {"choices": [{"index": 0, "delta": {"content": "4"}, "finish_reason": "stop"}]},
+        )
+    else:
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "4", key: "plan"},
+                            "finish_reason": "stop",
+                        }
+                    ]
+                },
+            )
+
+        transport = httpx.MockTransport(handler)
+    backend = OpenAICompatBackend(
+        base_url="http://vllm:8000/v1",
+        model="m",
+        api_key_env=None,
+        transport=transport,
+        upstream="vllm",
+    )
+
+    if stream:
+        results = [result async for result in backend.stream(_request())]
+        output = results[-1].completions[0]
+    else:
+        output = (await backend.generate(_request())).completions[0]
+
+    assert output.text == "4"
+    assert output.reasoning_content == "plan"
+    await backend.shutdown()
+
+
 async def test_vllm_templated_completion_separates_configured_private_reasoning():
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -878,6 +926,34 @@ async def test_generate_forwards_representable_sampling_payload():
     assert captured["body"]["logprobs"] is True
     assert captured["body"]["top_logprobs"] == 3
     assert captured["body"]["response_format"] == {"type": "json_object"}
+    await backend.shutdown()
+
+
+async def test_generate_continues_assistant_prefill_on_vllm_chat():
+    """DTO-D15: an assistant prefill rides as the final chat message that
+    vLLM continues instead of opening a new generation prompt."""
+
+    import dataclasses
+
+    captured: dict = {}
+    backend = OpenAICompatBackend(
+        base_url="https://api.example.com/v1",
+        model="m",
+        api_key_env=None,
+        transport=_ok_transport(captured),
+        upstream="vllm",
+    )
+    prefill = "<think>\nplan\n</think>\n\n"
+
+    await backend.generate(dataclasses.replace(_request(), assistant_prefill=prefill))
+
+    body = captured["body"]
+    assert body["messages"] == [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": prefill},
+    ]
+    assert body["continue_final_message"] is True
+    assert body["add_generation_prompt"] is False
     await backend.shutdown()
 
 

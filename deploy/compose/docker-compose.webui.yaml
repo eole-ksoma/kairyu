@@ -39,6 +39,10 @@ services:
     environment:
       OPENAI_API_BASE_URL: http://kairyu:8000/v1
       OPENAI_API_KEY: sk-local
+      # The admin-visible "new version available" toast lands bottom-right at
+      # an unpredictable moment after login and intercepts pointer events on
+      # the model selector (flaky webui-e2e "AUTO UI chat" click timeouts).
+      ENABLE_VERSION_UPDATE_CHECK: "false"
       RAG_EMBEDDING_ENGINE: openai
       RAG_EMBEDDING_MODEL: embed-small
       RAG_OPENAI_API_BASE_URL: http://kairyu:8000/v1

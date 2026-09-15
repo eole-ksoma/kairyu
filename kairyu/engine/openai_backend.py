@@ -597,6 +597,24 @@ def _validated_request_payload(
     return payload
 
 
+def _upstream_reasoning(message: object) -> str | None:
+    """The private-reasoning span of an upstream chat message or delta.
+
+    vLLM emits it as ``reasoning_content`` (DeepSeek-style) or, since the
+    OpenAI-compatible rename shipped in the pinned Qwen image, ``reasoning``.
+    Dropping the alias silently loses the span the public-output floor
+    continues and the ``reasoning_closed`` reclaim publishes (DTO-D15).
+    """
+
+    if not isinstance(message, Mapping):
+        return None
+    for key in ("reasoning_content", "reasoning"):
+        value = message.get(key)
+        if isinstance(value, str):
+            return value
+    return None
+
+
 class OpenAICompatBackend:
     def __init__(
         self,
@@ -834,6 +852,15 @@ class OpenAICompatBackend:
                     "does not support chat_template_kwargs: "
                     + ", ".join(sorted(unsupported)),
                 )
+        if request.assistant_prefill is not None and (
+            self._capabilities.upstream != "vllm"
+            or isinstance(request.prompt, TemplatedPrompt)
+        ):
+            raise _client_error(
+                self._capabilities.upstream,
+                "does not support assistant_prefill (a vLLM chat-template "
+                "continuation of the final assistant message)",
+            )
         if isinstance(request.prompt, MultimodalPrompt):
             if type(request.prompt.base) is not str and not isinstance(
                 request.prompt.base,
@@ -1428,11 +1455,18 @@ class OpenAICompatBackend:
                     **completion_args,
                 }
             messages = [{"role": "user", "content": text}]
+        if request.assistant_prefill is not None:
+            # The upstream template renders this final assistant turn and
+            # vLLM continues it instead of opening a new generation prompt.
+            messages.append({"role": "assistant", "content": request.assistant_prefill})
         payload: dict = {
             "model": self._model,
             "messages": messages,
             **validated,
         }
+        if request.assistant_prefill is not None:
+            payload["continue_final_message"] = True
+            payload["add_generation_prompt"] = False
         # A passthrough vLLM replica uses an identity chat template. Kairyu has
         # already rendered tools and reasoning controls into the model-owned
         # template, so duplicating the structured tool fields would create two
@@ -1568,12 +1602,7 @@ class OpenAICompatBackend:
                     self._completion_reasoning_end_tag,
                 )
             elif not use_completions:
-                reasoning_content = (
-                    choice["message"].get("reasoning_content")
-                    if isinstance(choice.get("message"), Mapping)
-                    and isinstance(choice["message"].get("reasoning_content"), str)
-                    else None
-                )
+                reasoning_content = _upstream_reasoning(choice.get("message"))
             completions_list.append(
                 CompletionOutput(
                     index=choice.get("index", i),
@@ -1773,7 +1802,7 @@ class OpenAICompatBackend:
                     reasoning = (
                         None
                         if use_completions
-                        else delta.get("reasoning_content")
+                        else _upstream_reasoning(delta)
                     )
                     if not use_completions and isinstance(delta, Mapping):
                         for position, raw_call in enumerate(delta.get("tool_calls") or ()):

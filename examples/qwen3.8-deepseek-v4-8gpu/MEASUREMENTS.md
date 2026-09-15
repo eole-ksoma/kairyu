@@ -22,8 +22,55 @@
 > the route distribution of the harness datasets, per-route TTFT/E2E, and
 > the re-defined TTFT gate (gated routes only; thinking direct routes
 > reported) are all **not yet measured** and land with the next GPU window.
+>
+> **Scope note (2026-08-25):** DTO-D14 moves the Qwen thinking roles to the
+> medium tier (spec `high`, example-local graded template, doubled budgets)
+> and the audit verifier to Qwen tier1 (fixed medium, one 16384-token cap).
+> The DTO-D14 served config is GPU-verified — see the 2026-08-25 section
+> below; every older section predates it and does not transfer.
 
-## Dual-track DAG serving matrices (current deployment)
+## Judged five-route serving gates (current deployment, 2026-08-25)
+
+Run IDs: `20260825T161729Z` (`./verify.sh serving-auto-max-coding`) and
+`20260825T173343Z` (`./verify.sh serving-auto-max`), both green (exit 0) on
+served-config digest
+`69702ab5af0ab3c00302855db18b33e89ec91823a2cc770161dfb44f1519da85`
+(DTO-D8..D14: judged five-route policy, Qwen medium tier, audit on Qwen).
+Artifacts under the NVMe `verification-results/<run-id>/` directories.
+
+Coding matrix (32 requests per row, `max_tokens 65536`, T=0, seed 0): the
+judge routed **every** coding request to `qwen_think_medium`, so all four
+TTFT rows record `not_applicable` (thinking direct routes are reported, not
+gated); paired DeepSeek-direct denominator rows are in the artifacts.
+
+| c | route (all 32) | route TTFT p50 |
+|---|---|---|
+| 1 | qwen_think_medium | 31,657 ms |
+| 8 | qwen_think_medium | 22,528 ms |
+| 16 | qwen_think_medium | 33,979 ms |
+| 32 | qwen_think_medium | 40,765 ms |
+
+Generic matrix (8K-token prompts, 32 requests per row): every sample passed
+the route-aware stage/trace validation (judge classification + exactly one
+final unit; primary samples additionally all internal stages and the audit
+verdict).
+
+| c | routes | TTFT p50 |
+|---|---|---|
+| 1 | qwen_direct 32 | 2,263 ms |
+| 8 | qwen_direct 32 | 6,355 ms |
+| 16 | qwen_direct 29 / primary 3 | 17,428 / 19,739 ms |
+| 32 | qwen_direct 32 | 34,823 ms |
+
+The verification surfaced and fixed three defects before going green:
+trace v2 rejected list detail values (the judge's offered labels) and
+crashed streamed SSE bodies; the trace envelope started at the judge's
+`started_at` while its `queued_at` was one clock read earlier; and the
+Qwen medium preamble initially dropped the DeepSeek preambles'
+think-close guard sentence, so long L2-wrapped contexts could end inside
+the think span and fail the route with EmptyFinalOutput.
+
+## Dual-track DAG serving matrices (pre-DTO-D8 9-role DAG)
 
 Run ID: `20260818T025710Z` (`./verify.sh serving-auto-max-coding` then
 `./verify.sh serving-auto-max`, same run directory); artifacts under the NVMe

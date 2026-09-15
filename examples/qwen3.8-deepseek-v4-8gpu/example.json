@@ -115,7 +115,7 @@
     "product_exposes_intermediate_outputs": true,
     "profiles": {
       "qwen_direct": ["qwen_answer"],
-      "qwen_think_low": ["qwen_think_answer"],
+      "qwen_think_medium": ["qwen_think_answer"],
       "deepseek_direct": ["deepseek_answer"],
       "deepseek_think": ["deepseek_think_answer"]
     },
@@ -124,7 +124,7 @@
       "fallback": "primary",
       "choices": [
         {"label": "QWEN", "profile": "qwen_direct"},
-        {"label": "QWEN_THINK", "profile": "qwen_think_low"},
+        {"label": "QWEN_THINK", "profile": "qwen_think_medium"},
         {"label": "DEEPSEEK", "profile": "deepseek_direct"},
         {"label": "DEEPSEEK_THINK", "profile": "deepseek_think"},
         {"label": "ENSEMBLE", "profile": "primary"}
@@ -133,20 +133,20 @@
     "profile_final_roles": {
       "primary": "synthesis",
       "qwen_direct": "qwen_answer",
-      "qwen_think_low": "qwen_think_answer",
+      "qwen_think_medium": "qwen_think_answer",
       "deepseek_direct": "deepseek_answer",
       "deepseek_think": "deepseek_think_answer"
     },
     "ttft_gated_profiles": ["primary", "qwen_direct", "deepseek_direct"],
     "direct_route_max_tokens": {
       "qwen_direct": 131072,
-      "qwen_think_low": 131072,
+      "qwen_think_medium": 131072,
       "deepseek_direct": 393216,
       "deepseek_think": 393216
     },
     "direct_route_sampling": {
       "qwen_direct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5, "max_tokens": 131072},
-      "qwen_think_low": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "max_tokens": 131072},
+      "qwen_think_medium": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "max_tokens": 131072},
       "deepseek_direct": {"temperature": 1.0, "top_p": 0.95, "max_tokens": 393216},
       "deepseek_think": {"temperature": 1.0, "top_p": 0.95, "max_tokens": 393216}
     }

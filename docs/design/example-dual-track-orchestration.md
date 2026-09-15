@@ -1,16 +1,15 @@
 # Tiered Example Dual-Track Policy-Ensemble Orchestration
 
-Status: **Accepted; implemented and GPU-verified** (2026-08-18; run
-`20260818T025710Z` — TTFT gate PASS at c1/8/16/32, binding c32 row 0.67×).
-The DTO-D8 sampling/budget amendments (2026-08-20) change the served config
-digest and are **not yet GPU re-verified**; re-verification is deferred to
-the next GPU window. DTO-D10..D12 (2026-08-20: peer synthesis + audit loop
-on the final unit, the image-only `image_description` stage, halved DeepSeek
-budgets) are accepted and implemented, change the served-config digest
-again, and are likewise **not yet GPU-verified**.
-DTO-D13 (2026-08-22: a Qwen non-thinking route judge selecting among four
-single-call direct routes and the ensemble) is accepted and implemented,
-changes the served-config digest again, and is **not yet GPU-verified**.
+Status: **Accepted; implemented and GPU-verified** (2026-08-25; runs
+`20260825T161729Z` coding + `20260825T173343Z` generic — both `verify.sh`
+serving gates green on the DTO-D8..D14 served config, digest
+`69702ab5af0ab3c0…`). The judge routes every coding-gate request to the
+ungated `qwen_think_medium` route (all coding TTFT rows `not_applicable`);
+the generic matrix passes its route-aware stage validation, including
+primary samples with the full internal DAG and the audit verdict. Manual
+Chat UI and Terminal-Bench passes remain on the next-window list. The
+previous green run (2026-08-18, `20260818T025710Z`) measured the pre-DTO-D8
+nine-role DAG.
 Applies to: `examples/qwen3.8-deepseek-v4-8gpu/` and the L2 mechanisms in
 `kairyu/orchestration/` + `kairyu/dsl/` that it consumes.
 Supersedes the ECO-D2/D3/D5/D6 role graphs, profiles, and profile judge in
@@ -319,7 +318,7 @@ way — a 502 after paying full dual-track cost (reproduced at `max_tokens:
 
 ### DTO-D10 — Peer synthesis + inline audit loop on the final unit (owner amendment, 2026-08-20)
 
-Status: accepted; implemented; not GPU-verified.
+Status: accepted; implemented; serving gates GPU-verified (2026-08-25, runs 20260825T161729Z/20260825T173343Z).
 
 - `compose` → `synthesis`: the final unit no longer anchors on critique's
   refined answer. It examines five UNTRUSTED CANDIDATE answers as peers —
@@ -332,7 +331,8 @@ Status: accepted; implemented; not GPU-verified.
 - New `audit` role: `role_type: verifier`, `verifies: synthesis`, DeepSeek
   thinking (tier2, `reasoning_effort: inherit`), T=1.0/top_p 0.95 — never
   greedy (issue #509) — with the same effort-graded budget as
-  policies/critique, `depends_on: [synthesis, head, image_description]` so
+  policies/critique — amended 2026-08-25 (DTO-D14): the audit now runs on
+  Qwen tier1 at fixed medium effort (spec `high`) with one 16384-token cap — `depends_on: [synthesis, head, image_description]` so
   it judges the committed opening plus the candidate remainder as one public
   answer. Verdict protocol is the Conductor's: first line `PASS` or `FAIL`;
   anything else is inconclusive and triggers one bounded re-verification; a
@@ -361,11 +361,12 @@ Status: accepted; implemented; not GPU-verified.
 
 ### DTO-D11 — Image-only `image_description` stage (owner amendment, 2026-08-20)
 
-Status: accepted; implemented; not GPU-verified.
+Status: accepted; implemented; serving gates GPU-verified (2026-08-25, runs 20260825T161729Z/20260825T173343Z).
 
 - New Qwen role `image_description` (tier1 — the vision-capable pool,
   `requires: image`, `reasoning_effort: low`, Qwen thinking-mode sampling,
-  2048 tokens, REQUEST-first framing): describes every attached image in
+  2048 tokens, REQUEST-first framing — amended 2026-08-25 (DTO-D14): fixed
+  medium effort, spec `high`, 4096 tokens): describes every attached image in
   precise objective text (verbatim on-image text, diagrams, UI, layout,
   anything the request refers to) and never answers the request.
 - `policies`, `critique`, `synthesis`, and `audit` (all text-only DeepSeek
@@ -387,9 +388,10 @@ Status: accepted; implemented; not GPU-verified.
 
 ### DTO-D12 — DeepSeek budgets halved for the Terminal-Bench turn envelope (owner amendment, 2026-08-20; supersedes part of DTO-D8)
 
-Status: accepted; implemented; not GPU-verified.
+Status: accepted; implemented; serving gates GPU-verified (2026-08-25, runs 20260825T161729Z/20260825T173343Z).
 
-- `max_tokens_by_effort` on `policies`/`critique`/`audit`: `{16384, 65536,
+- `max_tokens_by_effort` on `policies`/`critique`/`audit` (audit until
+  DTO-D14 moved it to Qwen with a single cap): `{16384, 65536,
   131072}` → `{8192, 32768, 65536}` (fallback `max_tokens` 65536 → 32768);
   `internal_max_tokens` 131072 → 65536 (the ceiling still admits the max
   tier); Chat UI `DEFAULT_MODEL_PARAMS.max_tokens` and the harness
@@ -408,7 +410,7 @@ Status: accepted; implemented; not GPU-verified.
 
 ### DTO-D13 — Qwen-judged five-route selection (owner amendment, 2026-08-22)
 
-Status: accepted; implemented; not GPU-verified.
+Status: accepted; implemented; serving gates GPU-verified (2026-08-25, runs 20260825T161729Z/20260825T173343Z).
 
 Owner decision (2026-08-22): every request first pays one bounded Qwen
 non-thinking judge call that reads the request and picks the route expected
@@ -459,7 +461,8 @@ are judged too; judge failure falls back to the ensemble.
   scaffold byte-identical); `profile_judge` on `tier1` (`QWEN`/`QWEN_THINK`/
   `DEEPSEEK`/`DEEPSEEK_THINK`/`ENSEMBLE`, fallback `primary`); profiles
   `qwen_direct` (`qwen_answer`: no effort, T=0.7/top_p 0.8/top_k 20/
-  presence 1.5, 131072), `qwen_think_low` (`qwen_think_answer`: `low`,
+  presence 1.5, 131072), `qwen_think_low` (`qwen_think_answer`: `low`;
+  amended 2026-08-25 (DTO-D14): renamed `qwen_think_medium`, spec `high`,
   T=1.0/top_p 0.95/top_k 20, 131072), `deepseek_direct` (`deepseek_answer`
   on `tier2-direct`, `reasoning_closed`, `<｜Assistant｜></think>`, T=1.0/
   top_p 0.95, 393216), `deepseek_think` (`deepseek_think_answer` on `tier2`,
@@ -502,9 +505,107 @@ are judged too; judge failure falls back to the ensemble.
   render the role-tagged conversation inside one user turn like every other
   role; from the Chat UI the 65536 caller cap binds before the official
   route caps; vLLM's behavior for `max_tokens` exceeding the remaining
-  context with the 131072/393216 caps must be confirmed (clamp follow-up if
-  it 400s). Both `verify.sh` gates, a manual per-route Chat UI pass, and the
-  judge-latency measurement are due in the next GPU window.
+  context with the 131072/393216 caps must be confirmed (add a clamp if vLLM
+  returns HTTP 400). Both `verify.sh` gates are green on the current digest,
+  and their `routes.json` artifacts record judge latency. A manual image chat,
+  a manual per-route Chat UI pass, and a Terminal-Bench-style agent run remain
+  outstanding.
+
+### DTO-D14 — Qwen medium tier and audit on Qwen (owner amendment, 2026-08-25; amends the Qwen side of DTO-D6/D8 and the audit worker of DTO-D10)
+
+Status: accepted; implemented; serving gates GPU-verified (2026-08-25, runs 20260825T161729Z/20260825T173343Z).
+
+- Owner decision (2026-08-25): the Qwen thinking roles move from the fixed
+  `low` tier to a medium tier, and the audit verifier moves from DeepSeek to
+  Qwen. Non-thinking Qwen surfaces (head, `qwen_direct`, the route judge)
+  and every DeepSeek generation role are unchanged.
+- The L2 ladder stays `low|high|max` (no core change): medium is expressed
+  as spec level `high`, mirroring the L3 alias normalization (medium→high).
+  `draft`, `image_description`, `answer_1..4`, and the renamed
+  `qwen_think_medium` route (ex-`qwen_think_low`) declare
+  `reasoning_effort: high`.
+- The example gets a local Qwen chat template (`qwen3.8-chat.jinja`; the
+  compose mounts leave `../qwen3.8-27b-1gpu/chat_template.jinja`, which is
+  untouched): `low` renders byte-identically to the shared template, `high`
+  prepends a medium reasoning instruction to the system prompt, and `max`
+  clamps to `high`.
+- Sampling stays effort-invariant (DTO-D8). Qwen thinking budgets double for
+  the medium tier: draft 1024→2048, image_description 2048→4096, answers
+  2048→4096 (DeepSeek's low→high ladder is 4x; medium takes the log
+  midpoint).
+- The audit (DTO-D10) now runs on `tier1` at fixed medium effort with a
+  Qwen-native prompt (REQUEST-first plain text, no DeepSeek scaffold, no
+  `prompt_suffix`), T=1.0/top_p=0.95/top_k=20, never greedy (issue #509). A
+  fixed level cannot carry `max_tokens_by_effort` (DTO-D8 rule), so one
+  16384-token cap (the geometric midpoint of the halved DTO-D12 low/high
+  ladder) bounds think + verdict. The verdict leaves the serial DeepSeek
+  chain; `synthesis` stays on tier2 and the caller's effort still grades
+  `policies`/`critique`/`synthesis`.
+- Risk accepted by the owner: a 27B Qwen now audits a frontier DeepSeek
+  synthesis (previously peer-strength). Both serving gates and the
+  served-config digest re-pin are complete (2026-08-25, runs
+  `20260825T161729Z`/`20260825T173343Z`).
+
+
+### DTO-D15 — Public-output floor for chat-template final units (owner amendment, 2026-08-26; extends DTO-D9 to the DTO-D13 `qwen_think_medium` route)
+
+Status: accepted; implemented; serving gates GPU re-verify and digest re-pin pending.
+
+- Trigger (2026-08-26): a SWE-bench Pro run sending `max_tokens: 8192`
+  received 502s from `qwen_think_medium` after ~2 × 8192 tokens: the Qwen
+  medium tier (DTO-D14) routinely deliberates ~7k tokens, the whole caller
+  cap went inside `<think>`, and — because the route's final unit declared
+  no `reasoning_close_tag` — `_profile_output_floor` passed no floor, so the
+  issue-#496 re-dispatch was byte-identical (prefix-cache hit, same outcome)
+  and the run ended `EmptyFinalOutput`. The caller cap is legitimate; the
+  server must answer within it.
+- Same window, second defect fixed en route: the DTO-D9 forced-close retry on
+  a *streamed* call (`/v1/messages`, which always streams internally)
+  produced `completion text delta offset mismatch … got 0` → 502. The
+  reasoning-only OpenAI stream leaves `text_delta=""`/`text_offset=0` on the
+  completion that `_unit_public_output` reclaims as public text, while the
+  reclaimed text is already published as a tail delta. The reclaim now
+  returns the cumulative form (`text_delta`/`text_offset` cleared) so the
+  server slices by its own offset; the unit fixture `ThinkExhaustedBackend`
+  is delta-native so the floor tests exercise the real backend shape.
+- Third defect found by the live re-check on the deployed Qwen worker: vLLM
+  v0.23 returns the private span under the OpenAI-compatible key
+  `reasoning`, not `reasoning_content`; the OpenAI backend read only the
+  latter, so every Qwen-pool call silently lost its reasoning (the chat
+  continuation carried an empty think and the `reasoning_closed` reclaim
+  had nothing to publish). The backend now accepts either key on messages
+  and stream deltas.
+- **Config**: role-level `reasoning_continuation: prefix | chat` (default
+  `prefix`, today's behavior) and `reasoning_open_tag`. `chat` declares
+  that the worker's upstream chat template opens the reasoning span
+  (Qwen-family `<think>`), so the empty-output re-dispatch cannot extend a
+  text scaffold; it requires both tags. DSL/Conductor validation rejects
+  `chat` without them and an open tag outside `chat`.
+- **Phase A** is unchanged: attempt 0 dispatches with `max_tokens = B −
+  floor`.
+- **Phase B (`chat`)**: the same single bounded re-dispatch sends the
+  rendered role prompt unchanged plus a final assistant message
+  `"<open>\n<attempt-0 reasoning>\n<close>\n\n"` with vLLM
+  `continue_final_message: true` / `add_generation_prompt: false`
+  (`GenerationRequest.assistant_prefill`; OpenAI backend, vLLM upstream and
+  template-owned chat prompts only). The Qwen template re-renders that
+  message as a closed thinking turn (`<|im_start|>assistant\n<think>\n…\n</think>\n\n`)
+  and the model continues with the reserved `min(floor, B)` public tokens;
+  vLLM requires the prefill to appear verbatim in the rendered chat, hence
+  the exact shape (probed on the deployed vLLM v0.23 Qwen worker). The
+  dispatch is `reasoning_closed` so parser-classified output is reclaimed
+  (issue #496); the trace keeps `retry:empty_output` with
+  `continuation: think_close` and adds `mode: chat`.
+- **Example**: `qwen_think_answer` declares `reasoning_close_tag: "</think>"`,
+  `reasoning_continuation: chat`, `reasoning_open_tag: "<think>"`; floor 256
+  now applies to the `qwen_think_medium` profile (0.4% of the Chat-UI cap;
+  0.2% of 131072). The other profiles are unchanged.
+- **Trade-off**: as DTO-D9 — an answer that finishes thinking inside phase A
+  may truncate up to `floor` tokens earlier; accepted. The continuation
+  prompt shape is model-family knowledge declared as config, like
+  `prompt_suffix`.
+- GPU consequences: served config changed → both serving gates and the
+  digest re-pin must be re-run before the next status claim.
 
 ## Acceptance
 
@@ -533,12 +634,13 @@ are judged too; judge failure falls back to the ensemble.
   contains a TTFT-gated profile (c32 is the watch row); thinking-direct-only
   rows report `not_applicable`. Results are recorded in the example's
   MEASUREMENTS.md.
-- GPU re-verification list for DTO-D10..D13 (next window): both `verify.sh`
-  gates; a manual image chat (the `image_description` stage appears in the
-  internal-work item; `skipped:condition` on a text chat); a manual Chat UI
-  pass for every route; judge-latency measurement; and a Terminal-Bench-style
-  Codex run over `/v1/responses` checking per-turn time against 900 s and that
-  tool-call turns PASS the audit.
+- GPU verification status for DTO-D10..D14: both `verify.sh` gates are green
+  on digest `69702ab5af0ab3c0…`, and the per-row `routes.json` artifacts record
+  judge latency. Outstanding manual checks are an image chat (the
+  `image_description` stage appears in the internal-work item;
+  `skipped:condition` on a text chat), a Chat UI pass for every route, and a
+  Terminal-Bench-style Codex run over `/v1/responses` checking per-turn time
+  against 900 s and that tool-call turns PASS the audit.
 - Test-policy accounting: the executor-status gate tests and retired general
   profile assertions were deleted with the features they protected; DTO-D13
   reintroduced profile/judge assertions and route-aware gate tests;

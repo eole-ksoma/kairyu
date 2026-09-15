@@ -1,0 +1,183 @@
+name: kairyu-deepseek-v4-flash-vision-exp-dp2-8gpu
+
+# Two identical DeepSeek-V4-Flash-Vision-Exp TP4+EP4 vLLM replicas (four GPUs
+# each) behind one Kairyu L3 endpoint. Kairyu L2 is only the replica pool:
+# warm-prefix reuse when that replica is idle, otherwise least-outstanding
+# placement, so concurrent traffic alternates evenly between the two halves
+# (kairyu.yaml).
+x-deepseek: &deepseek
+  image: ${DEEPSEEK_VLLM_IMAGE:-local/vllm-openai:sm120-27a94d1-flashinfer-60b4915}
+  ipc: host
+  environment:
+    HF_HOME: /models/.cache
+    HF_HUB_OFFLINE: "1"
+    HF_HUB_DISABLE_TELEMETRY: "1"
+    VLLM_NO_USAGE_STATS: "1"
+    PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    SAFETENSORS_FAST_GPU: "1"
+    XDG_CACHE_HOME: /root/.cache
+    TORCHINDUCTOR_CACHE_DIR: /root/.cache/torchinductor
+    TRITON_CACHE_DIR: /root/.cache/triton
+    TILELANG_CACHE_DIR: /root/.cache/tilelang
+    TILELANG_TMP_DIR: /root/.cache/tilelang/tmp
+  # The official vLLM recipe's verified layout (TP4 + EP, FP8 KV, 256-token
+  # blocks, DSpark k=3 probabilistic drafting) at the checkpoint's native 1M
+  # context, with two SM120 adjustments: the Marlin MXFP4 MoE kernel pinned
+  # explicitly (vLLM's higher-priority DeepGEMM/TRT-LLM MXFP4 MoE backends
+  # target SM100 datacenter Blackwell; Marlin is the measured SM120 choice)
+  # and DSpark adaptive verification off (rejected by the SM120 indexer).
+  # Batch budget and sequence count come from the sibling
+  # deepseek-v4-flash-0731-dp2-8gpu measurements on the same GPUs.
+  command:
+    - /models/deepseek-v4-flash-vision-exp
+    - --served-model-name
+    - deepseek-v4-flash-vision-exp
+    - --max-model-len
+    - "1048576"
+    - --trust-remote-code
+    - --kv-cache-dtype
+    - fp8
+    - --block-size
+    - "256"
+    - --tensor-parallel-size
+    - "4"
+    - --enable-expert-parallel
+    - --moe-backend
+    - marlin
+    - --speculative-config
+    - '{"method":"dspark","num_speculative_tokens":3,"draft_sample_method":"probabilistic","enable_adaptive_verification":false}'
+    - --tokenizer-mode
+    - deepseek_v4
+    - --reasoning-parser
+    - deepseek_v4
+    - --reasoning-config
+    - '{"reasoning_parser":"deepseek_v4","reasoning_start_str":"","reasoning_end_str":""}'
+    # vLLM renders chat with the checkpoint's own encoder (tokenizer-mode
+    # deepseek_v4; OpenAI image parts become <｜deepseek_image｜> placeholders)
+    # and parses DSML tool calls into OpenAI tool_calls; without
+    # --tool-call-parser the markup leaks into message.content and tool-driven
+    # agents fail (PR #584 review). Thinking defaults off to keep the
+    # direct-chat contract; an explicit reasoning_effort re-enables it.
+    - --enable-auto-tool-choice
+    - --tool-call-parser
+    - deepseek_v4
+    - --default-chat-template-kwargs
+    - '{"thinking": false, "enable_thinking": false}'
+    - --enable-prefix-caching
+    - --gpu-memory-utilization
+    - "0.90"
+    - --max-num-seqs
+    - "32"
+    - --max-num-batched-tokens
+    - "16384"
+    - --disable-uvicorn-access-log
+  healthcheck: &health
+    test: [CMD, python3, -c, 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/health", timeout=2)']
+    interval: 5s
+    timeout: 3s
+    retries: 1440
+    start_period: 30s
+  restart: unless-stopped
+
+services:
+  deepseek-0:
+    <<: *deepseek
+    cpuset: ${DEEPSEEK_0_CPUSET}
+    volumes:
+      - type: bind
+        source: ${DEEPSEEK_MODEL_STORAGE_PATH}
+        target: /models
+        read_only: true
+      - type: bind
+        source: ${DEEPSEEK_CACHE_0_PATH}
+        target: /root/.cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0", "1", "2", "3"]
+              capabilities: [gpu]
+
+  deepseek-1:
+    <<: *deepseek
+    cpuset: ${DEEPSEEK_1_CPUSET}
+    volumes:
+      - type: bind
+        source: ${DEEPSEEK_MODEL_STORAGE_PATH}
+        target: /models
+        read_only: true
+      - type: bind
+        source: ${DEEPSEEK_CACHE_1_PATH}
+        target: /root/.cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["4", "5", "6", "7"]
+              capabilities: [gpu]
+
+  kairyu:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      args:
+        # Image validation (image_input_policy in kairyu.yaml) needs the
+        # `vision` extra.
+        KAIRYU_VISION: "1"
+    image: ${KAIRYU_IMAGE:-local/kairyu:deepseek-v4-vision-dp2-example}
+    command: [/etc/kairyu/kairyu.yaml]
+    environment:
+      KAIRYU_CONTAINER_IMAGE_DIGEST: ${KAIRYU_IMAGE_ID:-local-build}
+    volumes:
+      # Per-placement JSONL evidence (replica id + reason per request) that
+      # verify.sh reads to prove the even spread; session ids are hashed.
+      - type: bind
+        source: ${PLACEMENT_LOG_PATH}
+        target: /var/lib/kairyu/placement
+      - ./kairyu.yaml:/etc/kairyu/kairyu.yaml:ro
+    depends_on:
+      deepseek-0: {condition: service_healthy}
+      deepseek-1: {condition: service_healthy}
+    ports:
+      - 127.0.0.1:${API_PORT:-8005}:8000
+    healthcheck:
+      test: [CMD, python3, -c, 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/readyz", timeout=2)']
+      interval: 5s
+      timeout: 3s
+      retries: 120
+    restart: unless-stopped
+
+  chat-ui:
+    image: ${OPEN_WEBUI_IMAGE:-ghcr.io/open-webui/open-webui:v0.11.0-slim@sha256:3698bd4e9628b7ae3768808721098616e669b4a05a6bceb2f5da2d84a3282a01}
+    environment:
+      OPENAI_API_BASE_URL: http://kairyu:8000/v1
+      OPENAI_API_KEY: sk-local-kairyu
+      DEFAULT_MODELS: deepseek-v4-flash-vision-exp
+      # The checkpoint publishes no non-thinking sampling values, so only the
+      # output budget is pinned; vLLM applies the checkpoint's
+      # generation_config for the rest.
+      DEFAULT_MODEL_PARAMS: '{"max_tokens":32768}'
+      # Auth-less single-admin UI (as in the tiered example): `run.sh up`
+      # signs in through the auth-disabled session to install the Reasoning
+      # Effort dropdown (webui-reasoning-effort-filter.py).
+      ENABLE_PERSISTENT_CONFIG: "false"
+      RESET_CONFIG_ON_START: "true"
+      ENABLE_SIGNUP: "false"
+      ENABLE_LOGIN_FORM: "false"
+      WEBUI_AUTH: "false"
+      WEBUI_URL: ${WEBUI_URL:-http://localhost:3005}
+      WEBUI_ADMIN_NAME: ${WEBUI_ADMIN_NAME:-Kairyu Admin}
+      ENABLE_OLLAMA_API: "false"
+      ENABLE_EVALUATION_ARENA_MODELS: "false"
+      RAG_EMBEDDING_ENGINE: ""
+    volumes:
+      - type: bind
+        source: ${WEBUI_STORAGE_PATH}
+        target: /app/backend/data
+    depends_on:
+      kairyu: {condition: service_healthy}
+    ports:
+      - ${CHAT_UI_BIND_ADDRESS:-127.0.0.1}:${CHAT_UI_PORT:-3005}:8080
+    restart: unless-stopped

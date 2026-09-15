@@ -200,6 +200,12 @@ class GenerationRequest:
     # Per-request variables for an upstream-owned HF chat template (text or
     # multimodal chat prompts; never pre-rendered or token prompts).
     chat_template_kwargs: Mapping[str, object] | None = None
+    # Assistant-turn continuation for an upstream-templated chat prompt: the
+    # upstream renders this as the final assistant message and generation
+    # continues it (vLLM ``continue_final_message``). Used by the
+    # public-output floor on chat-template workers whose reasoning span the
+    # template itself opens (DTO-D15).
+    assistant_prefill: str | None = None
 
     def __post_init__(self) -> None:
         # Defense in depth for callers holding a SamplingParams created by an
@@ -231,6 +237,14 @@ class GenerationRequest:
                 dict(self.chat_template_kwargs),
             )
         kind = prompt_kind(self.prompt)
+        if self.assistant_prefill is not None:
+            if not isinstance(self.assistant_prefill, str) or not self.assistant_prefill:
+                raise ValueError("assistant_prefill must be a non-empty string or null")
+            if kind == "tokens" or isinstance(self.prompt, TemplatedPrompt):
+                raise ValueError(
+                    "assistant_prefill requires an upstream-templated chat prompt "
+                    "(text or multimodal), not a pre-rendered or token prompt"
+                )
         if self.chat_template_kwargs is not None and (
             kind == "tokens" or isinstance(self.prompt, TemplatedPrompt)
         ):
@@ -590,6 +604,8 @@ def validate_native_request_surface_before_prepare(
         unsupported.append("prompt_logprobs")
     if request.chat_template_kwargs is not None:
         unsupported.append("chat_template_kwargs")
+    if request.assistant_prefill is not None:
+        unsupported.append("assistant_prefill")
     if not isinstance(params.extra_args, Mapping):
         unsupported.append("extra_args")
     if unsupported:

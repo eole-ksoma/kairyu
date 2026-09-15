@@ -83,7 +83,24 @@ async function step(name, operation) {
 		return await operation();
 	} catch (error) {
 		const detail = error instanceof Error ? error.message : String(error);
-		throw new Error(`${name}: ${detail}`, { cause: error });
+		// Overlay toasts/popups are the most common cause of intercepted
+		// clicks; include their visible text so a failure names the actual
+		// blocker instead of a bare locator timeout.
+		let overlayNote = '';
+		try {
+			const overlays = await page.evaluate(() =>
+				Array.from(document.querySelectorAll('div.z-50'))
+					.map((node) => node.innerText.trim().replace(/\s+/g, ' ').slice(0, 200))
+					.filter(Boolean)
+					.slice(0, 3)
+			);
+			if (overlays.length > 0) {
+				overlayNote = `\n[z-50 overlays: ${JSON.stringify(overlays)}]`;
+			}
+		} catch {
+			// diagnostics never mask the original failure
+		}
+		throw new Error(`${name}: ${detail}${overlayNote}`, { cause: error });
 	}
 }
 

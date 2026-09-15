@@ -942,3 +942,34 @@ def test_profile_judge_usage_settles_when_later_preflight_rejects(tmp_path):
     assert totals["requests"] == 1
     assert totals["prompt_tokens"] == judge.reported_usage.prompt_tokens
     assert totals["completion_tokens"] == judge.reported_usage.completion_tokens
+def test_trace_v2_event_accepts_list_detail_values() -> None:
+    """DTO-D13 judge events carry the offered label list; the chunk schema
+    rejecting list detail values crashed live SSE streams mid-body."""
+    from kairyu.entrypoints.server.protocol import (
+        ChatCompletionChunk,
+        KairyuTraceEvent,
+    )
+
+    event = KairyuTraceEvent(
+        seq=0,
+        node="profile_judge",
+        role="profile_judge",
+        kind="classification",
+        status="success",
+        detail={"verdict": "QWEN", "offered": ["QWEN", "ENSEMBLE"], "fallback": None},
+    )
+    assert event.detail["offered"] == ["QWEN", "ENSEMBLE"]
+    chunk = ChatCompletionChunk(
+        id="chatcmpl-offered",
+        created=0,
+        model="kairyu-auto-max",
+        choices=[],
+        kairyu_trace_v2={
+            "trace_version": "2.0",
+            "request_id": "chatcmpl-offered",
+            "started_at": "2026-08-25T00:00:00Z",
+            "completed_at": "2026-08-25T00:00:01Z",
+            "events": [event.model_dump()],
+        },
+    )
+    assert '"offered":["QWEN","ENSEMBLE"]' in chunk.model_dump_json()

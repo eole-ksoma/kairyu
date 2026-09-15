@@ -2343,6 +2343,7 @@ class KairyuBackend:
                     tool_call_protocol=request.tool_call_protocol,
                     reasoning_effort=request.reasoning_effort,
                     chat_template_kwargs=request.chat_template_kwargs,
+                    assistant_prefill=request.assistant_prefill,
                 )
             )
         return subs

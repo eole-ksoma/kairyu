@@ -11,6 +11,14 @@ header (above the existing entries), keeping their original order.
 
 <!-- ARCHIVE-INSERT-POINT: new trimmed entries go directly below this line -->
 
+### 2026-09-07 — [progress] PostgreSQL AsyncRequest persistence
+- What: added the production RequestStore schema and backend with tenant-scoped
+  idempotency, SKIP LOCKED claims, DB-clock renewal/takeover, fenced terminal
+  writes, deadline/cancel invalidation, lock-complete status lists, and
+  transactional claim audit events.
+- Refs: m10 A37; kairyu/async_requests/postgres_store.py;
+  tests/unit/test_postgres_request_store.py; scripts/postgres_integration.sh
+
 ### 2026-09-07 — [design] AsyncRequest v1 store and fencing contract
 - What: added a separate online async-request state model, tenant-scoped
   idempotency, deterministic priority claims, lease renewal/reclaim, fencing,
@@ -19,6 +27,51 @@ header (above the existing entries), keeping their original order.
   wiring, and Batch job/file semantics must not become the online queue model.
 - Refs: m10 A36; kairyu/async_requests; tests/unit/test_async_request_store.py
 
+### 2026-09-04 — [amendment] FN-D9: vision examples GPU-verified; Qwen drops MTP k=3
+- What: both vision replica examples pinned (tree SHA, image ID `b47e2210`) and all gates
+  PASS — DeepSeek c64 689 tok/s, Qwen c32 548 tok/s, placement 32/32 at every row ≥c8,
+  tool-calling 6/6, vision 2/2. `qwen3.8-flash-next-dp2-8gpu` now serves without the
+  recipe's `--speculative-config mtp k=3` and with `--kv-cache-memory` pinned (a cold
+  torch.compile cache made vLLM's start-up profile shrink replica 0's KV cache to 741K
+  tokens vs 3.45M); `verify.sh vision` requires the answer to name the probe colour.
+- Why: with prefix caching + MTP, `vllm@27a94d1c` corrupts batched answers on the hybrid
+  GDN checkpoint (`ductduct…`; 13/274 at 2-12 concurrent, 0/1,508 with either off,
+  63.8% with `--no-async-scheduling`; upstream vllm#53912). Prefix caching is what
+  Kairyu's prefix-aware placement and multi-turn traffic use, so MTP is the one dropped.
+- Refs: FN-D9 amendment in `docs/design/frontier-native-runtime.md`; `examples/*/MEASUREMENTS.md`; supersedes the "MTP k=3" wording in the 2026-09-04 FN-D9 entry below
+
+### 2026-09-04 — [amendment] FN-D9: two vision replica-pool examples
+- What: `examples/deepseek-v4-flash-vision-exp-dp2-8gpu` (TP4+EP4 × 2, official recipe
+  + SM120 marlin, 1M ctx) and `examples/qwen3.8-flash-next-dp2-8gpu` (TP4 × 2, official
+  rtx_pro_6000_4x FP8 layout, MTP k=3, 256K ctx): one public text+image model each,
+  no-login Chat UI with a reasoning-effort dropdown in each model's official vocabulary,
+  `verify.sh vision` gate, shared upstream-main `27a94d1c` + FlashInfer `60b49158`
+  SM120 overlay image with a fail-closed image-ID pin.
+- Why: both checkpoints need upstream `main` (official tags predate the support PRs;
+  FlashInfer 0.6.18 breaks SM120 sparse-MLA on the first image); Qwen's template
+  rejects L3-normalized efforts, so an example-local alias restores them.
+- Refs: FN-D9 amendment 2026-09-04 (docs/design/frontier-native-runtime.md); tests/unit/test_replica_examplectl.py; GPU evidence pending
+
+### 2026-09-02 — [amendment] FN-D9: replica examples must serve OpenAI tool calls
+- What: DP2 DeepSeek drops the Kairyu-rendered /completions passthrough (forwards
+  no tools; DSML parse is whole-block only) for the Qwen-style legacy path: vLLM
+  renders with the checkpoint's deepseek_v4 encoder + `--tool-call-parser
+  deepseek_v4`, Kairyu forwards tools to /chat/completions and normalizes. Both
+  examples gain a fail-closed readiness tool probe + `verify.sh tool-calling`
+  and non-thinking default kwargs (Qwen gate caught empty `content` on plain chat).
+- Why: PR #584 review — SWE-bench Pro got `tool_calls: null` every turn (22/22
+  RepeatedFormatError). GPU-verified: both tool gates 6/6, both matrices
+  re-pinned, SWE-bench Pro smoke 3/3 (kairyu-bench `20260902T010540Z-3bf671e8`).
+- Refs: PR #584; FN-D9 amendment; examples/{qwen3.8-27b-dp8-8gpu,deepseek-v4-flash-0731-dp2-8gpu}/
+
+### 2026-09-02 — [amendment] FN-D9: replica placement gates reject material skew
+- What: both replica-pool examples now limit a replica to 1.25× the even share.
+  Behavior tests reject the 8-way `16,16,16,8,2,2,2,2` and 2-way `63,1`
+  skews while the retained exact-even distributions pass. The verification-only
+  config change does not require a GPU rerun.
+- Why: the former 2× bound admitted materially skewed distributions as passing.
+- Refs: PR #585; FN-D9; examples/{qwen3.8-27b-dp8-8gpu,deepseek-v4-flash-0731-dp2-8gpu}/
+
 ### 2026-09-01 — [progress] Production-ready split-role Helm controls
 - What: chart 0.2.0 can pin repository@sha256, label gateway/replica roles,
   roll on DeploymentSpec changes, wait through model startup, drain before
@@ -26,6 +79,63 @@ header (above the existing entries), keeping their original order.
   select Recreate for scarce GPUs, and emit an optional ServiceMonitor.
 - Refs: deploy/helm/kairyu; tests/unit/test_fleet_elastic.py
 
+### 2026-09-01 — [amendment] FN-D9: two replica-pool 8-GPU examples (no orchestration)
+- What: `examples/qwen3.8-27b-dp8-8gpu` (Qwen3.8 TP1 × 8) and
+  `examples/deepseek-v4-flash-0731-dp2-8gpu` (DeepSeek TP4+EP4 × 2) expose one
+  public model each; L2 is only the `ReplicaPool` (`prefix_index: true`,
+  `queue_depth_threshold: 0`) and `verify.sh serving` gates the per-replica
+  split from `placement_log_path`. Same run/verify UX; no product code changed.
+- Why: a plain scale-out serving path (one API over N identical L1 replicas)
+  next to the orchestrated tiered example. GPU-verified 2026-09-01: gates green,
+  exact 8x8 / 32x2 splits; Qwen 313.7 tok/s at c8 (8.0x c1), DeepSeek 471 tok/s
+  at c32 (1.95x one replica) — MEASUREMENTS.md runs 20260901T133331Z / 20260901T140112Z.
+- Refs: FN-D9 (docs/design/frontier-native-runtime.md); tests/unit/test_replica_examplectl.py
+
+### 2026-08-26 — [design] DTO-D15: public-output floor for chat-template final units
+- What: role-level `reasoning_continuation: chat` + `reasoning_open_tag`; the
+  empty-output re-dispatch of a final unit whose span the upstream chat
+  template opens continues the captured reasoning as a closed assistant turn
+  (`GenerationRequest.assistant_prefill` → vLLM `continue_final_message`) with
+  the reserved floor tokens. `qwen_think_answer` adopts it (floor 256 now
+  covers the `qwen_think_medium` route). Served config changed — GPU
+  re-verify and digest re-pin pending.
+- Why: 502s on `max_tokens: 8192` agent turns — medium-tier Qwen spent the
+  whole cap in `<think>` and the byte-identical retry failed the same way.
+- Refs: DTO-D15; kairyu/{dsl,engine,orchestration}; examples/qwen3.8-deepseek-v4-8gpu/auto-max.yaml
+
+### 2026-08-26 — [progress] Streamed DTO-D9 floor retry no longer 502s (delta-offset reclaim fix)
+- What: `_unit_public_output` reclaim returns cumulative-form completions
+  (`text_delta`/`text_offset` cleared); a reasoning-only delta stream left
+  `text_offset=0` behind while the reclaimed text was already published, so
+  `/v1/messages` (always streamed) failed `delta offset mismatch` → 502 after
+  the full generation. Server regression test added; floor fixture made
+  delta-native.
+- Also: the OpenAI backend now reads the upstream span under `reasoning` as
+  well as `reasoning_content` (vLLM v0.23 Qwen image); the Qwen pool's
+  reasoning had been silently dropped.
+- Refs: DTO-D9/DTO-D15; kairyu/{orchestration/conductor.py,engine/openai_backend.py}; tests/server/test_openai_api.py
+
+### 2026-08-25 — [progress] DTO-D14 GPU-verified; three defects fixed en route
+- What: both verify.sh serving gates green on the DTO-D14 config (runs
+  20260825T161729Z coding / 20260825T173343Z generic, digest 69702ab5…).
+  The runs surfaced and fixed: trace v2 rejecting list detail values (judge
+  offered labels) crashing streamed SSE; trace envelope anchored at judge
+  started_at instead of queued_at (1 ms outside-envelope races); the Qwen
+  medium preamble missing the think-close guard sentence, letting long
+  L2-wrapped contexts end inside the think span (EmptyFinalOutput).
+- Refs: PR #579; DTO-D14 (amends the 2026-08-25 [design] entry below);
+  kairyu/{entrypoints/server/protocol.py,orchestration/{trace,orchestrator}.py}
+
+### 2026-08-25 — [design] DTO-D14: Qwen medium tier; audit moves to Qwen (tiered example)
+- What: Qwen thinking roles (draft, image_description, answer_1..4, renamed
+  qwen_think_medium route) fixed at spec `high` = medium tier (L3
+  medium→high alias); example-local graded Qwen template replaces the shared
+  clamped one; Qwen budgets doubled (2048/4096); audit moved to tier1 fixed
+  medium, one 16384 cap, REQUEST-first Qwen prompt without scaffold.
+- Why: owner request to raise Qwen deliberation to medium and audit on Qwen;
+  sampling stays DTO-D8; core effort ladder untouched. Served config changed
+  — GPU re-verify and digest re-pin pending.
+- Refs: DTO-D14; examples/qwen3.8-deepseek-v4-8gpu/*; tests/unit/test_tiered_frontier_examplectl.py
 ### 2026-08-25 — [progress] Incremental Anthropic tool streaming + count_tokens (#573)
 - What: `/v1/messages` streams tool calls incrementally — per-protocol
   scanners (GENERIC/LLAMA/QWEN/DSML, commit-on-close, hold-back) shared by

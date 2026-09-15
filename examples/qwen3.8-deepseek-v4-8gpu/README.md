@@ -9,7 +9,7 @@ Open WebUI
            request and picks the fastest route expected to answer correctly
            and well (DTO-D13):
              QWEN           -> qwen_direct     Qwen3.8 non-thinking, one call
-             QWEN_THINK     -> qwen_think_low  Qwen3.8 thinking (low), one call
+             QWEN_THINK     -> qwen_think_medium  Qwen3.8 thinking (medium), one call
              DEEPSEEK       -> deepseek_direct DeepSeek non-thinking, one call
              DEEPSEEK_THINK -> deepseek_think  DeepSeek thinking at the L3 effort
              ENSEMBLE       -> primary         the dual-track ensemble DAG below
@@ -21,7 +21,7 @@ Open WebUI
                      DeepSeek — concurrently with Track A
             Merge:   thinking DeepSeek synthesizes one better answer from
                      the 5 peer candidates (refined answer + 4 policy
-                     answers); a DeepSeek audit verifies it (PASS/FAIL,
+                     answers); a Qwen audit verifies it (PASS/FAIL,
                      <= 2 refinement rounds) before the remainder streams
             Images:  a Qwen image_description stage runs on image requests
                      only and feeds the text-only DeepSeek roles
@@ -68,7 +68,7 @@ How a request flows:
 | label | profile | what runs | thinking | sampling (fixed, DTO-D8) | max_tokens cap (vendor-official) |
 |---|---|---|---|---|---|
 | `QWEN` | `qwen_direct` | one Qwen3.8 call (`qwen_answer`) | no | T=0.7, top_p=0.8, top_k=20, presence_penalty=1.5 | 131,072 |
-| `QWEN_THINK` | `qwen_think_low` | one Qwen3.8 call (`qwen_think_answer`) | fixed `low` | T=1.0, top_p=0.95, top_k=20 | 131,072 |
+| `QWEN_THINK` | `qwen_think_medium` | one Qwen3.8 call (`qwen_think_answer`) | fixed `medium` (spec `high`) | T=1.0, top_p=0.95, top_k=20 | 131,072 |
 | `DEEPSEEK` | `deepseek_direct` | one DeepSeek call on the non-thinking pool (`deepseek_answer`) | no | T=1.0, top_p=0.95 | 393,216 (384K) |
 | `DEEPSEEK_THINK` | `deepseek_think` | one DeepSeek call on the thinking pool (`deepseek_think_answer`) | caller's L3 effort (default `high`) | T=1.0, top_p=0.95 | 393,216 (384K) |
 | `ENSEMBLE` | `primary` | the eleven-role dual-track DAG below | as before | as before | as before |
@@ -83,7 +83,7 @@ thorough, each with a short description of the kind of request it is for:
 - `QWEN` — a small fast model answers correctly at once: chit-chat, short
   facts, rewording/translation/formatting, simple lookups, trivial one-liners,
   exact fixed outputs.
-- `QWEN_THINK` — moderate reasoning a small model handles with brief
+- `QWEN_THINK` — moderate reasoning a small model handles with medium
   thinking: short math/logic, small well-specified coding tasks, step-by-step
   explanations, routine agent tool-call turns.
 - `DEEPSEEK` — needs frontier knowledge, breadth, or long-context
@@ -136,6 +136,14 @@ measured and the criteria adjusted from evidence.
   and audit loop are exactly DTO-D1..D12. The spec-level `budget {19, 2}`
   applies to every profile; a direct route spends one step plus the bounded
   empty-output re-dispatch.
+- **The Qwen thinking route keeps the floor too (DTO-D15)**: the vLLM chat
+  template opens Qwen's `<think>` span, so `qwen_think_answer` declares
+  `reasoning_close_tag`/`reasoning_open_tag` with
+  `reasoning_continuation: chat`. When a small caller cap (an agent harness
+  sending `max_tokens: 8192`) is eaten by medium-tier deliberation, the one
+  bounded re-dispatch continues the captured reasoning as a closed assistant
+  turn (vLLM `continue_final_message`) with the reserved 256 public tokens
+  instead of re-running the same request and 502-ing after 2x the cost.
 - **Cost**: the judge is one serial small Qwen call on every turn (~0.2 s
   measured on this deployment for a short turn); the next GPU window
   measures its TTFT contribution on the ensemble route and the route
@@ -151,20 +159,20 @@ profile no role is skipped** except the image-only stage on text requests.
 flowchart LR
     subgraph W1["Wave 1 — dependency-free"]
         H["head (Qwen non-thinking, T=0.7)<br/>streams public opening at t=0"]
-        DR["draft (Qwen thinking-low, T=1.0)<br/>quick internal draft"]
-        ID["image_description (Qwen thinking-low)<br/>image requests only; skipped otherwise"]
+        DR["draft (Qwen thinking-medium, T=1.0)<br/>quick internal draft"]
+        ID["image_description (Qwen thinking-medium)<br/>image requests only; skipped otherwise"]
         PO["policies (DeepSeek thinking, T=1.0)<br/>4 maximally different answer policies"]
     end
     subgraph W2["Wave 2 — two tracks in parallel"]
-        A1["answer_1 (Qwen thinking-low, T=1.0)<br/>follows POLICY 1"]
-        A2["answer_2 (Qwen thinking-low, T=1.0)<br/>follows POLICY 2"]
-        A3["answer_3 (Qwen thinking-low, T=1.0)<br/>follows POLICY 3"]
-        A4["answer_4 (Qwen thinking-low, T=1.0)<br/>follows POLICY 4"]
+        A1["answer_1 (Qwen thinking-medium, T=1.0)<br/>follows POLICY 1"]
+        A2["answer_2 (Qwen thinking-medium, T=1.0)<br/>follows POLICY 2"]
+        A3["answer_3 (Qwen thinking-medium, T=1.0)<br/>follows POLICY 3"]
+        A4["answer_4 (Qwen thinking-medium, T=1.0)<br/>follows POLICY 4"]
         CR["critique (DeepSeek thinking, T=1.0)<br/>critical analysis of the draft<br/>-> improved answer"]
     end
     subgraph W3["Wave 3 — merge + audit"]
         CO["synthesis (DeepSeek thinking)<br/>one better answer from 5 peer<br/>UNTRUSTED candidates; remainder is<br/>published after the audit"]
-        AU["audit (DeepSeek thinking, verifier)<br/>PASS -> stream; FAIL -> refine (<= 2)"]
+        AU["audit (Qwen thinking-medium, verifier)<br/>PASS -> stream; FAIL -> refine (<= 2)"]
     end
     ID -.image requests.-> PO
     ID -.image requests.-> CR
@@ -196,7 +204,7 @@ Role contracts:
 | `answer_1..4` | Qwen TP1 x4 | four policy-bound answers in parallel, one per replica; the policy list steers HOW, the request alone defines WHAT |
 | `critique` | DeepSeek thinking | deliberates privately over the UNTRUSTED draft with critical thinking, then emits one improved complete answer |
 | `synthesis` | DeepSeek thinking | the selected final unit: examines the five UNTRUSTED candidates (critique's refined answer + the four policy answers) as peers, verifies them, and writes one better answer; the remainder after the committed opening is published once the audit passes |
-| `audit` | DeepSeek thinking | verifier on `synthesis`: judges opening + remainder as one public answer (correctness, completeness, consistency, reply format); first line `PASS`/`FAIL`; FAIL feedback drives up to 2 refinement rounds, after which the last attempt is published |
+| `audit` | Qwen thinking (medium) | verifier on `synthesis`: judges opening + remainder as one public answer (correctness, completeness, consistency, reply format); first line `PASS`/`FAIL`; FAIL feedback drives up to 2 refinement rounds, after which the last attempt is published |
 
 Design notes (see
 [`docs/design/example-dual-track-orchestration.md`](../../docs/design/example-dual-track-orchestration.md)):
@@ -211,34 +219,37 @@ Design notes (see
   than `prefix_index`; only the leading REQUEST block may receive
   replica-local reuse from a preceding `head` or `draft` call.
 - Every DeepSeek v4 flash role thinks (owner decision, DTO-D7): `policies`,
-  `critique`, `synthesis`, and `audit` all end their scaffolds with
+  `critique`, and `synthesis` all end their scaffolds with
   `<｜Assistant｜><think>` and deliberate privately before their public text.
   The TTFT gate stays on the non-thinking Qwen head, and each role's token
   cap now bounds its `<think>` span plus its output together.
 - Qwen sampling and thinking are fixed per role in `auto-max.yaml`, never
   derived from the caller's request: `draft`, `image_description`, and
-  `answer_1..4` declare `reasoning_effort: low` (T=1.0), so they think at
-  low effort — the shared
-  Qwen template enables thinking for any explicit effort and clamps
-  `high`/`max` to `low` — while `head` (T=0.7) declares no effort and stays
-  non-thinking so the public opening streams immediately.
+  `answer_1..4` declare `reasoning_effort: high` (T=1.0) — the medium tier
+  under the L3 medium→high alias rule (DTO-D14) — so they think at medium
+  effort: the example-local Qwen template (`qwen3.8-chat.jinja`) enables
+  thinking for any explicit effort, prepends the medium reasoning preamble
+  for `high`, and clamps `max` to `high` — while `head` (T=0.7) declares no
+  effort and stays non-thinking so the public opening streams immediately.
 - The caller's L3 `reasoning_effort` reaches the DeepSeek roles: `policies`,
-  `critique`, `synthesis`, and `audit` declare `reasoning_effort: inherit`,
+  `critique`, and `synthesis` declare `reasoning_effort: inherit`,
   and a request without an explicit effort runs at the spec's
   `default_reasoning_effort: high`. The DeepSeek service's chat template
   (`deepseek-role-effort.jinja`) is a scaffold passthrough that splices the
   graded high/max reasoning preamble after `<｜begin▁of▁sentence｜>` into
-  thinking-scaffold calls — all four DeepSeek roles — so `low` yields plain
+  thinking-scaffold calls — all three DeepSeek roles — so `low` yields plain
   thinking and `high`/`max` strengthen every DeepSeek deliberation. The
   effort also grades the DeepSeek token budgets (DTO-D8, halved by
-  DTO-D12): `policies`, `critique`, and `audit` declare
+  DTO-D12): `policies` and `critique` declare
   `max_tokens_by_effort` `{low: 8192, high: 32768, max: 65536}` — half the
   vendor-recommended starting budgets, so the serial DeepSeek chain fits
   Terminal-Bench's 900 s per-turn agent envelope — bounding thinking +
   answer together, still clamped by `internal_max_tokens` (65536) and the
   request's public `max_tokens` — send a generous public `max_tokens` (the
   Chat UI default is 65536) or the higher tiers are clamped away.
-- The audit verifier gates publication (DTO-D10): after every `synthesis`
+- The audit verifier gates publication (DTO-D10; since DTO-D14 on Qwen at
+  fixed medium effort with one 16384-token think+verdict cap): after every
+  `synthesis`
   attempt the audit judges the committed opening plus the candidate
   remainder and answers `PASS` or `FAIL` on its first line; a FAIL verdict
   is fed back verbatim into a `synthesis` refinement (`max_refine_depth: 2`),
@@ -249,9 +260,9 @@ Design notes (see
   + 3 audit verdicts + 3 bounded inconclusive re-verifies + 2 refinements),
   `moa_samples: 0`.
 - Per request the DeepSeek engine sees at most one in-flight call per wave
-  (policies -> critique -> synthesis -> audit, plus refinement rounds); the
-  four concurrent Qwen roles spread one-per-replica through
-  `queue_depth_threshold: 0`.
+  (policies -> critique -> synthesis, plus refinement rounds — the audit
+  verdict now lands on the Qwen pool, DTO-D14); the four concurrent Qwen
+  roles spread one-per-replica through `queue_depth_threshold: 0`.
 
 On agent turns (declared tools, a plain-text structured-format demand, API
 `response_format`, `n>1`, or `logprobs`) the head is disabled for the call
@@ -355,8 +366,8 @@ reaches Kairyu — and `default` removes such values so the server default
 applies. The selection is forwarded as the OpenAI-compatible
 `reasoning_effort` body field.
 The chosen level flows through the `inherit`-declared DeepSeek roles and
-grades every DeepSeek deliberation (`policies`, `critique`, `synthesis`,
-`audit`) as well as their thinking+answer token budgets
+grades every DeepSeek deliberation (`policies`, `critique`, `synthesis`)
+as well as their thinking+answer token budgets
 (`max_tokens_by_effort`, DTO-D8/D12), and it is the effort of the
 `deepseek_think` direct route (DTO-D13); the Qwen roles and routes keep
 their fixed per-role declarations regardless of the UI setting. The API
@@ -425,12 +436,13 @@ row** (pinned `example.json` denominators are the fallback ceiling); samples
 the judge sent to a thinking direct route are reported per route but not
 gated, and a row with no gated-route sample records `not_applicable` in
 `ttft-gate.json`. The
-last green run is the dated 2026-08-18 section of `MEASUREMENTS.md` (run
-`20260818T025710Z`: TTFT gate PASS at every concurrency, binding c32 row
-0.67×), measured on the previous DAG; the DTO-D10..D12 DAG (synthesis +
-audit loop, image_description, halved DeepSeek budgets) and the DTO-D13
-judged five-route policy are **not yet
-GPU-measured** and every older section does not transfer. ChatUI continues
+last green runs are the dated 2026-08-25 section of `MEASUREMENTS.md`
+(`20260825T161729Z` coding + `20260825T173343Z` generic, both gates green
+on the DTO-D8..D14 served config): the judge routed every coding request
+to `qwen_think_medium`, so all coding TTFT rows record `not_applicable`,
+and the generic matrix passed its route-aware stage validation at every
+concurrency. Every older section predates this config and does not
+transfer. ChatUI continues
 to call only Kairyu
 L3. Raw artifacts go to the configured NVMe
 `verification-results/<UTC-run-id>/` directory. Model and product evaluations

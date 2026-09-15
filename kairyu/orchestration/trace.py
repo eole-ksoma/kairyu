@@ -17,6 +17,9 @@ from kairyu.orchestration.budget import BudgetState
 TRACE_VERSION = "2.0"
 
 JsonScalar: TypeAlias = str | int | float | bool | None
+# Trace metadata values: scalars plus flat scalar lists (e.g. the profile
+# judge's offered label list). Nested containers stay disallowed.
+JsonValue: TypeAlias = JsonScalar | list[JsonScalar]
 
 
 def utc_now_iso() -> str:
@@ -119,7 +122,7 @@ class TraceEvent:
     timing: TraceTiming | None = None
     usage: TraceUsage | None = None
     budget: TraceBudget | None = None
-    metadata: dict[str, JsonScalar] = field(default_factory=dict)
+    metadata: dict[str, JsonValue] = field(default_factory=dict)
     error: TraceError | None = None
 
     def as_v2(self, seq: int) -> dict[str, object]:

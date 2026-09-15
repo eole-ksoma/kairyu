@@ -19,6 +19,7 @@ from kairyu.entrypoints.chat_template import ChatTemplate
 from kairyu.entrypoints.server.metering import resolve_usage_counts
 from kairyu.entrypoints.server.settings import ServerSettings
 from kairyu.entrypoints.server.tenancy import TenantConfig, TenantLimits
+from kairyu.orchestration.conductor import RoleSpec
 from kairyu.orchestration.orchestrator import Orchestrator
 from kairyu.orchestration.replica import ReplicaPool
 from kairyu.outputs import CompletionOutput
@@ -4471,3 +4472,81 @@ async def test_auto_empty_final_output_is_an_explicit_error(stream):
         payload = response.json()
         assert payload["error"]
         assert "usage" in payload
+
+
+async def test_auto_stream_publishes_reclaimed_closed_reasoning_answer():
+    """A reasoning_closed final unit whose delta-native stream is entirely
+    parser-classified as reasoning (the DTO-D9 forced-close retry shape) must
+    stream the reclaimed answer and finish cleanly, not trip the delta-offset
+    contract into an SSE error after the full generation was paid for."""
+
+    class ReasoningOnlyDeltaBackend:
+        async def generate(self, request):  # pragma: no cover - stream expected
+            raise AssertionError("streaming dispatch expected")
+
+        async def stream(self, request):
+            yield GenerationResult(
+                request_id=request.request_id,
+                prompt=request.prompt,
+                completions=(
+                    CompletionOutput(
+                        index=0,
+                        text="",
+                        token_ids=(),
+                        finish_reason="stop",
+                        text_delta="",
+                        text_offset=0,
+                        reasoning_content="The answer is 5.",
+                        reasoning_delta="The answer is 5.",
+                        reasoning_offset=0,
+                    ),
+                ),
+                usage=GenerationUsage(prompt_tokens=3, completion_tokens=4),
+                finished=True,
+            )
+
+        async def shutdown(self):
+            return None
+
+    backend = ReasoningOnlyDeltaBackend()
+    roles = (
+        RoleSpec(
+            name="answer",
+            worker="tier1",
+            role_type="publisher",
+            prompt="[answer] {query}",
+            reasoning_closed=True,
+        ),
+    )
+    app = create_legacy_app(
+        engines={},
+        orchestrators={
+            "auto": Orchestrator({"tier1": backend, "tier2": backend}, roles=roles)
+        },
+    )
+    body = {
+        "model": "auto",
+        "messages": [
+            {
+                "role": "user",
+                # Multi-step wording so the router selects the role DAG.
+                "content": (
+                    "First research. Then plan. After that implement. "
+                    "Finally verify."
+                ),
+            }
+        ],
+        "stream": True,
+    }
+
+    async with _client(app, raise_app_exceptions=False) as client:
+        response = await client.post("/v1/chat/completions", json=body)
+
+    assert response.status_code == 200, response.text
+    payloads = _sse_json_payloads(response)
+    assert not any("error" in payload for payload in payloads), response.text
+    choices = [choice for payload in payloads for choice in payload.get("choices", ())]
+    assert "".join(choice["delta"].get("content") or "" for choice in choices) == (
+        "The answer is 5."
+    )
+    assert any(choice.get("finish_reason") == "stop" for choice in choices)

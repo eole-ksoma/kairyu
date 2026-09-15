@@ -395,7 +395,12 @@ class KairyuTraceEvent(BaseModel):
     timing: KairyuTraceTiming | None = None
     usage: KairyuTraceUsage | None = None
     budget: KairyuTraceBudget | None = None
-    detail: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
+    # Scalars plus flat scalar lists: the DTO-D13 profile-judge event carries
+    # the offered label list; rejecting it crashed live SSE streams mid-body.
+    detail: dict[
+        str,
+        str | int | float | bool | None | list[str | int | float | bool | None],
+    ] = Field(default_factory=dict)
     error: KairyuTraceError | None = None
 
 

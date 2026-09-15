@@ -180,6 +180,15 @@ class RoleSpec:
     # config like prompt_suffix; the public-output floor (issue #542) forces
     # it into the empty-output re-dispatch prompt to end deliberation.
     reasoning_close_tag: str = ""
+    # How the floor continues exhausted deliberation (DTO-D15): "prefix"
+    # appends reasoning + close tag to the role's own scaffold; "chat" sends
+    # them as an assistant prefill the worker's upstream chat template
+    # re-renders as a closed thinking turn (the template opened the span).
+    reasoning_continuation: str = "prefix"
+    # The literal opening the span for "chat" continuation ("<think>"): the
+    # prefill must reproduce the template's rendered closed thinking turn
+    # verbatim or vLLM refuses to continue the final message.
+    reasoning_open_tag: str = ""
     # Request condition for dispatch: "image" runs the role only when the
     # request carries image input; otherwise it is skipped entirely (no model
     # call, no step), dependents run as if it were absent, and its template
@@ -218,6 +227,17 @@ class RoleSpec:
             raise ValueError(
                 f"role {self.name!r}: reasoning_close_tag declares an open "
                 "reasoning span and cannot combine with reasoning_closed"
+            )
+        if self.reasoning_continuation not in {"prefix", "chat"}:
+            raise ValueError(
+                f"role {self.name!r}: reasoning_continuation must be 'prefix' or 'chat'"
+            )
+        if self.reasoning_continuation == "chat" and not (
+            self.reasoning_close_tag and self.reasoning_open_tag
+        ):
+            raise ValueError(
+                f"role {self.name!r}: reasoning_continuation 'chat' requires "
+                "reasoning_open_tag and reasoning_close_tag"
             )
         if self.executor is not None and self.reasoning_effort is not None:
             raise ValueError(
@@ -774,6 +794,23 @@ class Conductor:
             return None
         return self._role_reasoning_effort(self._selected_final_unit())
 
+    def final_retry_intent_assistant_prefill(self) -> str | None:
+        """A representative chat-continuation prefill for preflight.
+
+        The real text is only known after attempt 0, but backend capability is
+        determined by the presence of the final assistant turn.  An empty
+        reasoning span is also a valid retry payload and lets orchestration
+        reject unsupported workers before spending the reserved budget.
+        """
+
+        if self._think_close_floor() is None:
+            return None
+        final = self._selected_final_unit()
+        if final.reasoning_continuation != "chat":
+            return None
+        _prompt, assistant_prefill = self._think_close_continuation(final, "", "")
+        return assistant_prefill
+
     def final_intent_sampling_params(self) -> SamplingParams:
         """Effective final-unit params before run-local budget deductions.
 
@@ -828,6 +865,31 @@ class Conductor:
             # One prompt cannot continue multiple independent reasoning branches.
             return None
         return self._public_output_floor
+
+    @staticmethod
+    def _think_close_continuation(
+        spec: RoleSpec,
+        prompt: str,
+        reasoning: str,
+    ) -> tuple[str, str | None]:
+        """The forced-close re-dispatch input: (prompt, assistant prefill).
+
+        ``prefix`` roles opened the span in their own scaffold, so the
+        captured reasoning and the close tag extend the prompt. ``chat`` roles
+        rely on the worker's upstream chat template for the span, so the same
+        continuation travels as the final assistant turn (the Qwen-family
+        templates re-render ``…</think>`` content as a closed thinking turn)
+        and vLLM continues that message (DTO-D15).
+        """
+
+        if spec.reasoning_continuation == "chat":
+            # vLLM checks the final message appears verbatim in the rendered
+            # chat, so mirror the template's closed thinking turn exactly.
+            return prompt, (
+                f"{spec.reasoning_open_tag}\n{reasoning.strip()}\n"
+                f"{spec.reasoning_close_tag}\n\n"
+            )
+        return f"{prompt}{reasoning}{spec.reasoning_close_tag}\n\n", None
 
     def _public_budget_remaining(self, run: _RunState) -> int | None:
         """Tokens the final unit may still generate; ``None`` when unlimited."""
@@ -1184,6 +1246,7 @@ class Conductor:
         prompt: str,
         attempt: int,
         max_tokens_override: int | None = None,
+        assistant_prefill: str | None = None,
     ) -> GenerationRequest:
         """Consume an exact first-wave preflight request when one is bound."""
 
@@ -1218,6 +1281,7 @@ class Conductor:
             parallel_tool_calls=parallel_tool_calls,
             tool_call_protocol=tool_call_protocol,
             reasoning_effort=self._role_reasoning_effort(spec),
+            assistant_prefill=assistant_prefill,
         )
         if attempt != 0:
             return candidate
@@ -1328,8 +1392,18 @@ class Conductor:
         )
         if not reclaimed:
             return text, completions
+        # The reclaimed completion must be delta-consistent: a reasoning-only
+        # stream leaves ``text_delta=""``/``text_offset=0`` behind while the
+        # reclaimed text is published as a tail delta, so present the
+        # cumulative form and let the server slice by its own offset.
         return reclaimed, tuple(
-            replace(completion, text=completion.reasoning_content, reasoning_content=None)
+            replace(
+                completion,
+                text=completion.reasoning_content,
+                reasoning_content=None,
+                text_delta=None,
+                text_offset=None,
+            )
             if completion.reasoning_content and not completion.text.strip()
             else completion
             for completion in completions
@@ -1444,6 +1518,7 @@ class Conductor:
         spec: RoleSpec | None = None,
         operation: str = "generation",
         max_tokens_override: int | None = None,
+        assistant_prefill: str | None = None,
     ) -> _GenerationObservation:
         event_spec = spec or RoleSpec(name=node, worker=worker, prompt="")
         backend = self._workers[worker]
@@ -1454,6 +1529,7 @@ class Conductor:
             prompt,
             attempt,
             max_tokens_override=max_tokens_override,
+            assistant_prefill=assistant_prefill,
         )
         queued_at = utc_now_iso()
         budget_before = run.budget
@@ -2003,6 +2079,7 @@ class Conductor:
         empty_retry_used = False
         dispatch_spec = spec
         retry_max_tokens: int | None = None
+        retry_prefill: str | None = None
         while True:
             try:
                 observed = await self._generate(
@@ -2015,6 +2092,7 @@ class Conductor:
                     spec=dispatch_spec,
                     operation="generation",
                     max_tokens_override=retry_max_tokens,
+                    assistant_prefill=retry_prefill,
                 )
             except _BudgetRefused:
                 refused_attempt = depth + (1 if empty_retry_used else 0)
@@ -2079,9 +2157,15 @@ class Conductor:
                     reasoning = self._model_reasoning(observed.completions) or ""
                     # Continue the attempt that ran dry — the refined prompt
                     # on a refinement attempt, not attempt 0's scaffold.
-                    prompt = f"{prompt}{reasoning}{spec.reasoning_close_tag}\n\n"
+                    prompt, retry_prefill = self._think_close_continuation(
+                        spec, prompt, reasoning
+                    )
                     dispatch_spec = replace(
-                        spec, reasoning_closed=True, reasoning_close_tag=""
+                        spec,
+                        reasoning_closed=True,
+                        reasoning_close_tag="",
+                        reasoning_continuation="prefix",
+                        reasoning_open_tag="",
                     )
                     remaining = self._public_budget_remaining(run)
                     retry_max_tokens = (
@@ -2089,6 +2173,7 @@ class Conductor:
                     )
                     metadata.update(
                         continuation="think_close",
+                        mode=spec.reasoning_continuation,
                         reserved_tokens=floor,
                     )
                 run.trace.append(
@@ -2316,6 +2401,7 @@ class Conductor:
             # reserve-sized cap into this attempt.
             dispatch_spec = spec
             retry_max_tokens = None
+            retry_prefill = None
         if (
             is_final_unit
             and not self._has_public_output(
@@ -2655,14 +2741,23 @@ class Conductor:
                 dict(run.outputs),
             )
         max_tokens_override: int | None = None
+        assistant_prefill: str | None = None
         if think_continuation is not None:
             # Public-output floor (issue #542): continue the captured
             # deliberation after a forced reasoning close, answering with the
             # reserved public tokens; the reasoning_closed reclaim publishes
             # parser-classified output at stream end.
             floor = self._think_close_floor()
-            prompt = f"{prompt}{think_continuation}{spec.reasoning_close_tag}\n\n"
-            spec = replace(spec, reasoning_closed=True, reasoning_close_tag="")
+            prompt, assistant_prefill = self._think_close_continuation(
+                spec, prompt, think_continuation
+            )
+            spec = replace(
+                spec,
+                reasoning_closed=True,
+                reasoning_close_tag="",
+                reasoning_continuation="prefix",
+                reasoning_open_tag="",
+            )
             if floor is not None:
                 max_tokens_override = (
                     floor if remaining is None else max(1, min(floor, remaining))
@@ -2675,6 +2770,7 @@ class Conductor:
             prompt,
             attempt,
             max_tokens_override=max_tokens_override,
+            assistant_prefill=assistant_prefill,
         )
         queued_at = utc_now_iso()
         budget_before = run.budget
@@ -3134,6 +3230,7 @@ class Conductor:
                         if floor is not None:
                             retry_metadata.update(
                                 continuation="think_close",
+                                mode=final.reasoning_continuation,
                                 reserved_tokens=floor,
                             )
                         run.trace.append(

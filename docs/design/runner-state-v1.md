@@ -6,9 +6,9 @@ not a projection of Kubernetes Pod phase: a running container remains
 evidence is complete.
 
 This slice fixes the controller-neutral contract, a read-only Kubernetes
-observation/reconciliation boundary, and a fence-bound drain/termination
-handshake. Persistence, leader election, Kubernetes termination writes, and
-scale actuation remain later work.
+observation/reconciliation boundary, a fence-bound drain/termination handshake,
+and bounded failure-domain backoff/quarantine. Durable persistence, leader
+election, Kubernetes termination writes, and scale actuation remain later work.
 
 ## Identity and snapshot rules
 
@@ -30,9 +30,11 @@ including after controller restart.
 `draining` and `unhealthy` may retain a non-zero count so a controller does not
 erase in-flight work while removing the Runner from new dispatch. An
 `unhealthy` snapshot requires a bounded, sanitized failure and other states
-forbid one. State updates inherit the prior active count unless the caller
-supplies a newly observed value; entering `ready`, `terminating`, or
-`terminated` from a non-empty snapshot therefore requires an explicit zero.
+forbid one. Fatal failures may additionally declare a `revision`, `node`, or
+`gpu` domain for restart protection. State updates inherit the prior active
+count unless the caller supplies a newly observed value; entering `ready`,
+`terminating`, or `terminated` from a non-empty snapshot therefore requires an
+explicit zero.
 Any snapshot with active work requires complete startup evidence, including
 while draining or unhealthy.
 
@@ -183,8 +185,54 @@ Kubernetes objects, choose a replica count, persist controller status, or elect
 a writer. A multi-gateway deployment must implement the protocol with a shared,
 durable dispatch fence before using its authorization for Pod deletion.
 
+## Crash backoff and failure-domain quarantine
+
+`RunnerFailureGuard` consumes immutable `unhealthy` transitions. A transition
+is counted exactly once by `runner_id + state_version`; an exact replay is
+idempotent and a conflicting replay fails closed. A separate window-bounded
+observation tombstone retains this identity even when a domain has no action or
+its bounded event list evicts the original row. Tombstone capacity overflow is
+rejected atomically rather than weakening deduplication. The stateful reconciler
+submits its complete updated view through `record_many()` before committing its
+own state, so a guard capacity/error rejection leaves both components unchanged.
+Failure scopes are explicit in `RunnerFailure.domain` rather than inferred from
+free-form messages:
+
+- revision failures use the complete `release_id + model_id + model_revision`
+  identity, preventing one poisoned release from suppressing another;
+- node failures use the stable Kubernetes node name and apply across releases;
+- GPU failures use physical GPU UUIDs and apply across nodes/releases. When a
+  Pod reports more than one GPU and the source cannot identify the exact device,
+  every assigned UUID is conservatively fenced.
+
+The reconciler marks image-pull failures, OOM, crash loops, non-zero container
+exit, Pod failure, and fatal runtime readiness as revision-scoped; GPU Xid as
+GPU-scoped; and unknown Pod state as node-scoped. Startup-owned failures without
+an explicit scope are revision-scoped because their immutable startup report
+binds them to the release/model revision. Transient serving-gate loss without a
+fatal classification does not poison a domain.
+
+`RunnerBackoffPolicy` bounds the base delay, exponential factor, maximum delay,
+failure window, quarantine threshold/duration, retained events per domain, and
+total domain count. Before the threshold, `RunnerBackoffDecision` exposes an
+exponential `backoff_until`; at the threshold it also exposes a time-bounded
+`quarantine_until`. `blocked_domains()` evaluates all currently known revision,
+node, and GPU identities for a candidate placement. A capacity overflow raises
+instead of silently dropping an active quarantine.
+
+`RunnerFailureGuardSnapshot` serializes the policy, bounded event ledgers, and
+quarantine deadlines in deterministic order. Active quarantine retains its
+threshold evidence beyond the ordinary failure window, and snapshot validation
+reconstructs each bounded domain ledger from the tombstones and recomputes the
+exact deadline from that evidence and policy. Restored guards reject clock
+rollback, future evidence, changed replays, missing node/GPU identity,
+one-sided/corrupt ledgers, and out-of-capacity state. The snapshot is the
+persistence seam for the later single-writer controller; this slice itself
+performs no database or Kubernetes writes and assumes one event-loop/controller
+owner.
+
 ## Next integration boundary
 
-The next slice should implement crash backoff and quarantine keyed by revision,
-node, and GPU failure domain. Scale actuation, persistence, Kubernetes deletion,
-and leader election remain separate changes.
+The next slice should implement leader election and bind reconciler, failure
+guard, and later autoscaler mutations to one fenced writer. Scale actuation,
+durable persistence, and Kubernetes deletion remain separate changes.

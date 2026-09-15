@@ -53,6 +53,14 @@ class RunnerStartupPhaseOutcome(StrEnum):
     SKIPPED = "skipped"
 
 
+class RunnerFailureDomainKind(StrEnum):
+    """Failure scope used by bounded restart backoff and quarantine."""
+
+    REVISION = "revision"
+    NODE = "node"
+    GPU = "gpu"
+
+
 def _non_empty(value: str, *, name: str) -> str:
     if not value.strip():
         raise ValueError(f"{name} must be a non-empty string")
@@ -75,6 +83,7 @@ class RunnerFailure(BaseModel):
     code: str = Field(max_length=128)
     message: str = Field(max_length=1024)
     retryable: bool = False
+    domain: RunnerFailureDomainKind | None = None
 
     @field_validator("code", "message")
     @classmethod

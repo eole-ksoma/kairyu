@@ -7,6 +7,7 @@ import json
 from collections.abc import Mapping
 from datetime import datetime, timedelta
 
+from kairyu.runners.backoff import RunnerFailureGuard
 from kairyu.runners.drain import (
     RunnerDispatchFence,
     RunnerDrainController,
@@ -19,6 +20,7 @@ from kairyu.runners.lifecycle import (
 )
 from kairyu.runners.models import (
     RunnerFailure,
+    RunnerFailureDomainKind,
     RunnerStartupPhase,
     RunnerStartupReport,
     RunnerState,
@@ -77,10 +79,7 @@ def runner_is_routing_eligible(
 
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("now must be timezone-aware")
-    if (
-        serving_gates_observed_at.tzinfo is None
-        or serving_gates_observed_at.utcoffset() is None
-    ):
+    if serving_gates_observed_at.tzinfo is None or serving_gates_observed_at.utcoffset() is None:
         raise ValueError("serving_gates_observed_at must be timezone-aware")
     if max_observation_age <= timedelta(0):
         raise ValueError("max_observation_age must be positive")
@@ -96,8 +95,19 @@ def runner_is_routing_eligible(
     )
 
 
-def _failure(code: str, message: str, *, retryable: bool = False) -> RunnerFailure:
-    return RunnerFailure(code=code, message=message, retryable=retryable)
+def _failure(
+    code: str,
+    message: str,
+    *,
+    retryable: bool = False,
+    domain: RunnerFailureDomainKind | None = None,
+) -> RunnerFailure:
+    return RunnerFailure(
+        code=code,
+        message=message,
+        retryable=retryable,
+        domain=domain,
+    )
 
 
 def _runtime_fingerprint(runtime: RunnerRuntimeObservation) -> str:
@@ -120,13 +130,22 @@ def _observed_failure(observation: RunnerObservation) -> RunnerFailure | None:
 
     terminated = (pod.terminated_reason or "").lower()
     if terminated == "oomkilled":
-        return _failure("runner_oom", "container terminated: OOMKilled")
+        return _failure(
+            "runner_oom",
+            "container terminated: OOMKilled",
+            domain=RunnerFailureDomainKind.REVISION,
+        )
     if "xid" in terminated:
-        return _failure("gpu_xid", "container terminated after a GPU Xid error")
+        return _failure(
+            "gpu_xid",
+            "container terminated after a GPU Xid error",
+            domain=RunnerFailureDomainKind.GPU,
+        )
     if pod.exit_code is not None and pod.exit_code != 0:
         return _failure(
             "container_exit_nonzero",
             f"Runner container exited with code {pod.exit_code}",
+            domain=RunnerFailureDomainKind.REVISION,
         )
     waiting = (pod.waiting_reason or "").lower()
     if waiting in {"errimagepull", "imagepullbackoff", "invalidimagename"}:
@@ -134,26 +153,34 @@ def _observed_failure(observation: RunnerObservation) -> RunnerFailure | None:
             "image_pull_failed",
             f"container waiting reason: {pod.waiting_reason}",
             retryable=True,
+            domain=RunnerFailureDomainKind.REVISION,
         )
     if waiting == "crashloopbackoff":
         return _failure(
             "container_crash_loop",
             "Runner container entered CrashLoopBackOff",
             retryable=True,
+            domain=RunnerFailureDomainKind.REVISION,
         )
     if pod.phase is KubernetesPodPhase.FAILED:
         reason = pod.terminated_reason or "PodFailed"
-        return _failure("pod_failed", f"Pod entered Failed phase: {reason}")
+        return _failure(
+            "pod_failed",
+            f"Pod entered Failed phase: {reason}",
+            domain=RunnerFailureDomainKind.REVISION,
+        )
     if pod.phase is KubernetesPodPhase.UNKNOWN:
         return _failure(
             "pod_unknown",
             "Kubernetes could not determine the Pod phase",
             retryable=True,
+            domain=RunnerFailureDomainKind.NODE,
         )
     if runtime is not None and runtime.fatal:
         return _failure(
             "readiness_fatal",
             runtime.detail or "Runner reported a fatal readiness condition",
+            domain=RunnerFailureDomainKind.REVISION,
         )
     return None
 
@@ -257,6 +284,7 @@ def _desired_state(
         return RunnerState.UNHEALTHY, _failure(
             "pod_exited",
             "Serving Pod exited without a termination handshake",
+            domain=RunnerFailureDomainKind.REVISION,
         )
     if pod.phase is KubernetesPodPhase.PENDING:
         return (
@@ -264,9 +292,7 @@ def _desired_state(
             None,
         )
 
-    if pod.phase is KubernetesPodPhase.RUNNING and (
-        startup is None or not startup.completed
-    ):
+    if pod.phase is KubernetesPodPhase.RUNNING and (startup is None or not startup.completed):
         return _startup_state(startup), None
 
     all_serving_gates = _serving_gates_ready(observation, startup)
@@ -292,19 +318,12 @@ def _validate_identity(previous: RunnerStatus, observation: RunnerObservation) -
     if observation.observed_at < previous.observed_at:
         raise InvalidRunnerObservationError("Runner observations cannot move backwards")
     if observation.pod is not None:
-        if (
-            previous.node_name is not None
-            and observation.pod.node_name != previous.node_name
-        ):
+        if previous.node_name is not None and observation.pod.node_name != previous.node_name:
             raise InvalidRunnerObservationError("Runner node_name cannot change")
         if previous.gpu_uuids and observation.pod.gpu_uuids != previous.gpu_uuids:
             raise InvalidRunnerObservationError("Runner gpu_uuids cannot change")
     startup = None if observation.runtime is None else observation.runtime.startup
-    if (
-        previous.startup is not None
-        and observation.runtime is not None
-        and startup is None
-    ):
+    if previous.startup is not None and observation.runtime is not None and startup is None:
         raise InvalidRunnerObservationError("startup evidence cannot disappear")
     if previous.startup is not None and startup is not None:
         try:
@@ -349,11 +368,16 @@ def _advance(
             else:
                 next_state = _NORMAL_NEXT[current]
 
-        next_active = active_requests if next_state in {
-            RunnerState.BUSY,
-            RunnerState.DRAINING,
-            RunnerState.UNHEALTHY,
-        } else 0
+        next_active = (
+            active_requests
+            if next_state
+            in {
+                RunnerState.BUSY,
+                RunnerState.DRAINING,
+                RunnerState.UNHEALTHY,
+            }
+            else 0
+        )
         status = transition_runner_status(
             status,
             next_state,
@@ -397,10 +421,8 @@ def _effective_observation(
                 "runtime payload cannot change at an equal observation timestamp"
             )
     if runtime is not None and (
-        observation.observed_at - runtime.observed_at
-        > max_runtime_observation_age
-        or runtime.observed_at - observation.observed_at
-        > runtime_clock_skew_tolerance
+        observation.observed_at - runtime.observed_at > max_runtime_observation_age
+        or runtime.observed_at - observation.observed_at > runtime_clock_skew_tolerance
         or (
             previous is not None
             and previous.runtime_observed_at is not None
@@ -445,9 +467,7 @@ def reconcile_runner_status(
     else:
         active_requests = 0
     if active_requests > 0 and (startup is None or not startup.completed):
-        raise InvalidRunnerObservationError(
-            "active requests require completed startup evidence"
-        )
+        raise InvalidRunnerObservationError("active requests require completed startup evidence")
 
     target, failure = _desired_state(
         previous,
@@ -508,6 +528,7 @@ class RunnerStatusReconciler:
         serving_gate_failure_grace: timedelta = timedelta(seconds=5),
         max_runtime_observation_age: timedelta = timedelta(seconds=5),
         runtime_clock_skew_tolerance: timedelta = timedelta(seconds=2),
+        failure_guard: RunnerFailureGuard | None = None,
     ) -> None:
         if serving_gate_failure_grace <= timedelta(0):
             raise ValueError("serving_gate_failure_grace must be positive")
@@ -519,14 +540,15 @@ class RunnerStatusReconciler:
         for runner_id, status in initial.items():
             if runner_id != status.runner_id:
                 raise ValueError("initial status keys must match Runner IDs")
+        if failure_guard is not None and not isinstance(failure_guard, RunnerFailureGuard):
+            raise TypeError("failure_guard must be a RunnerFailureGuard")
         self._statuses = initial
+        self._failure_guard = failure_guard
         self._serving_gate_failure_grace = serving_gate_failure_grace
         self._max_runtime_observation_age = max_runtime_observation_age
         self._runtime_clock_skew_tolerance = runtime_clock_skew_tolerance
         self._gate_loss_started_at: dict[str, datetime] = {}
-        self._serving_gates: dict[str, bool] = {
-            runner_id: False for runner_id in initial
-        }
+        self._serving_gates: dict[str, bool] = {runner_id: False for runner_id in initial}
         self._serving_gate_observed_at: dict[str, datetime] = {}
         self._last_observed_at: datetime | None = None
         self._last_source_started_at: datetime | None = None
@@ -535,6 +557,10 @@ class RunnerStatusReconciler:
     @property
     def statuses(self) -> dict[str, RunnerStatus]:
         return dict(self._statuses)
+
+    @property
+    def failure_guard(self) -> RunnerFailureGuard | None:
+        return self._failure_guard
 
     def routing_eligible(
         self,
@@ -568,9 +594,7 @@ class RunnerStatusReconciler:
 
         status = self._statuses.get(fence.runner_id)
         if status is None:
-            raise InvalidRunnerObservationError(
-                "termination fence references an unknown Runner"
-            )
+            raise InvalidRunnerObservationError("termination fence references an unknown Runner")
         authorized = authorize_runner_termination(
             status,
             fence,
@@ -593,16 +617,12 @@ class RunnerStatusReconciler:
             self._last_source_started_at is not None
             and batch.source_started_at < self._last_source_started_at
         ):
-            raise InvalidRunnerObservationError(
-                "observation source times cannot move backwards"
-            )
+            raise InvalidRunnerObservationError("observation source times cannot move backwards")
         previous_epoch = self._source_epochs.get(batch.source_id)
         if previous_epoch is not None and batch.source_epoch <= previous_epoch:
             raise InvalidRunnerObservationError("source epochs must increase monotonically")
         observed = {item.runner_id: item for item in batch.runners}
-        missing_runtime = {
-            item.runner_id: item for item in batch.missing_runner_runtime
-        }
+        missing_runtime = {item.runner_id: item for item in batch.missing_runner_runtime}
         unknown_runtime = set(missing_runtime) - set(self._statuses)
         if unknown_runtime:
             raise InvalidRunnerObservationError(
@@ -668,6 +688,8 @@ class RunnerStatusReconciler:
                 runtime_clock_skew_tolerance=self._runtime_clock_skew_tolerance,
                 serving_gate_loss_confirmed=gate_loss_confirmed,
             )
+        if self._failure_guard is not None:
+            self._failure_guard.record_many(updated.values(), at=batch.observed_at)
         self._statuses = updated
         self._gate_loss_started_at = gate_loss_started_at
         self._serving_gates = serving_gates

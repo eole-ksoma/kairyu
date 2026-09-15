@@ -10,7 +10,11 @@ from kairyu.runners import (
     RUNNER_STARTUP_PHASES,
     InvalidRunnerObservationError,
     KubernetesPodPhase,
+    RunnerBackoffPolicy,
     RunnerFailure,
+    RunnerFailureCapacityError,
+    RunnerFailureDomainKind,
+    RunnerFailureGuard,
     RunnerObservation,
     RunnerObservationBatch,
     RunnerPodObservation,
@@ -24,6 +28,7 @@ from kairyu.runners import (
     RunnerTerminationAuthorization,
     complete_startup_phase,
     reconcile_runner_status,
+    revision_failure_domain,
     runner_is_routing_eligible,
     skip_startup_phase,
     start_startup_phase,
@@ -266,7 +271,7 @@ def test_complete_coherent_observation_reconstructs_ready_and_busy() -> None:
 
 
 @pytest.mark.parametrize(
-    ("pod", "runtime", "code"),
+    ("pod", "runtime", "code", "domain"),
     [
         (
             _pod(
@@ -276,6 +281,7 @@ def test_complete_coherent_observation_reconstructs_ready_and_busy() -> None:
             ),
             None,
             "image_pull_failed",
+            RunnerFailureDomainKind.REVISION,
         ),
         (
             _pod(
@@ -285,6 +291,7 @@ def test_complete_coherent_observation_reconstructs_ready_and_busy() -> None:
             ),
             None,
             "runner_oom",
+            RunnerFailureDomainKind.REVISION,
         ),
         (
             _pod(
@@ -294,6 +301,7 @@ def test_complete_coherent_observation_reconstructs_ready_and_busy() -> None:
             ),
             None,
             "gpu_xid",
+            RunnerFailureDomainKind.GPU,
         ),
         (
             _pod(
@@ -303,6 +311,7 @@ def test_complete_coherent_observation_reconstructs_ready_and_busy() -> None:
             ),
             None,
             "container_crash_loop",
+            RunnerFailureDomainKind.REVISION,
         ),
         (
             _pod(
@@ -313,6 +322,7 @@ def test_complete_coherent_observation_reconstructs_ready_and_busy() -> None:
             ),
             None,
             "container_exit_nonzero",
+            RunnerFailureDomainKind.REVISION,
         ),
         (
             _pod(),
@@ -324,6 +334,7 @@ def test_complete_coherent_observation_reconstructs_ready_and_busy() -> None:
                 startup=_complete_startup(),
             ),
             "readiness_fatal",
+            RunnerFailureDomainKind.REVISION,
         ),
     ],
 )
@@ -331,6 +342,7 @@ def test_failures_have_distinct_bounded_reason_codes(
     pod: RunnerPodObservation,
     runtime: RunnerRuntimeObservation | None,
     code: str,
+    domain: RunnerFailureDomainKind,
 ) -> None:
     status = reconcile_runner_status(
         None,
@@ -339,6 +351,7 @@ def test_failures_have_distinct_bounded_reason_codes(
     assert status.state is RunnerState.UNHEALTHY
     assert status.failure is not None
     assert status.failure.code == code
+    assert status.failure.domain is domain
 
 
 def test_startup_failure_is_preserved_as_authoritative_reason() -> None:
@@ -367,6 +380,73 @@ def test_startup_failure_is_preserved_as_authoritative_reason() -> None:
     )
     assert status.failure is not None
     assert status.failure.code == "registry_denied"
+
+
+def test_stateful_reconciler_records_failure_guard_once() -> None:
+    guard = RunnerFailureGuard()
+    reconciler = RunnerStatusReconciler(failure_guard=guard)
+    observation = _observation(
+        pod=_pod(
+            phase=KubernetesPodPhase.RUNNING,
+            ready=False,
+            waiting_reason="CrashLoopBackOff",
+        ),
+        endpoint_ready=False,
+        runtime=None,
+    )
+    observed_at = observation.observed_at
+    status = reconciler.reconcile(_batch(1, at=observed_at, runners=(observation,)))["pod-uid-a"]
+    assert status.state is RunnerState.UNHEALTHY
+    domain = revision_failure_domain(
+        release_id=status.release_id,
+        model_id=status.model_id,
+        model_revision=status.model_revision,
+    )
+    assert guard.decision(domain, at=observed_at).failure_count == 1
+
+    replay_at = observed_at + timedelta(seconds=1)
+    replay = observation.model_copy(update={"observed_at": replay_at})
+    reconciler.reconcile(
+        _batch(
+            2,
+            at=replay_at,
+            source_started_at=replay_at,
+            runners=(replay,),
+        )
+    )
+    assert guard.decision(domain, at=replay_at).failure_count == 1
+    assert len(guard.snapshot(at=replay_at).observations) == 1
+
+
+def test_failure_guard_capacity_failure_does_not_commit_reconciler_state() -> None:
+    guard = RunnerFailureGuard(RunnerBackoffPolicy(max_observations=1))
+    reconciler = RunnerStatusReconciler(failure_guard=guard)
+    first = _observation(
+        pod=_pod(
+            phase=KubernetesPodPhase.RUNNING,
+            ready=False,
+            waiting_reason="CrashLoopBackOff",
+        ),
+        endpoint_ready=False,
+        runtime=None,
+    )
+    assert first.pod is not None
+    second = first.model_copy(
+        update={
+            "runner_id": "pod-uid-b",
+            "pod": first.pod.model_copy(update={"uid": "pod-uid-b"}),
+        }
+    )
+    with pytest.raises(RunnerFailureCapacityError, match="observations"):
+        reconciler.reconcile(
+            _batch(
+                1,
+                at=first.observed_at,
+                runners=(first, second),
+            )
+        )
+    assert reconciler.statuses == {}
+    assert guard.snapshot(at=first.observed_at).observations == ()
 
 
 def test_ready_gate_loss_fails_closed_and_cannot_self_recover() -> None:
@@ -413,19 +493,20 @@ def test_missing_runtime_observation_preserves_startup_and_fails_closed() -> Non
 
 
 def test_stateful_reconciler_debounces_cross_resource_gate_skew() -> None:
-    reconciler = RunnerStatusReconciler(
-        serving_gate_failure_grace=timedelta(seconds=5)
-    )
+    reconciler = RunnerStatusReconciler(serving_gate_failure_grace=timedelta(seconds=5))
     ready_observation = _ready_observation()
     ready = reconciler.reconcile(
         _batch(1, at=ready_observation.observed_at, runners=(ready_observation,))
     )["pod-uid-a"]
     assert ready.state is RunnerState.READY
-    assert reconciler.routing_eligible(
-        "pod-uid-a",
-        now=ready.observed_at,
-        max_observation_age=timedelta(seconds=5),
-    ) is True
+    assert (
+        reconciler.routing_eligible(
+            "pod-uid-a",
+            now=ready.observed_at,
+            max_observation_age=timedelta(seconds=5),
+        )
+        is True
+    )
 
     skewed = _observation(
         at=NOW + timedelta(seconds=21),
@@ -438,26 +519,30 @@ def test_stateful_reconciler_debounces_cross_resource_gate_skew() -> None:
             startup=_complete_startup(),
         ),
     )
-    held = reconciler.reconcile(_batch(2, at=skewed.observed_at, runners=(skewed,)))[
-        "pod-uid-a"
-    ]
+    held = reconciler.reconcile(_batch(2, at=skewed.observed_at, runners=(skewed,)))["pod-uid-a"]
     assert held.state is RunnerState.READY
-    assert reconciler.routing_eligible(
-        "pod-uid-a",
-        now=held.observed_at,
-        max_observation_age=timedelta(seconds=5),
-    ) is False
+    assert (
+        reconciler.routing_eligible(
+            "pod-uid-a",
+            now=held.observed_at,
+            max_observation_age=timedelta(seconds=5),
+        )
+        is False
+    )
 
     recovered_observation = _ready_observation(at=NOW + timedelta(seconds=22))
     recovered = reconciler.reconcile(
         _batch(3, at=recovered_observation.observed_at, runners=(recovered_observation,))
     )["pod-uid-a"]
     assert recovered.state is RunnerState.READY
-    assert reconciler.routing_eligible(
-        "pod-uid-a",
-        now=recovered.observed_at,
-        max_observation_age=timedelta(seconds=5),
-    ) is True
+    assert (
+        reconciler.routing_eligible(
+            "pod-uid-a",
+            now=recovered.observed_at,
+            max_observation_age=timedelta(seconds=5),
+        )
+        is True
+    )
 
     first_loss_at = NOW + timedelta(seconds=23)
     for epoch, offset in ((4, 0), (5, 0.02)):
@@ -473,9 +558,7 @@ def test_stateful_reconciler_debounces_cross_resource_gate_skew() -> None:
                 startup=_complete_startup(),
             ),
         )
-        held = reconciler.reconcile(_batch(epoch, at=at, runners=(rapid_loss,)))[
-            "pod-uid-a"
-        ]
+        held = reconciler.reconcile(_batch(epoch, at=at, runners=(rapid_loss,)))["pod-uid-a"]
         assert held.state is RunnerState.READY
 
     confirmed_at = first_loss_at + timedelta(seconds=5)
@@ -490,9 +573,9 @@ def test_stateful_reconciler_debounces_cross_resource_gate_skew() -> None:
             startup=_complete_startup(),
         ),
     )
-    unhealthy = reconciler.reconcile(
-        _batch(6, at=confirmed_at, runners=(confirmed_loss,))
-    )["pod-uid-a"]
+    unhealthy = reconciler.reconcile(_batch(6, at=confirmed_at, runners=(confirmed_loss,)))[
+        "pod-uid-a"
+    ]
     assert unhealthy.state is RunnerState.UNHEALTHY
 
 
@@ -500,28 +583,32 @@ def test_routing_lease_expires_when_observation_loop_stops() -> None:
     reconciler = RunnerStatusReconciler()
     observation = _ready_observation()
     reconciler.reconcile(_batch(1, at=observation.observed_at, runners=(observation,)))
-    assert reconciler.routing_eligible(
-        "pod-uid-a",
-        now=observation.observed_at + timedelta(seconds=6),
-        max_observation_age=timedelta(seconds=5),
-    ) is False
+    assert (
+        reconciler.routing_eligible(
+            "pod-uid-a",
+            now=observation.observed_at + timedelta(seconds=6),
+            max_observation_age=timedelta(seconds=5),
+        )
+        is False
+    )
 
 
 def test_routing_fails_closed_when_caller_clock_is_behind_observations() -> None:
     status = reconcile_runner_status(None, _ready_observation())
-    assert runner_is_routing_eligible(
-        status,
-        serving_gates_ready=True,
-        serving_gates_observed_at=status.observed_at,
-        now=status.observed_at - timedelta(milliseconds=1),
-        max_observation_age=timedelta(seconds=5),
-    ) is False
+    assert (
+        runner_is_routing_eligible(
+            status,
+            serving_gates_ready=True,
+            serving_gates_observed_at=status.observed_at,
+            now=status.observed_at - timedelta(milliseconds=1),
+            max_observation_age=timedelta(seconds=5),
+        )
+        is False
+    )
 
 
 def test_runtime_freshness_is_not_extended_by_the_routing_lease() -> None:
-    reconciler = RunnerStatusReconciler(
-        max_runtime_observation_age=timedelta(seconds=5)
-    )
+    reconciler = RunnerStatusReconciler(max_runtime_observation_age=timedelta(seconds=5))
     runtime_at = NOW + timedelta(seconds=20)
     source_started_at = runtime_at + timedelta(seconds=4, milliseconds=900)
     completed_at = source_started_at + timedelta(milliseconds=100)
@@ -545,11 +632,14 @@ def test_runtime_freshness_is_not_extended_by_the_routing_lease() -> None:
         )
     )["pod-uid-a"]
     assert status.state is RunnerState.READY
-    assert reconciler.routing_eligible(
-        "pod-uid-a",
-        now=runtime_at + timedelta(seconds=5, milliseconds=1),
-        max_observation_age=timedelta(seconds=5),
-    ) is False
+    assert (
+        reconciler.routing_eligible(
+            "pod-uid-a",
+            now=runtime_at + timedelta(seconds=5, milliseconds=1),
+            max_observation_age=timedelta(seconds=5),
+        )
+        is False
+    )
 
 
 def test_equal_runtime_timestamp_requires_an_identical_payload() -> None:
@@ -576,25 +666,19 @@ def test_equal_runtime_timestamp_requires_an_identical_payload() -> None:
         endpoint_ready=True,
         runtime=first_observation.runtime,
     )
-    repeated = reconciler.reconcile(
-        _batch(2, at=replay.observed_at, runners=(replay,))
-    )
+    repeated = reconciler.reconcile(_batch(2, at=replay.observed_at, runners=(replay,)))
     assert repeated["pod-uid-a"].state is RunnerState.BUSY
     assert repeated["pod-uid-a"].active_requests == 2
 
     changed = replay.model_copy(
         update={
             "observed_at": NOW + timedelta(seconds=22),
-            "runtime": first_observation.runtime.model_copy(
-                update={"active_requests": 0}
-            ),
+            "runtime": first_observation.runtime.model_copy(update={"active_requests": 0}),
         }
     )
     restarted = RunnerStatusReconciler(repeated)
     with pytest.raises(InvalidRunnerObservationError, match="payload cannot change"):
-        restarted.reconcile(
-            _batch(3, at=changed.observed_at, runners=(changed,))
-        )
+        restarted.reconcile(_batch(3, at=changed.observed_at, runners=(changed,)))
     assert restarted.statuses == repeated
     assert initial["pod-uid-a"].active_requests == 2
 
@@ -613,11 +697,14 @@ def test_slow_kubernetes_poll_does_not_refresh_old_serving_gates() -> None:
         )
     )["pod-uid-a"]
     assert status.state is RunnerState.READY
-    assert reconciler.routing_eligible(
-        "pod-uid-a",
-        now=completed_at,
-        max_observation_age=timedelta(seconds=5),
-    ) is False
+    assert (
+        reconciler.routing_eligible(
+            "pod-uid-a",
+            now=completed_at,
+            max_observation_age=timedelta(seconds=5),
+        )
+        is False
+    )
 
 
 def test_stale_runtime_zero_cannot_authorize_termination() -> None:
@@ -924,17 +1011,13 @@ def test_full_epoch_rejects_stale_source_time_and_duplicate_epoch() -> None:
             )
         )
     with pytest.raises(InvalidRunnerObservationError, match="source epochs"):
-        reconciler.reconcile(
-            _batch(1, at=NOW + timedelta(seconds=22))
-        )
+        reconciler.reconcile(_batch(1, at=NOW + timedelta(seconds=22)))
 
 
 def test_missing_pod_runtime_zero_is_retained_for_later_drain_handshake() -> None:
     reconciler = RunnerStatusReconciler()
     busy_observation = _ready_observation(active_requests=2)
-    reconciler.reconcile(
-        _batch(1, at=busy_observation.observed_at, runners=(busy_observation,))
-    )
+    reconciler.reconcile(_batch(1, at=busy_observation.observed_at, runners=(busy_observation,)))
     zero = _runtime(
         at=NOW + timedelta(seconds=21),
         ready=False,

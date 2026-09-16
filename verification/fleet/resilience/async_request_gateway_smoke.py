@@ -16,6 +16,7 @@ from typing import Any
 import httpx
 
 GATEWAY_IDS = ("a", "b", "c")
+TERMINAL_STATES = ("succeeded", "failed", "cancelled", "expired")
 STORE_ID = "kairyu-f1c-async"
 MODEL = "async-smoke"
 FAILOVER_MODEL = "async-failover-smoke"
@@ -32,6 +33,19 @@ def metric_value(text: str, name: str, **labels: str) -> float:
         if all(f'{key}="{value}"' in label_text for key, value in labels.items()):
             return float(raw_value)
     raise KeyError(f"metric sample {name!r} with labels {labels!r} was not found")
+
+
+def terminal_state_counts(text: str) -> dict[str, float]:
+    """Read the terminal request gauges from one shared metrics snapshot."""
+    return {
+        state: metric_value(
+            text,
+            "kairyu_async_request_state",
+            store=STORE_ID,
+            state=state,
+        )
+        for state in TERMINAL_STATES
+    }
 
 
 def rank_gateways(session_id: str) -> tuple[str, ...]:
@@ -688,11 +702,14 @@ class Smoke:
             raise AssertionError("gateways exposed inconsistent shared queue metrics")
 
         reference = snapshots["a"]
-        if metric_value(
-            reference,
-            "kairyu_async_request_queue_depth",
-            store=STORE_ID,
-        ) != 0:
+        if (
+            metric_value(
+                reference,
+                "kairyu_async_request_queue_depth",
+                store=STORE_ID,
+            )
+            != 0
+        ):
             raise AssertionError("completed smoke left durable work queued")
         minimums = {
             ("kairyu_async_request_transitions_total", "reclaim"): 1,
@@ -729,18 +746,27 @@ class Smoke:
 
     def retention_and_audit_archive(self) -> None:
         request_id = str(self.checks[0]["request_id"])
-        before_text = self._request("GET", "/metrics", gateway_id="a").text
-        before_succeeded = metric_value(
-            before_text,
-            "kairyu_async_request_state",
-            store=STORE_ID,
-            state="succeeded",
+        before_terminal_count = int(
+            self._sql_scalar(
+                "SELECT COALESCE(sum(total), 0) "
+                "FROM async_request_state_shards "
+                f"WHERE store_id = '{STORE_ID}' "
+                "AND state IN ('succeeded', 'failed', 'cancelled', 'expired')"
+            )
         )
-        before_transitions = metric_value(
-            before_text,
-            "kairyu_async_request_transitions_total",
-            store=STORE_ID,
-            event="succeed",
+        before_succeeded = int(
+            self._sql_scalar(
+                "SELECT COALESCE(sum(total), 0) "
+                "FROM async_request_state_shards "
+                f"WHERE store_id = '{STORE_ID}' AND state = 'succeeded'"
+            )
+        )
+        before_transitions = int(
+            self._sql_scalar(
+                "SELECT COALESCE(sum(total), 0) "
+                "FROM async_request_metric_shards "
+                f"WHERE store_id = '{STORE_ID}' AND event = 'succeed'"
+            )
         )
         self._retention_cli("--mode", "prepare", "--apply")
         safe_request_id = request_id.replace("'", "''")
@@ -756,6 +782,17 @@ class Smoke:
         preview, preview_output = self._retention_cli("--mode", "purge")
         if preview.get("applied") is not False:
             raise AssertionError("retention preview unexpectedly mutated data")
+        preview_work = sum(
+            int(preview.get(field, 0))
+            for field in (
+                "terminal_requests_deleted",
+                "audit_events_archived",
+                "audit_events_deleted",
+                "owner_deferrals_deleted",
+            )
+        )
+        if preview_work < 1 and preview.get("has_more") is not True:
+            raise AssertionError(f"retention preview found no eligible work: {preview}")
         self._status(request_id, "b")
         applied, applied_output = self._retention_cli(
             "--mode",
@@ -764,8 +801,9 @@ class Smoke:
             "--max-batches",
             "10",
         )
-        if int(applied.get("terminal_requests_deleted", 0)) != 1:
-            raise AssertionError(f"retention did not delete one request: {applied}")
+        deleted_requests = int(applied.get("terminal_requests_deleted", 0))
+        if deleted_requests < 1:
+            raise AssertionError(f"retention did not delete the target request: {applied}")
         archived = int(
             self._sql_scalar(
                 "SELECT count(*) FROM async_request_claim_audit_archive "
@@ -785,11 +823,11 @@ class Smoke:
         deadline = time.monotonic() + self._timeout_seconds
         while time.monotonic() < deadline:
             current = self._request("GET", "/metrics", gateway_id="c").text
-            current_succeeded = metric_value(
+            current_terminal = terminal_state_counts(current)
+            snapshot_success = metric_value(
                 current,
-                "kairyu_async_request_state",
+                "kairyu_async_request_metrics_snapshot_success",
                 store=STORE_ID,
-                state="succeeded",
             )
             current_transitions = metric_value(
                 current,
@@ -798,7 +836,9 @@ class Smoke:
                 event="succeed",
             )
             if (
-                current_succeeded == before_succeeded - 1
+                snapshot_success == 1
+                and sum(current_terminal.values()) == before_terminal_count - deleted_requests
+                and current_terminal["succeeded"] <= before_succeeded - 1
                 and current_transitions == before_transitions
             ):
                 break

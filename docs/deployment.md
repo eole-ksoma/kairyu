@@ -503,7 +503,9 @@ It runs the existing F1c shared-store gate before checking cross-gateway
 idempotency and reads, remote cancellation, deadline expiry, a concurrent
 768 KiB submit and responsiveness probe, lease-fenced takeover after killing
 the active owner, and persistence plus new work after a PostgreSQL process
-restart. Use `--keep-cluster` only for inspection; the default collects the
+restart. The registered live smoke entrypoint is
+`verification/fleet/resilience/async_request_gateway_smoke.py`. Use
+`--keep-cluster` only for inspection; the default collects the
 report, claim audit, Kubernetes state/events, and service logs before bounded
 cluster cleanup. Evidence is written below
 `bench/results/async-request-kind-live/`, which is an ignored local directory.

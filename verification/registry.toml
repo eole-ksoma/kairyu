@@ -44,6 +44,20 @@ installed = false
 invocations = ["path", "module"]
 
 [[entrypoints]]
+path = "verification/fleet/resilience/async_request_gateway_smoke.py"
+module = "verification.fleet.resilience.async_request_gateway_smoke"
+id = "fleet.resilience.async_request_gateway_smoke"
+scope = "fleet"
+kind = "resilience"
+output_schema = "entrypoint-defined"
+entrypoint_class = "formal-gate"
+formal = true
+requires = ["kubernetes", "postgres", "service"]
+documentation = ["verification/README.md", "docs/deployment.md"]
+installed = false
+invocations = ["path", "module"]
+
+[[entrypoints]]
 path = "verification/l1/performance/attention_backend_profile_bench.py"
 module = "verification.l1.performance.attention_backend_profile_bench"
 id = "l1.performance.attention_backend_profile_bench"

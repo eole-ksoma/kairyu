@@ -8,6 +8,7 @@ from verification.fleet.resilience.async_request_gateway_smoke import (
     metric_value,
     rank_gateways,
     sessions_by_gateway,
+    terminal_state_counts,
 )
 from verification.fleet.resilience.fleet_gateway_bench import (
     wall_clock_envelope_contains,
@@ -38,10 +39,9 @@ def test_cross_process_clock_envelope_has_a_narrow_explicit_tolerance():
 
 def test_metric_value_ignores_prometheus_label_order():
     text = (
-        '# HELP kairyu_async_request_transitions_total test\n'
+        "# HELP kairyu_async_request_transitions_total test\n"
         'kairyu_async_request_transitions_total{event="reclaim",store="shared"} 2.0\n'
     )
-
     assert (
         metric_value(
             text,
@@ -51,6 +51,25 @@ def test_metric_value_ignores_prometheus_label_order():
         )
         == 2
     )
+
+
+def test_terminal_state_counts_reads_every_terminal_gauge():
+    text = "\n".join(
+        f'kairyu_async_request_state{{state="{state}",store="kairyu-f1c-async"}} {count}'
+        for state, count in {
+            "succeeded": 3,
+            "failed": 0,
+            "cancelled": 2,
+            "expired": 1,
+        }.items()
+    )
+
+    assert terminal_state_counts(text) == {
+        "succeeded": 3,
+        "failed": 0,
+        "cancelled": 2,
+        "expired": 1,
+    }
 
 
 def test_sessions_target_every_gateway_deterministically():

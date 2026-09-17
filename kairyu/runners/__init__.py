@@ -87,6 +87,14 @@ from kairyu.runners.reconciler import (
     reconcile_runner_status,
     runner_is_routing_eligible,
 )
+from kairyu.runners.scale_actuator import (
+    InvalidKubernetesScaleResponseError,
+    KubernetesScalableKind,
+    KubernetesScaleActuator,
+    KubernetesScaleConflictError,
+    KubernetesScaleResult,
+    KubernetesScaleTarget,
+)
 from kairyu.runners.scaling import ScalingPolicy, ScalingPolicyCatalog
 from kairyu.runners.scaling_log import (
     InMemoryScalingDecisionLog,
@@ -116,10 +124,16 @@ __all__ = [
     "InvalidRunnerDrainEvidenceError",
     "InvalidRunnerFailureEvidenceError",
     "InvalidRunnerLeadershipError",
+    "InvalidKubernetesScaleResponseError",
     "InMemoryRunnerLeaderLeaseStore",
     "KubernetesPodPhase",
     "KubernetesRunnerPodSnapshot",
     "KubernetesRunnerWatcher",
+    "KubernetesScaleActuator",
+    "KubernetesScaleConflictError",
+    "KubernetesScaleResult",
+    "KubernetesScaleTarget",
+    "KubernetesScalableKind",
     "RunnerRuntimeSource",
     "RELEASE_ID_ANNOTATION",
     "RUNNER_CONTAINER_ANNOTATION",

@@ -14,6 +14,7 @@ from kairyu.runners import (
     ScalingDecisionAction,
     ScalingDecisionCapacityError,
     ScalingDecisionConflictError,
+    ScalingDecisionGenerationError,
     ScalingDecisionLog,
     ScalingDecisionReason,
     ScalingDecisionRecord,
@@ -457,6 +458,74 @@ def test_in_memory_log_is_idempotent_and_detects_conflicts() -> None:
     assert log.get(record.decision_id) == record
     with pytest.raises(ScalingDecisionConflictError):
         log.append(_record(reason=ScalingDecisionReason.HYSTERESIS))
+
+
+def test_log_allocates_mutation_generations_and_hold_does_not_consume() -> None:
+    log = InMemoryScalingDecisionLog()
+    first_draft = _record(
+        "scale-1",
+        action=ScalingDecisionAction.SCALE_UP,
+        reason=ScalingDecisionReason.QUEUE_PRESSURE,
+        desired_replicas=4,
+        target_delta=1,
+    )
+    first = log.append(first_draft)
+    hold = log.append(_record("hold-1"))
+    second = log.append(
+        _record(
+            "scale-2",
+            action=ScalingDecisionAction.SCALE_UP,
+            reason=ScalingDecisionReason.QUEUE_PRESSURE,
+            desired_replicas=4,
+            target_delta=1,
+        )
+    )
+
+    assert first.decision_generation == 1
+    assert hold.decision_generation is None
+    assert second.decision_generation == 2
+    assert log.append(first_draft) == first
+    assert log.append(first) == first
+
+
+def test_new_decision_cannot_forge_a_durable_generation() -> None:
+    log = InMemoryScalingDecisionLog()
+    draft = _record(
+        "scale-1",
+        action=ScalingDecisionAction.SCALE_UP,
+        reason=ScalingDecisionReason.QUEUE_PRESSURE,
+        desired_replicas=4,
+        target_delta=1,
+    )
+    forged = ScalingDecisionRecord.model_validate(
+        draft.model_copy(update={"decision_generation": 9}).model_dump()
+    )
+
+    with pytest.raises(ScalingDecisionGenerationError, match="must not supply"):
+        log.append(forged)
+
+
+def test_mutation_generation_allocation_is_atomic_per_model_class() -> None:
+    log = InMemoryScalingDecisionLog()
+    drafts = tuple(
+        _record(
+            f"scale-{index}",
+            action=ScalingDecisionAction.SCALE_UP,
+            reason=ScalingDecisionReason.QUEUE_PRESSURE,
+            desired_replicas=4,
+            target_delta=1,
+        )
+        for index in range(1, 17)
+    )
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = tuple(pool.map(log.append, drafts))
+
+    assert {record.decision_generation for record in results} == set(range(1, 17))
+
+
+def test_hold_cannot_be_labeled_with_a_mutation_generation() -> None:
+    with pytest.raises(ValidationError, match="cannot consume"):
+        _record(decision_generation=1)
 
 
 def test_in_memory_log_lists_newest_with_filters_and_limit() -> None:

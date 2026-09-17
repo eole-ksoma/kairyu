@@ -9,8 +9,9 @@ This slice fixes the controller-neutral contract, a read-only Kubernetes
 observation/reconciliation boundary, a fence-bound drain/termination handshake,
 bounded failure-domain backoff/quarantine, and a lease-fenced single-writer
 boundary. It also defines the immutable model-class scaling policy, observation
-window, and durable decision-log boundary. Durable Runner-state persistence,
-Kubernetes termination writes, and scale actuation remain later work.
+window, durable decision-log boundary, and leader-fenced scale actuation.
+Durable Runner-state persistence and Kubernetes termination writes remain later
+work.
 
 ## Identity and snapshot rules
 
@@ -277,10 +278,15 @@ The authority check never holds the coordination store lock while application
 code runs, so an expired leader cannot prevent takeover by hanging. Therefore
 the authority token must be persisted with any external decision and checked
 atomically by its mutation target; output from a callback that outlives its
-lease is stale even if the local function returns normally. WP3.4 remains
-responsible for propagating this token into the scale decision generation/CAS
-boundary. The current slice performs no Kubernetes mutation and does not add
-cluster RBAC.
+lease is stale even if the local function returns normally. WP3.4 implements
+that boundary as `claim_authority() -> observe/decide -> append ->
+apply_fenced()`. A successor first advances the token on the workload with a
+JSON Patch resourceVersion/UID CAS. The actuator then accepts a decision only
+when that exact token is still present. Both claim and actuation require one
+more store-authoritative reauthorization immediately before PATCH, so expiry
+detected by that final pre-PATCH check fails closed even before a successor
+claim. Cluster RBAC
+and admission policy remain deployment concerns.
 
 ## Model-class scaling policy
 
@@ -342,7 +348,13 @@ optional resource/startup evidence when present) and the copied policy's
 freshness lease; the persisted boolean and reason must agree with that result.
 Stale input may hold or perform a policy-step-bounded scale-up, but can never
 authorize scale-down. A canonical record fingerprint makes an exact retry
-idempotent and a changed retry under the same decision ID a conflict.
+idempotent and a changed retry under the same decision ID a conflict. The log
+atomically allocates a per-model `decision_generation` when a scale-up/down
+draft is first appended and binds it into that fingerprint. The same record
+also embeds the claimed election/token and exact workload kind, namespace,
+name, UID, generation, release, and model revision used to decide. HOLD records
+are explicitly generation-free and do not consume the mutation sequence. A
+caller cannot assign a generation to a new decision.
 
 If a newly resolved policy puts the currently observed replica count outside
 its bounds, one decision may remain outside the new range only while moving by
@@ -358,9 +370,13 @@ in-memory implementation is a bounded, thread-safe reference backend only.
 `PostgresScalingDecisionLog` is the shared production backend: an environment
 uses an explicit store ID, and that store durably fixes its capacity so two
 controllers cannot silently apply different bounds. A row lock on the registry
-serializes capacity checks and inserts. The primary key provides exactly-once
-decision IDs; reads revalidate both the JSON payload and its duplicated indexed
-metadata/fingerprint before returning it.
+serializes capacity checks, per-model mutation-generation allocation, and
+inserts. The primary key provides exactly-once decision IDs; reads revalidate
+both the JSON payload and its duplicated indexed metadata/fingerprint before
+returning it. Replaying either the original unallocated draft or the returned
+allocated record resolves to the same durable record. Optional WP3.4 fields are
+omitted from the canonical fingerprint when absent, preserving the fingerprint
+and readability of pre-WP3.4 schema-v1 rows.
 
 PostgreSQL objects live in the explicitly qualified `public` schema. Startup
 fails closed unless ordered columns, nullability, primary/foreign/check
@@ -370,16 +386,26 @@ and rechecked after reconnect. The schema is append-only through the public API;
 retention/export policy is deliberately deferred until evidence establishes an
 operational horizon.
 
-## Next integration boundary
+## Kubernetes scale actuation and next integration boundary
 
 WP3.3 consumes a validated decision record and applies its bounded desired
 replica count through the Deployment or StatefulSet `scale` subresource. The
 actuator reads the live `Scale`, skips exact retries and hold decisions, and
 uses its `resourceVersion` for a single idempotent write. Conflicts and malformed
-responses fail closed. Callers must enter through `mutate_autoscaler()` so only
-a fresh leader can begin the mutation; WP3.4 then makes this structural by
-propagating the leader fencing token and decision generation through that CAS
-boundary. The actuator therefore remains deliberately unwired and is not safe
-for production deployment until WP3.4 closes the post-authorization lease race.
-Durable Runner-status persistence and Kubernetes deletion remain separate
-changes.
+responses fail closed. WP3.4 adds the production ordering contract: callers
+enter through `mutate_autoscaler()`, persist the returned authority with
+`claim_authority()` before observing decision inputs, append the decision to
+obtain its durable generation, and call `apply_fenced()`. The parent workload
+JSON Patch tests resourceVersion, UID, workload generation, claimed authority,
+and live replicas while atomically changing replicas and recording decision
+generation, ID, and canonical fingerprint. Exact retries require the entire
+decision identity; later generations may supersede unapplied decisions but
+cannot move backwards. Stale leaders, reused generations, changed release
+or model revision, and malformed responses fail closed. The actuator also
+resolves the supplied decision by ID from its configured durable log and
+requires the complete fingerprint, so a caller-created generation is not an
+actuation capability. Parent workload PATCH is broader than scale-subresource
+RBAC, so deployment must use a dedicated service account and constrain the
+permitted workload/fields with admission policy. Quota/Kueue policy,
+cache-aware prewarm, scale-down drain integration, durable Runner status, and
+Kubernetes deletion remain separate changes.

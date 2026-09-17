@@ -10,8 +10,10 @@ from typing import Literal, Self
 
 from kairyu.runners.scaling import _MAX_SIGNED_BIGINT
 from kairyu.runners.scaling_log import (
+    ScalingDecisionAction,
     ScalingDecisionCapacityError,
     ScalingDecisionConflictError,
+    ScalingDecisionGenerationError,
     ScalingDecisionRecord,
     _aware,
     _non_empty,
@@ -491,7 +493,6 @@ class PostgresScalingDecisionLog:
 
     def append(self, record: ScalingDecisionRecord) -> ScalingDecisionRecord:
         record = self._validated(record)
-        fingerprint = record.fingerprint
         with self._lock:
             self._require_open()
             self._ensure_connection()
@@ -520,7 +521,12 @@ class PostgresScalingDecisionLog:
                     existing = cursor.fetchone()
                     if existing is not None:
                         stored = self._record(existing)
-                        if stored.fingerprint != fingerprint:
+                        matches = (
+                            stored.intent_fingerprint == record.intent_fingerprint
+                            if record.decision_generation is None
+                            else stored.fingerprint == record.fingerprint
+                        )
+                        if not matches:
                             raise ScalingDecisionConflictError(
                                 "decision ID was already used with different content"
                             )
@@ -539,6 +545,39 @@ class PostgresScalingDecisionLog:
                         raise ScalingDecisionCapacityError(
                             "decision log capacity is exhausted"
                         )
+                    if record.action is not ScalingDecisionAction.HOLD:
+                        if record.decision_generation is not None:
+                            raise ScalingDecisionGenerationError(
+                                "new scaling decisions must not supply decision_generation"
+                            )
+                        cursor.execute(
+                            """
+                            SELECT COALESCE(
+                                max((record ->> 'decision_generation')::bigint),
+                                0
+                            )
+                            FROM public.runner_scaling_decisions
+                            WHERE store_id = %s
+                              AND model_class = %s
+                              AND record ->> 'decision_generation' IS NOT NULL
+                            """,
+                            (self._store_id, record.policy.model_class),
+                        )
+                        generation_row = cursor.fetchone()
+                        assert generation_row is not None
+                        previous_generation = generation_row[0]
+                        if previous_generation >= _MAX_SIGNED_BIGINT:
+                            raise ScalingDecisionGenerationError(
+                                "scaling decision generation is exhausted"
+                            )
+                        record = ScalingDecisionRecord.model_validate(
+                            record.model_copy(
+                                update={
+                                    "decision_generation": previous_generation + 1
+                                }
+                            ).model_dump()
+                        )
+                    fingerprint = record.fingerprint
                     assert psycopg is not None
                     cursor.execute(
                         """

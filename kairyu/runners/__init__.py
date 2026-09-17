@@ -122,6 +122,17 @@ from kairyu.runners.scaling_log import (
     ScalingStartupPhaseMetrics,
     ScalingStartupSnapshot,
 )
+from kairyu.runners.scaling_quota import (
+    KueueScalingAdmission,
+    ScalingQuotaAdmission,
+    ScalingQuotaConstraint,
+    ScalingQuotaLimit,
+    ScalingQuotaScope,
+    ScalingQuotaSnapshot,
+    admit_scaling_quota,
+    kueue_scaling_workload_name,
+    parse_kueue_scaling_admission,
+)
 
 __all__ = [
     "RUNNER_STARTUP_PHASES",
@@ -193,6 +204,12 @@ __all__ = [
     "RunnerWriterAuthority",
     "ScalingPolicy",
     "ScalingPolicyCatalog",
+    "KueueScalingAdmission",
+    "ScalingQuotaAdmission",
+    "ScalingQuotaConstraint",
+    "ScalingQuotaLimit",
+    "ScalingQuotaScope",
+    "ScalingQuotaSnapshot",
     "InMemoryScalingDecisionLog",
     "ScalingDecisionAction",
     "ScalingDecisionCapacityError",
@@ -212,6 +229,9 @@ __all__ = [
     "StaleRunnerLeaderLeaseError",
     "ReplicaPoolDrainController",
     "authorize_runner_termination",
+    "admit_scaling_quota",
+    "kueue_scaling_workload_name",
+    "parse_kueue_scaling_admission",
     "candidate_failure_domains",
     "complete_startup_phase",
     "failure_domains_for_status",

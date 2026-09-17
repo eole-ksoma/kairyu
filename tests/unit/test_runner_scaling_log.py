@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 
@@ -10,6 +12,7 @@ from pydantic import ValidationError
 
 from kairyu.runners import (
     InMemoryScalingDecisionLog,
+    KueueScalingAdmission,
     RunnerStartupPhase,
     ScalingDecisionAction,
     ScalingDecisionCapacityError,
@@ -22,11 +25,17 @@ from kairyu.runners import (
     ScalingObservationWindow,
     ScalingPolicy,
     ScalingQueueSnapshot,
+    ScalingQuotaLimit,
+    ScalingQuotaScope,
+    ScalingQuotaSnapshot,
     ScalingResourceSnapshot,
     ScalingRunnerSnapshot,
     ScalingStartupPhaseMetrics,
     ScalingStartupSnapshot,
+    admit_scaling_quota,
+    kueue_scaling_workload_name,
 )
+from kairyu.runners.postgres_scaling_log import PostgresScalingDecisionLog
 
 NOW = datetime(2026, 9, 15, 6, 0, tzinfo=UTC)
 
@@ -143,6 +152,77 @@ def _record(
     }
     values.update(updates)
     return ScalingDecisionRecord(**values)
+
+
+def _quota_admission(
+    *,
+    requested: int,
+    tenant_limit: int = 50,
+    observed_at: datetime = NOW,
+):
+    snapshot = ScalingQuotaSnapshot(
+        snapshot_id="quota-snapshot-1",
+        quota_revision=7,
+        observed_at=observed_at,
+        tenant_id="tenant-a",
+        model_class="interactive-14b",
+        model_family="qwen",
+        gpus_per_replica=1,
+        target_reserved_gpus=tenant_limit,
+        limits=(
+            ScalingQuotaLimit(
+                scope=ScalingQuotaScope.CLUSTER,
+                quota_name="cluster",
+                hard_limit_gpus=100,
+                used_gpus_excluding_target=0,
+            ),
+            ScalingQuotaLimit(
+                scope=ScalingQuotaScope.MODEL_FAMILY,
+                quota_name="qwen",
+                hard_limit_gpus=50,
+                used_gpus_excluding_target=0,
+            ),
+            ScalingQuotaLimit(
+                scope=ScalingQuotaScope.TENANT_MODEL,
+                quota_name="tenant-a/interactive-14b",
+                hard_limit_gpus=tenant_limit,
+                used_gpus_excluding_target=0,
+            ),
+        ),
+        kueue=KueueScalingAdmission(
+            api_version="kueue.x-k8s.io/v1beta2",
+            namespace="tenant-a",
+            workload_name=kueue_scaling_workload_name(
+                target_kind="Deployment",
+                target_namespace="model-serving",
+                target_name="interactive-14b-runners",
+                target_uid="target-workload-uid",
+            ),
+            workload_uid="kueue-workload-uid",
+            workload_generation=2,
+            resource_version="99",
+            target_kind="Deployment",
+            target_namespace="model-serving",
+            target_name="interactive-14b-runners",
+            target_uid="target-workload-uid",
+            local_queue="serving",
+            cluster_queue="tenant-a-gpu",
+            pod_set_name="runners",
+            resource_flavor="h100-sxm",
+            priority_class_name="interactive-serving",
+            priority_class_group="kueue.x-k8s.io",
+            priority_class_kind="WorkloadPriorityClass",
+            priority=1000,
+            admitted=True,
+            admitted_pods=tenant_limit,
+            admitted_gpus=tenant_limit,
+        ),
+    )
+    return admit_scaling_quota(
+        snapshot,
+        current_replicas=3,
+        requested_replicas=requested,
+    )
 
 
 def test_observation_captures_all_planned_input_families() -> None:
@@ -263,6 +343,120 @@ def test_decision_persists_exact_window_policy_revision_and_reason() -> None:
     assert record.reason is ScalingDecisionReason.NO_CHANGE
     assert len(record.fingerprint) == 64
     assert ScalingDecisionRecord.model_validate_json(record.model_dump_json()) == record
+
+
+def test_legacy_schema_v1_fingerprint_and_postgres_row_remain_readable() -> None:
+    record = _record()
+    legacy_payload = record.model_dump(mode="json")
+    for optional_field in (
+        "decision_generation",
+        "target_revision",
+        "quota_admission",
+    ):
+        legacy_payload.pop(optional_field)
+    legacy_fingerprint = hashlib.sha256(
+        json.dumps(
+            legacy_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    row = (
+        record.decision_id,
+        record.policy.model_class,
+        record.decided_at,
+        record.window.started_at,
+        record.window.ended_at,
+        record.catalog_revision,
+        record.policy.policy_revision,
+        record.action.value,
+        legacy_fingerprint,
+        legacy_payload,
+    )
+
+    assert record.fingerprint == legacy_fingerprint
+    assert PostgresScalingDecisionLog._record(row) == record
+
+
+def test_decision_persists_unconstrained_quota_and_kueue_admission() -> None:
+    quota = _quota_admission(requested=6)
+    decision = _record(
+        action=ScalingDecisionAction.SCALE_UP,
+        reason=ScalingDecisionReason.QUEUE_PRESSURE,
+        quota_admission=quota,
+        desired_replicas=6,
+        target_delta=3,
+    )
+
+    assert decision.quota_admission == quota
+    assert decision.quota_admission.snapshot.kueue.cluster_queue == "tenant-a-gpu"
+
+
+def test_budget_limit_reason_is_derived_from_quota_clamp() -> None:
+    quota = _quota_admission(requested=8, tenant_limit=5)
+    decision = _record(
+        action=ScalingDecisionAction.SCALE_UP,
+        reason=ScalingDecisionReason.BUDGET_LIMIT,
+        quota_admission=quota,
+        demand_replicas=5,
+        buffered_target_replicas=8,
+        desired_replicas=5,
+        target_delta=2,
+    )
+
+    assert decision.quota_admission is not None
+    assert decision.quota_admission.requested_replicas == 8
+    assert decision.desired_replicas == 5
+    with pytest.raises(ValidationError, match="budget-limit reason"):
+        _record(
+            action=ScalingDecisionAction.SCALE_UP,
+            reason=ScalingDecisionReason.QUEUE_PRESSURE,
+            quota_admission=quota,
+            demand_replicas=5,
+            buffered_target_replicas=8,
+            desired_replicas=5,
+            target_delta=2,
+        )
+
+
+def test_stale_quota_evidence_cannot_authorize_scale_up() -> None:
+    quota = _quota_admission(
+        requested=6,
+        observed_at=NOW - timedelta(seconds=31),
+    )
+
+    with pytest.raises(ValidationError, match="stale quota evidence"):
+        _record(
+            action=ScalingDecisionAction.SCALE_UP,
+            reason=ScalingDecisionReason.QUEUE_PRESSURE,
+            quota_admission=quota,
+            desired_replicas=6,
+            target_delta=3,
+        )
+
+
+def test_stale_observation_reason_takes_precedence_over_quota_constraint() -> None:
+    quota = _quota_admission(
+        requested=8,
+        tenant_limit=5,
+        observed_at=NOW + timedelta(seconds=1),
+    )
+
+    decision = _record(
+        decided_at=NOW + timedelta(seconds=31),
+        action=ScalingDecisionAction.SCALE_UP,
+        reason=ScalingDecisionReason.STALE_OBSERVATIONS,
+        inputs_stale=True,
+        quota_admission=quota,
+        demand_replicas=5,
+        buffered_target_replicas=8,
+        desired_replicas=5,
+        target_delta=2,
+    )
+
+    assert decision.quota_admission is not None
+    assert decision.quota_admission.constrained is True
+    assert decision.reason is ScalingDecisionReason.STALE_OBSERVATIONS
 
 
 @pytest.mark.parametrize(

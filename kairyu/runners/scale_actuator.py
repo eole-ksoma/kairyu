@@ -23,6 +23,7 @@ from kairyu.runners.scaling_log import (
     ScalingDecisionRecord,
     ScalingDecisionTargetRevision,
 )
+from kairyu.runners.scaling_quota import ScalingQuotaAdmission
 
 SCALE_ELECTION_ID_ANNOTATION = "kairyu.ai/scale-election-id"
 SCALE_FENCING_TOKEN_ANNOTATION = "kairyu.ai/scale-fencing-token"
@@ -336,7 +337,8 @@ class KubernetesScaleActuator:
     """Apply validated decisions through Kubernetes optimistic concurrency.
 
     ``apply`` is the WP3.3 scale-subresource primitive and remains suitable for
-    isolated verification only. Production callers enter through
+    isolated verification only when ``allow_unfenced=True`` is explicitly set.
+    Production callers enter through
     ``LeaderFencedRunnerController.mutate_autoscaler`` and pass its authority to
     ``apply_fenced``. That path atomically patches replicas and monotonic fence
     annotations on the parent workload, so a superseded leader cannot write
@@ -354,6 +356,7 @@ class KubernetesScaleActuator:
         client: httpx.Client | None = None,
         close_client: bool | None = None,
         decision_log: ScalingDecisionLog | None = None,
+        allow_unfenced: bool = False,
         timeout_s: float = 10.0,
     ) -> None:
         if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)):
@@ -383,7 +386,10 @@ class KubernetesScaleActuator:
         self._closed = False
         if decision_log is not None and not isinstance(decision_log, ScalingDecisionLog):
             raise TypeError("decision_log must implement ScalingDecisionLog")
+        if type(allow_unfenced) is not bool:
+            raise TypeError("allow_unfenced must be a boolean")
         self._decision_log = decision_log
+        self._allow_unfenced = allow_unfenced
 
     def _url(self, target: KubernetesScaleTarget) -> str:
         namespace = quote(target.namespace, safe="")
@@ -464,6 +470,98 @@ class KubernetesScaleActuator:
         if refreshed.tenure != authority.tenure:
             raise KubernetesScaleConflictError(
                 "leader authority changed during Kubernetes mutation"
+            )
+        return refreshed
+
+    @staticmethod
+    def _reauthorize_quota(
+        decision: ScalingDecisionRecord,
+        reauthorize_quota: Callable[[], ScalingQuotaAdmission] | None,
+        *,
+        authority: RunnerWriterAuthority,
+    ) -> ScalingQuotaAdmission:
+        original = decision.quota_admission
+        if original is None:
+            raise ValueError("fenced scale-up requires a durable quota admission")
+        if not callable(reauthorize_quota):
+            raise TypeError("scale-up reauthorize_quota must be callable")
+        refreshed = reauthorize_quota()
+        if not isinstance(refreshed, ScalingQuotaAdmission):
+            raise TypeError("reauthorize_quota must return ScalingQuotaAdmission")
+        refreshed = ScalingQuotaAdmission.model_validate(refreshed.model_dump())
+        quota_age = (
+            authority.validated_at - refreshed.snapshot.observed_at
+        ).total_seconds()
+        if not 0 <= quota_age <= decision.policy.max_observation_age_seconds:
+            raise KubernetesScaleConflictError(
+                "quota authority is not fresh at final scale authorization"
+            )
+        original_kueue = original.snapshot.kueue
+        refreshed_kueue = refreshed.snapshot.kueue
+        original_kueue_identity = (
+            original_kueue.api_version,
+            original_kueue.namespace,
+            original_kueue.workload_name,
+            original_kueue.workload_uid,
+            original_kueue.workload_generation,
+            original_kueue.target_kind,
+            original_kueue.target_namespace,
+            original_kueue.target_name,
+            original_kueue.target_uid,
+            original_kueue.local_queue,
+            original_kueue.cluster_queue,
+            original_kueue.pod_set_name,
+            original_kueue.resource_flavor,
+            original_kueue.resource_name,
+            original_kueue.priority_class_name,
+            original_kueue.priority_class_group,
+            original_kueue.priority_class_kind,
+            original_kueue.priority_class_source,
+            original_kueue.priority,
+        )
+        refreshed_kueue_identity = (
+            refreshed_kueue.api_version,
+            refreshed_kueue.namespace,
+            refreshed_kueue.workload_name,
+            refreshed_kueue.workload_uid,
+            refreshed_kueue.workload_generation,
+            refreshed_kueue.target_kind,
+            refreshed_kueue.target_namespace,
+            refreshed_kueue.target_name,
+            refreshed_kueue.target_uid,
+            refreshed_kueue.local_queue,
+            refreshed_kueue.cluster_queue,
+            refreshed_kueue.pod_set_name,
+            refreshed_kueue.resource_flavor,
+            refreshed_kueue.resource_name,
+            refreshed_kueue.priority_class_name,
+            refreshed_kueue.priority_class_group,
+            refreshed_kueue.priority_class_kind,
+            refreshed_kueue.priority_class_source,
+            refreshed_kueue.priority,
+        )
+        if (
+            refreshed.snapshot.tenant_id != original.snapshot.tenant_id
+            or refreshed.snapshot.model_class != original.snapshot.model_class
+            or refreshed.snapshot.model_family != original.snapshot.model_family
+            or refreshed.snapshot.gpus_per_replica
+            != original.snapshot.gpus_per_replica
+            or refreshed.current_replicas != original.current_replicas
+            or refreshed.requested_replicas != original.requested_replicas
+            or refreshed.snapshot.observed_at < original.snapshot.observed_at
+            or refreshed.snapshot.quota_revision
+            < original.snapshot.quota_revision
+            or refreshed_kueue_identity != original_kueue_identity
+        ):
+            raise KubernetesScaleConflictError(
+                "quota authority changed during Kubernetes mutation"
+            )
+        if (
+            not refreshed_kueue.admitted
+            or refreshed.admitted_replicas < decision.desired_replicas
+        ):
+            raise KubernetesScaleConflictError(
+                "quota authority no longer admits the scaling decision"
             )
         return refreshed
 
@@ -615,6 +713,11 @@ class KubernetesScaleActuator:
         target: KubernetesScaleTarget,
     ) -> KubernetesScaleResult:
         """Apply one decision once; exact retries become read-only no-ops."""
+
+        if not self._allow_unfenced:
+            raise RuntimeError(
+                "unfenced scale writes are disabled; use apply_fenced in production"
+            )
 
         if not isinstance(decision, ScalingDecisionRecord):
             raise TypeError("decision must be a ScalingDecisionRecord")
@@ -829,6 +932,7 @@ class KubernetesScaleActuator:
         authority: RunnerWriterAuthority,
         fence: KubernetesScaleFence,
         reauthorize: Callable[[], RunnerWriterAuthority],
+        reauthorize_quota: Callable[[], ScalingQuotaAdmission] | None = None,
     ) -> KubernetesFencedScaleResult:
         """Apply a durable decision only under a previously claimed leader token."""
 
@@ -878,6 +982,11 @@ class KubernetesScaleActuator:
             and decision.decision_generation is None
         ):
             raise ValueError("mutating decision must be appended before fenced apply")
+        if (
+            decision.action is ScalingDecisionAction.SCALE_UP
+            and decision.quota_admission is None
+        ):
+            raise ValueError("fenced scale-up requires a durable quota admission")
 
         with self._lock:
             if self._closed:
@@ -1038,6 +1147,12 @@ class KubernetesScaleActuator:
                 for name, value in annotations.items()
             )
             authority = self._reauthorize(authority, reauthorize)
+            if decision.action is ScalingDecisionAction.SCALE_UP:
+                self._reauthorize_quota(
+                    decision,
+                    reauthorize_quota,
+                    authority=authority,
+                )
             response = self._client.patch(
                 url,
                 headers={**headers, "Content-Type": "application/json-patch+json"},

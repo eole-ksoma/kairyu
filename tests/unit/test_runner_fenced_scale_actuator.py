@@ -20,6 +20,11 @@ from kairyu.runners import (
     RunnerWriterAuthority,
 )
 from kairyu.runners.kubernetes import MODEL_REVISION_ANNOTATION, RELEASE_ID_ANNOTATION
+from kairyu.runners.models import (
+    RunnerState,
+    RunnerStatus,
+    RunnerTerminationAuthorization,
+)
 from kairyu.runners.prewarm import (
     ModelCachePlacement,
     ModelCachePlacementState,
@@ -31,16 +36,24 @@ from kairyu.runners.scale_actuator import (
     SCALE_DECISION_FINGERPRINT_ANNOTATION,
     SCALE_DECISION_GENERATION_ANNOTATION,
     SCALE_DECISION_ID_ANNOTATION,
+    SCALE_DOWN_DRAIN_FINALIZER,
     SCALE_ELECTION_ID_ANNOTATION,
     SCALE_FENCING_TOKEN_ANNOTATION,
     InvalidKubernetesScaleResponseError,
     KubernetesScalableKind,
     KubernetesScaleActuator,
+    KubernetesScaleCleanupPendingError,
     KubernetesScaleConflictError,
     KubernetesScaleFence,
     KubernetesScaleTarget,
 )
 from kairyu.runners.scaling import ScalingPolicy
+from kairyu.runners.scaling_drain import (
+    ScalingDrainCandidate,
+    ScalingDrainPlan,
+    ScalingDrainSnapshot,
+    plan_statefulset_scale_down,
+)
 from kairyu.runners.scaling_log import (
     ScalingDecisionAction,
     ScalingDecisionReason,
@@ -195,6 +208,72 @@ def _refresh_prewarm(
     )
 
 
+def _drain_plan(
+    *,
+    current: int = 4,
+    desired: int = 2,
+    observed_at: datetime = NOW,
+    drain_revision: int = 7,
+    fence_prefix: str = "fence",
+    status_observed_at: datetime | None = None,
+) -> ScalingDrainPlan:
+    status_observed_at = status_observed_at or observed_at
+    candidates = []
+    for ordinal in range(desired, current):
+        authorization = RunnerTerminationAuthorization(
+            runner_id=f"runner-{ordinal}",
+            pod_uid=f"pod-uid-{ordinal}",
+            fence_id=f"{fence_prefix}-{ordinal}",
+            fence_sequence=ordinal + 1,
+            drain_state_version=6,
+            replica_generation=f"replica-generation-{ordinal}",
+            dispatch_stopped_at=status_observed_at - timedelta(seconds=3),
+            routing_excluded_at=status_observed_at - timedelta(seconds=2),
+            activity_observed_at=status_observed_at - timedelta(seconds=1),
+            authorized_at=status_observed_at - timedelta(seconds=1),
+        )
+        status = RunnerStatus(
+            runner_id=f"runner-{ordinal}",
+            release_id="release-a",
+            model_id="qwen",
+            model_revision="model-revision-a",
+            state=RunnerState.TERMINATING,
+            state_version=7,
+            state_changed_at=status_observed_at - timedelta(seconds=1),
+            observed_at=status_observed_at,
+            node_name=f"gpu-node-{ordinal}",
+            pod_uid=f"pod-uid-{ordinal}",
+            gpu_uuids=(f"GPU-{ordinal}",),
+            active_requests=0,
+            termination_authorization=authorization,
+        )
+        candidates.append(
+            ScalingDrainCandidate(
+                pod_name=f"qwen-14b-runners-{ordinal}",
+                workload_ordinal=ordinal,
+                status=status,
+            )
+        )
+    snapshot = ScalingDrainSnapshot(
+        snapshot_id=f"drain-{drain_revision}",
+        drain_revision=drain_revision,
+        observed_at=observed_at,
+        model_class="qwen-14b",
+        namespace="model-serving",
+        statefulset_name="qwen-14b-runners",
+        workload_uid="workload-uid",
+        workload_generation=7,
+        release_id="release-a",
+        model_revision="model-revision-a",
+        candidates=tuple(candidates),
+    )
+    return plan_statefulset_scale_down(
+        snapshot,
+        current_replicas=current,
+        desired_replicas=desired,
+    )
+
+
 def _decision(
     *,
     action: ScalingDecisionAction = ScalingDecisionAction.SCALE_UP,
@@ -202,6 +281,7 @@ def _decision(
     current: int = 2,
     decision_id: str = "decision-a",
     target_revision: ScalingDecisionTargetRevision | None = None,
+    drain_plan: ScalingDrainPlan | None = None,
 ) -> ScalingDecisionRecord:
     observation = ScalingObservation(
         observation_id=f"observation-{decision_id}",
@@ -255,11 +335,16 @@ def _decision(
             if action is ScalingDecisionAction.SCALE_UP
             else None
         ),
+        drain_plan=drain_plan,
         action=action,
         reason=(
             ScalingDecisionReason.NO_CHANGE
             if action is ScalingDecisionAction.HOLD
-            else ScalingDecisionReason.QUEUE_PRESSURE
+            else (
+                ScalingDecisionReason.LOW_UTILIZATION
+                if action is ScalingDecisionAction.SCALE_DOWN
+                else ScalingDecisionReason.QUEUE_PRESSURE
+            )
         ),
         demand_replicas=3,
         buffered_target_replicas=4,
@@ -370,8 +455,9 @@ def _workload_payload(
     generation: int = 7,
     uid: str = "workload-uid",
     annotations: dict[str, str] | None = None,
+    statefulset_start_ordinal: int | None = None,
 ) -> dict:
-    return {
+    payload = {
         "apiVersion": "apps/v1",
         "kind": kind,
         "metadata": {
@@ -384,6 +470,38 @@ def _workload_payload(
         },
         "spec": {"replicas": replicas},
     }
+    if statefulset_start_ordinal is not None:
+        payload["spec"]["ordinals"] = {"start": statefulset_start_ordinal}
+    return payload
+
+
+def _drain_pod_payload(
+    ordinal: int,
+    *,
+    uid: str | None = None,
+    finalizers: list[str] | None = None,
+    deleting: bool = False,
+) -> dict:
+    metadata = {
+        "name": f"qwen-14b-runners-{ordinal}",
+        "namespace": "model-serving",
+        "uid": uid or f"pod-uid-{ordinal}",
+        "finalizers": (
+            [SCALE_DOWN_DRAIN_FINALIZER] if finalizers is None else finalizers
+        ),
+        "ownerReferences": [
+            {
+                "apiVersion": "apps/v1",
+                "kind": "StatefulSet",
+                "name": "qwen-14b-runners",
+                "uid": "workload-uid",
+                "controller": True,
+            }
+        ],
+    }
+    if deleting:
+        metadata["deletionTimestamp"] = "2026-09-17T08:00:01Z"
+    return {"apiVersion": "v1", "kind": "Pod", "metadata": metadata}
 
 
 def _actuator(
@@ -1158,6 +1276,962 @@ def test_hold_is_generation_free_but_requires_claimed_authority(tmp_path: Path) 
     assert decision.decision_generation is None
     assert result.scale.applied is False
     assert [request.method for request in requests] == ["GET"]
+    client.close()
+
+
+def test_statefulset_scale_down_requires_and_reauthorizes_exact_drained_ordinals(
+    tmp_path: Path,
+) -> None:
+    decision: ScalingDecisionRecord | None = None
+    requests: list[tuple[str, str]] = []
+    released: set[int] = set()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        if "/pods/" in request.url.path:
+            ordinal = int(request.url.path.rsplit("-", 1)[1])
+            if request.method == "GET":
+                if ordinal in released:
+                    return httpx.Response(404, json={"kind": "Status"})
+                return httpx.Response(200, json=_drain_pod_payload(ordinal))
+            if request.method == "DELETE":
+                options = json.loads(request.content)
+                assert options["preconditions"]["uid"] == f"pod-uid-{ordinal}"
+                assert options["gracePeriodSeconds"] == 0
+                return httpx.Response(202, json={"kind": "Status"})
+            patch = json.loads(request.content)
+            assert patch[0] == {
+                "op": "test",
+                "path": "/metadata/uid",
+                "value": f"pod-uid-{ordinal}",
+            }
+            assert patch[-1]["path"] == "/metadata/finalizers/0"
+            released.add(ordinal)
+            return httpx.Response(
+                200,
+                json=_drain_pod_payload(
+                    ordinal,
+                    finalizers=[],
+                    deleting=True,
+                ),
+            )
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json=_workload_payload(
+                    kind="StatefulSet",
+                    replicas=4,
+                    annotations=_annotations(token=1),
+                ),
+            )
+        assert decision is not None
+        patch = json.loads(request.content)
+        values = {operation["path"]: operation.get("value") for operation in patch}
+        assert values["/spec/replicas"] == 2
+        return httpx.Response(
+            200,
+            json=_workload_payload(
+                kind="StatefulSet",
+                replicas=2,
+                resource_version="11",
+                generation=8,
+                annotations=_annotations(token=1, decision=decision),
+            ),
+        )
+
+    actuator, client, log = _actuator(tmp_path, handler)
+    plan = _drain_plan()
+    decision = log.append(
+        _decision(
+            action=ScalingDecisionAction.SCALE_DOWN,
+            current=4,
+            desired=2,
+            target_revision=_target_revision(target_kind="StatefulSet"),
+            drain_plan=plan,
+        )
+    )
+    result = actuator.apply_fenced(
+        decision,
+        _target(KubernetesScalableKind.STATEFUL_SET),
+        authority=_authority(),
+        fence=_fence(),
+        reauthorize=lambda: _authority(),
+        reauthorize_drain=lambda: plan,
+    )
+
+    assert result.scale.applied is True
+    assert result.scale.previous_replicas == 4
+    assert result.scale.resulting_replicas == 2
+    assert [(method, "/pods/" in path) for method, path in requests] == [
+        ("GET", False),
+        ("GET", True),
+        ("GET", True),
+        ("PATCH", False),
+        ("DELETE", True),
+        ("PATCH", True),
+        ("GET", True),
+        ("DELETE", True),
+        ("PATCH", True),
+        ("GET", True),
+    ]
+    assert [
+        path.rsplit("-", 1)[1]
+        for method, path in requests
+        if method == "DELETE"
+    ] == ["3", "2"]
+    client.close()
+
+
+def test_statefulset_scale_down_reports_ordered_cleanup_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    decision: ScalingDecisionRecord | None = None
+    released: set[int] = set()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert decision is not None
+        if "/pods/" in request.url.path:
+            ordinal = int(request.url.path.rsplit("-", 1)[1])
+            if request.method == "GET":
+                return httpx.Response(
+                    200,
+                    json=_drain_pod_payload(
+                        ordinal,
+                        finalizers=(
+                            []
+                            if ordinal in released
+                            else [SCALE_DOWN_DRAIN_FINALIZER]
+                        ),
+                        deleting=ordinal in released,
+                    ),
+                )
+            if request.method == "DELETE":
+                return httpx.Response(202, json={"kind": "Status"})
+            released.add(ordinal)
+            return httpx.Response(
+                200,
+                json=_drain_pod_payload(ordinal, finalizers=[], deleting=True),
+            )
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json=_workload_payload(
+                    kind="StatefulSet",
+                    replicas=4,
+                    annotations=_annotations(token=1),
+                ),
+            )
+        return httpx.Response(
+            200,
+            json=_workload_payload(
+                kind="StatefulSet",
+                replicas=2,
+                resource_version="11",
+                generation=8,
+                annotations=_annotations(token=1, decision=decision),
+            ),
+        )
+
+    monkeypatch.setattr(KubernetesScaleActuator, "_DRAIN_DELETE_WAIT_SECONDS", 0)
+    actuator, client, log = _actuator(tmp_path, handler)
+    plan = _drain_plan()
+    decision = log.append(
+        _decision(
+            action=ScalingDecisionAction.SCALE_DOWN,
+            current=4,
+            desired=2,
+            target_revision=_target_revision(target_kind="StatefulSet"),
+            drain_plan=plan,
+        )
+    )
+
+    with pytest.raises(KubernetesScaleCleanupPendingError, match="retry the decision"):
+        actuator.apply_fenced(
+            decision,
+            _target(KubernetesScalableKind.STATEFUL_SET),
+            authority=_authority(),
+            fence=_fence(),
+            reauthorize=lambda: _authority(),
+            reauthorize_drain=lambda: plan,
+        )
+    assert released == {3}
+    client.close()
+
+
+def test_statefulset_scale_down_exact_retry_is_a_read_only_no_op(
+    tmp_path: Path,
+) -> None:
+    decision: ScalingDecisionRecord | None = None
+    methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        assert decision is not None
+        if "/pods/" in request.url.path:
+            return httpx.Response(404, json={"kind": "Status"})
+        return httpx.Response(
+            200,
+            json=_workload_payload(
+                kind="StatefulSet",
+                replicas=2,
+                resource_version="11",
+                generation=8,
+                annotations=_annotations(token=1, decision=decision),
+            ),
+        )
+
+    actuator, client, log = _actuator(tmp_path, handler)
+    plan = _drain_plan()
+    decision = log.append(
+        _decision(
+            action=ScalingDecisionAction.SCALE_DOWN,
+            current=4,
+            desired=2,
+            target_revision=_target_revision(target_kind="StatefulSet"),
+            drain_plan=plan,
+        )
+    )
+    result = actuator.apply_fenced(
+        decision,
+        _target(KubernetesScalableKind.STATEFUL_SET),
+        authority=_authority(),
+        fence=_fence(),
+        reauthorize=lambda: pytest.fail("exact retry must not reauthorize"),
+        reauthorize_drain=lambda: pytest.fail("exact retry must not reauthorize drain"),
+    )
+
+    assert result.scale.applied is False
+    assert result.scale.resulting_replicas == 2
+    assert methods == ["GET", "GET", "GET"]
+    client.close()
+
+
+def test_statefulset_scale_down_exact_retry_releases_remaining_deletion_hold(
+    tmp_path: Path,
+) -> None:
+    decision: ScalingDecisionRecord | None = None
+    methods: list[str] = []
+    authority_calls = 0
+    released: set[int] = set()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        assert decision is not None
+        if "/pods/" not in request.url.path:
+            return httpx.Response(
+                200,
+                json=_workload_payload(
+                    kind="StatefulSet",
+                    replicas=2,
+                    resource_version="11",
+                    generation=8,
+                    annotations=_annotations(token=1, decision=decision),
+                ),
+            )
+        ordinal = int(request.url.path.rsplit("-", 1)[1])
+        if request.method == "GET":
+            if ordinal == 3 or ordinal in released:
+                return httpx.Response(404, json={"kind": "Status"})
+            return httpx.Response(200, json=_drain_pod_payload(ordinal, deleting=True))
+        if request.method == "DELETE":
+            return httpx.Response(202, json={"kind": "Status"})
+        released.add(ordinal)
+        return httpx.Response(
+            200,
+            json=_drain_pod_payload(ordinal, finalizers=[], deleting=True),
+        )
+
+    def reauthorize() -> RunnerWriterAuthority:
+        nonlocal authority_calls
+        authority_calls += 1
+        return _authority()
+
+    actuator, client, log = _actuator(tmp_path, handler)
+    plan = _drain_plan()
+    decision = log.append(
+        _decision(
+            action=ScalingDecisionAction.SCALE_DOWN,
+            current=4,
+            desired=2,
+            target_revision=_target_revision(target_kind="StatefulSet"),
+            drain_plan=plan,
+        )
+    )
+    result = actuator.apply_fenced(
+        decision,
+        _target(KubernetesScalableKind.STATEFUL_SET),
+        authority=_authority(),
+        fence=_fence(),
+        reauthorize=reauthorize,
+        reauthorize_drain=lambda: pytest.fail(
+            "an applied decision must use its durable drain proof"
+        ),
+    )
+
+    assert result.scale.applied is False
+    assert authority_calls == 1
+    assert methods == ["GET", "GET", "GET", "DELETE", "PATCH", "GET"]
+    client.close()
+
+
+def test_exact_retry_waits_for_released_higher_ordinal_to_disappear(
+    tmp_path: Path,
+) -> None:
+    decision: ScalingDecisionRecord | None = None
+    methods: list[str] = []
+    pod_gets: dict[int, int] = {}
+    released: set[int] = set()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        assert decision is not None
+        if "/pods/" not in request.url.path:
+            return httpx.Response(
+                200,
+                json=_workload_payload(
+                    kind="StatefulSet",
+                    replicas=2,
+                    resource_version="11",
+                    generation=8,
+                    annotations=_annotations(token=1, decision=decision),
+                ),
+            )
+        ordinal = int(request.url.path.rsplit("-", 1)[1])
+        if request.method == "GET":
+            pod_gets[ordinal] = pod_gets.get(ordinal, 0) + 1
+            if ordinal in released or (ordinal == 3 and pod_gets[ordinal] >= 2):
+                return httpx.Response(404, json={"kind": "Status"})
+            if ordinal == 3:
+                return httpx.Response(
+                    200,
+                    json=_drain_pod_payload(
+                        ordinal,
+                        finalizers=[],
+                        deleting=True,
+                    ),
+                )
+            return httpx.Response(200, json=_drain_pod_payload(ordinal))
+        if request.method == "DELETE":
+            return httpx.Response(202, json={"kind": "Status"})
+        released.add(ordinal)
+        return httpx.Response(
+            200,
+            json=_drain_pod_payload(ordinal, finalizers=[], deleting=True),
+        )
+
+    actuator, client, log = _actuator(tmp_path, handler)
+    plan = _drain_plan()
+    decision = log.append(
+        _decision(
+            action=ScalingDecisionAction.SCALE_DOWN,
+            current=4,
+            desired=2,
+            target_revision=_target_revision(target_kind="StatefulSet"),
+            drain_plan=plan,
+        )
+    )
+    result = actuator.apply_fenced(
+        decision,
+        _target(KubernetesScalableKind.STATEFUL_SET),
+        authority=_authority(),
+        fence=_fence(),
+        reauthorize=lambda: _authority(),
+        reauthorize_drain=lambda: pytest.fail(
+            "an applied decision must use its durable drain proof"
+        ),
+    )
+
+    assert result.scale.applied is False
+    assert methods == ["GET", "GET", "GET", "GET", "DELETE", "PATCH", "GET"]
+    client.close()
+
+
+def test_successor_leader_finishes_applied_scale_down_deletion_holds(
+    tmp_path: Path,
+) -> None:
+    decision: ScalingDecisionRecord | None = None
+    methods: list[str] = []
+    released: set[int] = set()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        assert decision is not None
+        if "/pods/" not in request.url.path:
+            return httpx.Response(
+                200,
+                json=_workload_payload(
+                    kind="StatefulSet",
+                    replicas=2,
+                    resource_version="12",
+                    generation=8,
+                    annotations=_annotations(token=2, decision=decision),
+                ),
+            )
+        ordinal = int(request.url.path.rsplit("-", 1)[1])
+        if request.method == "GET":
+            if ordinal == 3 or ordinal in released:
+                return httpx.Response(404, json={"kind": "Status"})
+            return httpx.Response(200, json=_drain_pod_payload(ordinal, deleting=True))
+        if request.method == "DELETE":
+            return httpx.Response(202, json={"kind": "Status"})
+        released.add(ordinal)
+        return httpx.Response(
+            200,
+            json=_drain_pod_payload(ordinal, finalizers=[], deleting=True),
+        )
+
+    actuator, client, log = _actuator(tmp_path, handler)
+    plan = _drain_plan()
+    decision = log.append(
+        _decision(
+            action=ScalingDecisionAction.SCALE_DOWN,
+            current=4,
+            desired=2,
+            target_revision=_target_revision(target_kind="StatefulSet", token=1),
+            drain_plan=plan,
+        )
+    )
+    successor = _authority(token=2)
+    result = actuator.apply_fenced(
+        decision,
+        _target(KubernetesScalableKind.STATEFUL_SET),
+        authority=successor,
+        fence=_fence(),
+        reauthorize=lambda: successor,
+        reauthorize_drain=lambda: pytest.fail(
+            "a successor cleanup uses the already applied durable drain proof"
+        ),
+    )
+
+    assert result.scale.applied is False
+    assert result.successor_cleanup is True
+    assert result.authority.fencing_token == 2
+    assert methods == ["GET", "GET", "GET", "DELETE", "PATCH", "GET"]
+    client.close()
+
+
+@pytest.mark.parametrize(
+    ("pod_payload", "message"),
+    [
+        (_drain_pod_payload(2, uid="replacement-pod-uid"), "identity changed"),
+        (_drain_pod_payload(2, finalizers=[]), "missing.*deletion hold"),
+    ],
+)
+def test_statefulset_scale_down_requires_exact_held_pod_before_parent_patch(
+    tmp_path: Path,
+    pod_payload: dict,
+    message: str,
+) -> None:
+    methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        if "/pods/" in request.url.path:
+            return httpx.Response(200, json=pod_payload)
+        return httpx.Response(
+            200,
+            json=_workload_payload(
+                kind="StatefulSet",
+                replicas=4,
+                annotations=_annotations(token=1),
+            ),
+        )
+
+    actuator, client, log = _actuator(tmp_path, handler)
+    plan = _drain_plan()
+    decision = log.append(
+        _decision(
+            action=ScalingDecisionAction.SCALE_DOWN,
+            current=4,
+            desired=2,
+            target_revision=_target_revision(target_kind="StatefulSet"),
+            drain_plan=plan,
+        )
+    )
+
+    with pytest.raises(KubernetesScaleConflictError, match=message):
+        actuator.apply_fenced(
+            decision,
+            _target(KubernetesScalableKind.STATEFUL_SET),
+            authority=_authority(),
+            fence=_fence(),
+            reauthorize=lambda: _authority(),
+            reauthorize_drain=lambda: plan,
+        )
+    assert methods == ["GET", "GET"]
+    client.close()
+
+
+def test_deployment_scale_down_is_rejected_before_io(tmp_path: Path) -> None:
+    actuator, client, log = _actuator(
+        tmp_path,
+        lambda _request: pytest.fail("Kubernetes must not be called"),
+    )
+    decision = _persist(
+        log,
+        _decision(
+            action=ScalingDecisionAction.SCALE_DOWN,
+            current=4,
+            desired=2,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="deterministic StatefulSet ordinals"):
+        actuator.apply_fenced(
+            decision,
+            _target(),
+            authority=_authority(),
+            fence=_fence(),
+            reauthorize=lambda: _authority(),
+        )
+    client.close()
+
+
+def test_statefulset_scale_down_requires_durable_drain_plan_before_io(
+    tmp_path: Path,
+) -> None:
+    actuator, client, log = _actuator(
+        tmp_path,
+        lambda _request: pytest.fail("Kubernetes must not be called"),
+    )
+    decision = _persist(
+        log,
+        _decision(
+            action=ScalingDecisionAction.SCALE_DOWN,
+            current=4,
+            desired=2,
+            target_revision=_target_revision(target_kind="StatefulSet"),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="durable drain plan"):
+        actuator.apply_fenced(
+            decision,
+            _target(KubernetesScalableKind.STATEFUL_SET),
+            authority=_authority(),
+            fence=_fence(),
+            reauthorize=lambda: _authority(),
+        )
+    client.close()
+
+
+def test_statefulset_scale_down_rejects_nonzero_start_ordinal(
+    tmp_path: Path,
+) -> None:
+    methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        return httpx.Response(
+            200,
+            json=_workload_payload(
+                kind="StatefulSet",
+                replicas=4,
+                annotations=_annotations(token=1),
+                statefulset_start_ordinal=10,
+            ),
+        )
+
+    actuator, client, log = _actuator(tmp_path, handler)
+    plan = _drain_plan()
+    decision = log.append(
+        _decision(
+            action=ScalingDecisionAction.SCALE_DOWN,
+            current=4,
+            desired=2,
+            target_revision=_target_revision(target_kind="StatefulSet"),
+            drain_plan=plan,
+        )
+    )
+
+    with pytest.raises(KubernetesScaleConflictError, match="zero StatefulSet start ordinal"):
+        actuator.apply_fenced(
+            decision,
+            _target(KubernetesScalableKind.STATEFUL_SET),
+            authority=_authority(),
+            fence=_fence(),
+            reauthorize=lambda: _authority(),
+            reauthorize_drain=lambda: plan,
+        )
+    assert methods == ["GET"]
+    client.close()
+
+
+def test_statefulset_scale_down_requires_final_drain_reauthorization(
+    tmp_path: Path,
+) -> None:
+    methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        return httpx.Response(
+            200,
+            json=_workload_payload(
+                kind="StatefulSet",
+                replicas=4,
+                annotations=_annotations(token=1),
+            ),
+        )
+
+    actuator, client, log = _actuator(tmp_path, handler)
+    plan = _drain_plan()
+    decision = log.append(
+        _decision(
+            action=ScalingDecisionAction.SCALE_DOWN,
+            current=4,
+            desired=2,
+            target_revision=_target_revision(target_kind="StatefulSet"),
+            drain_plan=plan,
+        )
+    )
+
+    with pytest.raises(TypeError, match="reauthorize_drain"):
+        actuator.apply_fenced(
+            decision,
+            _target(KubernetesScalableKind.STATEFUL_SET),
+            authority=_authority(),
+            fence=_fence(),
+            reauthorize=lambda: _authority(),
+        )
+    assert methods == ["GET"]
+    client.close()
+
+
+def test_changed_drain_authorization_prevents_scale_down(tmp_path: Path) -> None:
+    methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        return httpx.Response(
+            200,
+            json=_workload_payload(
+                kind="StatefulSet",
+                replicas=4,
+                annotations=_annotations(token=1),
+            ),
+        )
+
+    actuator, client, log = _actuator(tmp_path, handler)
+    plan = _drain_plan()
+    changed = _drain_plan(
+        observed_at=NOW + timedelta(seconds=1),
+        drain_revision=8,
+        fence_prefix="replacement-fence",
+    )
+    decision = log.append(
+        _decision(
+            action=ScalingDecisionAction.SCALE_DOWN,
+            current=4,
+            desired=2,
+            target_revision=_target_revision(target_kind="StatefulSet"),
+            drain_plan=plan,
+        )
+    )
+
+    with pytest.raises(KubernetesScaleConflictError, match="no longer authorizes"):
+        actuator.apply_fenced(
+            decision,
+            _target(KubernetesScalableKind.STATEFUL_SET),
+            authority=_authority(),
+            fence=_fence(),
+            reauthorize=lambda: _authority(validated_at=NOW + timedelta(seconds=1)),
+            reauthorize_drain=lambda: changed,
+        )
+    assert methods == ["GET"]
+    client.close()
+
+
+def test_stale_final_drain_authority_prevents_scale_down(tmp_path: Path) -> None:
+    methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        return httpx.Response(
+            200,
+            json=_workload_payload(
+                kind="StatefulSet",
+                replicas=4,
+                annotations=_annotations(token=1),
+            ),
+        )
+
+    actuator, client, log = _actuator(tmp_path, handler)
+    plan = _drain_plan()
+    decision = log.append(
+        _decision(
+            action=ScalingDecisionAction.SCALE_DOWN,
+            current=4,
+            desired=2,
+            target_revision=_target_revision(target_kind="StatefulSet"),
+            drain_plan=plan,
+        )
+    )
+
+    with pytest.raises(KubernetesScaleConflictError, match="drain authority is not fresh"):
+        actuator.apply_fenced(
+            decision,
+            _target(KubernetesScalableKind.STATEFUL_SET),
+            authority=_authority(),
+            fence=_fence(),
+            reauthorize=lambda: _authority(
+                validated_at=NOW + timedelta(seconds=31)
+            ),
+            reauthorize_drain=lambda: plan,
+        )
+    assert methods == ["GET"]
+    client.close()
+
+
+def test_fresh_outer_drain_snapshot_cannot_reauthorize_stale_runner_evidence(
+    tmp_path: Path,
+) -> None:
+    methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        return httpx.Response(
+            200,
+            json=_workload_payload(
+                kind="StatefulSet",
+                replicas=4,
+                annotations=_annotations(token=1),
+            ),
+        )
+
+    actuator, client, log = _actuator(tmp_path, handler)
+    plan = _drain_plan()
+    stale_inner = _drain_plan(
+        observed_at=NOW + timedelta(seconds=1),
+        drain_revision=8,
+        status_observed_at=NOW - timedelta(seconds=31),
+    )
+    decision = log.append(
+        _decision(
+            action=ScalingDecisionAction.SCALE_DOWN,
+            current=4,
+            desired=2,
+            target_revision=_target_revision(target_kind="StatefulSet"),
+            drain_plan=plan,
+        )
+    )
+
+    with pytest.raises(KubernetesScaleConflictError, match="drain authority is not fresh"):
+        actuator.apply_fenced(
+            decision,
+            _target(KubernetesScalableKind.STATEFUL_SET),
+            authority=_authority(),
+            fence=_fence(),
+            reauthorize=lambda: _authority(
+                validated_at=NOW + timedelta(seconds=1)
+            ),
+            reauthorize_drain=lambda: stale_inner,
+        )
+    assert methods == ["GET"]
+    client.close()
+
+
+def test_drain_revision_rollback_prevents_scale_down(tmp_path: Path) -> None:
+    methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        return httpx.Response(
+            200,
+            json=_workload_payload(
+                kind="StatefulSet",
+                replicas=4,
+                annotations=_annotations(token=1),
+            ),
+        )
+
+    actuator, client, log = _actuator(tmp_path, handler)
+    plan = _drain_plan()
+    rollback = _drain_plan(
+        observed_at=NOW + timedelta(seconds=1),
+        drain_revision=6,
+    )
+    decision = log.append(
+        _decision(
+            action=ScalingDecisionAction.SCALE_DOWN,
+            current=4,
+            desired=2,
+            target_revision=_target_revision(target_kind="StatefulSet"),
+            drain_plan=plan,
+        )
+    )
+
+    with pytest.raises(KubernetesScaleConflictError, match="drain authority changed"):
+        actuator.apply_fenced(
+            decision,
+            _target(KubernetesScalableKind.STATEFUL_SET),
+            authority=_authority(),
+            fence=_fence(),
+            reauthorize=lambda: _authority(
+                validated_at=NOW + timedelta(seconds=1)
+            ),
+            reauthorize_drain=lambda: rollback,
+        )
+    assert methods == ["GET"]
+    client.close()
+
+
+def test_drain_revision_cannot_roll_back_during_pod_hold_verification(
+    tmp_path: Path,
+) -> None:
+    methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        if "/pods/" in request.url.path:
+            ordinal = int(request.url.path.rsplit("-", 1)[1])
+            return httpx.Response(200, json=_drain_pod_payload(ordinal))
+        return httpx.Response(
+            200,
+            json=_workload_payload(
+                kind="StatefulSet",
+                replicas=4,
+                annotations=_annotations(token=1),
+            ),
+        )
+
+    actuator, client, log = _actuator(tmp_path, handler)
+    original = _drain_plan()
+    refreshed = iter(
+        (
+            _drain_plan(
+                observed_at=NOW + timedelta(seconds=1),
+                drain_revision=9,
+                status_observed_at=NOW,
+            ),
+            _drain_plan(
+                observed_at=NOW + timedelta(seconds=2),
+                drain_revision=8,
+                status_observed_at=NOW,
+            ),
+        )
+    )
+    decision = log.append(
+        _decision(
+            action=ScalingDecisionAction.SCALE_DOWN,
+            current=4,
+            desired=2,
+            target_revision=_target_revision(target_kind="StatefulSet"),
+            drain_plan=original,
+        )
+    )
+
+    with pytest.raises(KubernetesScaleConflictError, match="rolled back"):
+        actuator.apply_fenced(
+            decision,
+            _target(KubernetesScalableKind.STATEFUL_SET),
+            authority=_authority(),
+            fence=_fence(),
+            reauthorize=lambda: _authority(
+                validated_at=NOW + timedelta(seconds=2)
+            ),
+            reauthorize_drain=lambda: next(refreshed),
+        )
+    assert methods == ["GET", "GET", "GET"]
+    client.close()
+
+
+def test_drain_runner_source_cannot_roll_back_during_pod_hold_verification(
+    tmp_path: Path,
+) -> None:
+    methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        if "/pods/" in request.url.path:
+            ordinal = int(request.url.path.rsplit("-", 1)[1])
+            return httpx.Response(200, json=_drain_pod_payload(ordinal))
+        return httpx.Response(
+            200,
+            json=_workload_payload(
+                kind="StatefulSet",
+                replicas=4,
+                annotations=_annotations(token=1),
+            ),
+        )
+
+    def with_source(
+        plan: ScalingDrainPlan,
+        *,
+        observed_at: datetime,
+        source_observed_at: tuple[datetime, ...],
+        drain_revision: int,
+    ) -> ScalingDrainPlan:
+        candidates = tuple(
+            candidate.model_copy(
+                update={
+                    "status": candidate.status.model_copy(
+                        update={
+                            "observed_at": source_observed_at[
+                                candidate.workload_ordinal
+                                - plan.desired_replicas
+                            ]
+                        }
+                    )
+                }
+            )
+            for candidate in plan.snapshot.candidates
+        )
+        snapshot = ScalingDrainSnapshot.model_validate(
+            plan.snapshot.model_copy(
+                update={
+                    "observed_at": observed_at,
+                    "drain_revision": drain_revision,
+                    "candidates": candidates,
+                }
+            ).model_dump()
+        )
+        return plan_statefulset_scale_down(
+            snapshot,
+            current_replicas=plan.current_replicas,
+            desired_replicas=plan.desired_replicas,
+        )
+
+    actuator, client, log = _actuator(tmp_path, handler)
+    original = _drain_plan()
+    refreshed = iter(
+        (
+            with_source(
+                original,
+                observed_at=NOW + timedelta(seconds=2),
+                source_observed_at=(NOW, NOW + timedelta(seconds=2)),
+                drain_revision=9,
+            ),
+            with_source(
+                original,
+                observed_at=NOW + timedelta(seconds=3),
+                source_observed_at=(NOW, NOW + timedelta(seconds=1)),
+                drain_revision=10,
+            ),
+        )
+    )
+    decision = log.append(
+        _decision(
+            action=ScalingDecisionAction.SCALE_DOWN,
+            current=4,
+            desired=2,
+            target_revision=_target_revision(target_kind="StatefulSet"),
+            drain_plan=original,
+        )
+    )
+
+    with pytest.raises(KubernetesScaleConflictError, match="rolled back"):
+        actuator.apply_fenced(
+            decision,
+            _target(KubernetesScalableKind.STATEFUL_SET),
+            authority=_authority(),
+            fence=_fence(),
+            reauthorize=lambda: _authority(
+                validated_at=NOW + timedelta(seconds=3)
+            ),
+            reauthorize_drain=lambda: next(refreshed),
+        )
+    assert methods == ["GET", "GET", "GET"]
     client.close()
 
 

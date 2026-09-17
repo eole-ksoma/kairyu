@@ -16,6 +16,9 @@ from kairyu.runners import (
     ModelCachePlacement,
     ModelCachePlacementState,
     RunnerStartupPhase,
+    RunnerState,
+    RunnerStatus,
+    RunnerTerminationAuthorization,
     ScalingDecisionAction,
     ScalingDecisionCapacityError,
     ScalingDecisionConflictError,
@@ -23,6 +26,9 @@ from kairyu.runners import (
     ScalingDecisionLog,
     ScalingDecisionReason,
     ScalingDecisionRecord,
+    ScalingDecisionTargetRevision,
+    ScalingDrainCandidate,
+    ScalingDrainSnapshot,
     ScalingObservation,
     ScalingObservationWindow,
     ScalingPolicy,
@@ -38,6 +44,7 @@ from kairyu.runners import (
     admit_scaling_quota,
     kueue_scaling_workload_name,
     plan_cache_aware_scale_up,
+    plan_statefulset_scale_down,
 )
 from kairyu.runners.postgres_scaling_log import PostgresScalingDecisionLog
 
@@ -265,6 +272,84 @@ def _prewarm_plan(
     )
 
 
+def _target_revision(**updates) -> ScalingDecisionTargetRevision:
+    values = {
+        "target_kind": "StatefulSet",
+        "namespace": "model-serving",
+        "name": "interactive-14b-runners",
+        "election_id": "election-a",
+        "fencing_token": 11,
+        "workload_uid": "target-workload-uid",
+        "workload_generation": 7,
+        "release_id": "release-a",
+        "model_revision": "model-revision-a",
+    }
+    values.update(updates)
+    return ScalingDecisionTargetRevision(**values)
+
+
+def _drain_plan(
+    *,
+    current: int = 3,
+    desired: int = 2,
+    observed_at: datetime = NOW,
+    status_observed_at: datetime | None = None,
+):
+    status_observed_at = status_observed_at or observed_at
+    candidates = []
+    for ordinal in range(desired, current):
+        authorization = RunnerTerminationAuthorization(
+            runner_id=f"runner-{ordinal}",
+            pod_uid=f"pod-uid-{ordinal}",
+            fence_id=f"fence-{ordinal}",
+            fence_sequence=ordinal + 1,
+            drain_state_version=6,
+            replica_generation=f"replica-generation-{ordinal}",
+            dispatch_stopped_at=status_observed_at - timedelta(seconds=2),
+            routing_excluded_at=status_observed_at - timedelta(seconds=2),
+            activity_observed_at=status_observed_at - timedelta(seconds=1),
+            authorized_at=status_observed_at - timedelta(seconds=1),
+        )
+        status = RunnerStatus(
+            runner_id=f"runner-{ordinal}",
+            release_id="release-a",
+            model_id="qwen",
+            model_revision="model-revision-a",
+            state=RunnerState.TERMINATING,
+            state_version=7,
+            state_changed_at=status_observed_at - timedelta(seconds=1),
+            observed_at=status_observed_at,
+            pod_uid=f"pod-uid-{ordinal}",
+            active_requests=0,
+            termination_authorization=authorization,
+        )
+        candidates.append(
+            ScalingDrainCandidate(
+                pod_name=f"interactive-14b-runners-{ordinal}",
+                workload_ordinal=ordinal,
+                status=status,
+            )
+        )
+    snapshot = ScalingDrainSnapshot(
+        snapshot_id="drain-snapshot-1",
+        drain_revision=7,
+        observed_at=observed_at,
+        model_class="interactive-14b",
+        namespace="model-serving",
+        statefulset_name="interactive-14b-runners",
+        workload_uid="target-workload-uid",
+        workload_generation=7,
+        release_id="release-a",
+        model_revision="model-revision-a",
+        candidates=tuple(candidates),
+    )
+    return plan_statefulset_scale_down(
+        snapshot,
+        current_replicas=current,
+        desired_replicas=desired,
+    )
+
+
 def test_observation_captures_all_planned_input_families() -> None:
     observation = _observation("1", observed_at=NOW)
 
@@ -393,6 +478,7 @@ def test_legacy_schema_v1_fingerprint_and_postgres_row_remain_readable() -> None
         "target_revision",
         "quota_admission",
         "prewarm_plan",
+        "drain_plan",
     ):
         legacy_payload.pop(optional_field)
     legacy_fingerprint = hashlib.sha256(
@@ -418,6 +504,107 @@ def test_legacy_schema_v1_fingerprint_and_postgres_row_remain_readable() -> None
     assert record.fingerprint == legacy_fingerprint
     assert PostgresScalingDecisionLog._record(row) == record
 
+
+def test_scale_down_persists_exact_drain_plan_and_target_binding() -> None:
+    drain = _drain_plan()
+    decision = _record(
+        target_revision=_target_revision(),
+        drain_plan=drain,
+        action=ScalingDecisionAction.SCALE_DOWN,
+        reason=ScalingDecisionReason.LOW_UTILIZATION,
+        desired_replicas=2,
+        target_delta=-1,
+    )
+
+    assert decision.drain_plan == drain
+    assert decision.drain_plan.candidate_runner_ids == ("runner-2",)
+    assert decision.drain_plan.snapshot.workload_uid == (
+        decision.target_revision.workload_uid
+    )
+
+
+@pytest.mark.parametrize(
+    ("record_updates", "message"),
+    [
+        (
+            {"drain_plan": _drain_plan(current=4, desired=2)},
+            "observed current replicas",
+        ),
+        (
+            {
+                "action": ScalingDecisionAction.HOLD,
+                "reason": ScalingDecisionReason.NO_CHANGE,
+                "desired_replicas": 3,
+                "target_delta": 0,
+            },
+            "scale-down decisions",
+        ),
+        (
+            {"target_revision": _target_revision(workload_uid="other-uid")},
+            "decision target revision",
+        ),
+    ],
+)
+def test_drain_plan_rejects_wrong_decision_or_target_binding(
+    record_updates: dict[str, object],
+    message: str,
+) -> None:
+    values = {
+        "target_revision": _target_revision(),
+        "drain_plan": _drain_plan(),
+        "action": ScalingDecisionAction.SCALE_DOWN,
+        "reason": ScalingDecisionReason.LOW_UTILIZATION,
+        "desired_replicas": 2,
+        "target_delta": -1,
+    }
+    values.update(record_updates)
+
+    with pytest.raises(ValidationError, match=message):
+        _record(**values)
+
+
+def test_stale_drain_evidence_is_a_decision_source_and_cannot_scale_down() -> None:
+    stale_drain = _drain_plan(observed_at=NOW - timedelta(seconds=31))
+
+    with pytest.raises(ValidationError, match="policy freshness limit"):
+        _record(
+            target_revision=_target_revision(),
+            drain_plan=stale_drain,
+            action=ScalingDecisionAction.SCALE_DOWN,
+            reason=ScalingDecisionReason.LOW_UTILIZATION,
+            desired_replicas=2,
+            target_delta=-1,
+        )
+
+    with pytest.raises(ValidationError, match="cannot authorize scale-down"):
+        _record(
+            target_revision=_target_revision(),
+            drain_plan=stale_drain,
+            action=ScalingDecisionAction.SCALE_DOWN,
+            reason=ScalingDecisionReason.STALE_OBSERVATIONS,
+            inputs_stale=True,
+            desired_replicas=2,
+            target_delta=-1,
+        )
+
+
+def test_fresh_drain_snapshot_cannot_launder_stale_runner_evidence() -> None:
+    stale_inner = _drain_plan(
+        observed_at=NOW,
+        status_observed_at=NOW - timedelta(seconds=31),
+    )
+
+    assert stale_inner.snapshot.observed_at == NOW
+    assert stale_inner.source_observed_at == NOW - timedelta(seconds=31)
+    with pytest.raises(ValidationError, match="policy freshness limit"):
+        _record(
+            target_revision=_target_revision(),
+            drain_plan=stale_inner,
+            action=ScalingDecisionAction.SCALE_DOWN,
+            reason=ScalingDecisionReason.LOW_UTILIZATION,
+            desired_replicas=2,
+            target_delta=-1,
+        )
 
 def test_decision_persists_unconstrained_quota_and_kueue_admission() -> None:
     quota = _quota_admission(requested=6)

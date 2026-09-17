@@ -23,7 +23,7 @@ beat frontier APIs as measured by the committed harness (G6 gate P-C1).
 
 ## Current Status
 
-Snapshot date: 2026-09-15. Hardware context: all GPU evidence so far is on
+Snapshot date: 2026-09-17. Hardware context: all GPU evidence so far is on
 8× RTX PRO 6000 Blackwell (SM120), PCIe-only interconnect (P2P 30–37 GB/s);
 NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 `bench/results/` (see `index.json`); decisions and rationale in `docs/design/`.
@@ -102,8 +102,11 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
   single-writer gate with a PostgreSQL shared lease backend. WP3.1 adds bounded,
   model-class scaling policy schemas. WP3.2 adds source-timestamped observation
   windows and an append-only PostgreSQL decision log with stale-input safety.
-  Scale actuation, deployment wiring, durable Runner status, Kubernetes mutations,
-  and runtime instrumentation remain open.
+  WP3.3 adds idempotent Deployment/StatefulSet scale-subresource actuation with
+  resourceVersion conflict detection, composed through the existing leader gate.
+  Deployment wiring, structural leader-token/revision propagation, durable Runner
+  status, and runtime instrumentation remain open; actuation stays unwired until
+  WP3.4 closes the post-authorization lease race.
 - Qwen3.8-Flash-Next MTP speculative decoding stays off in `qwen3.8-flash-next-dp2-8gpu` until upstream fixes vllm#53912 (prefix caching + MTP output corruption on hybrid GDN); single-stream decode 104 vs 175 tok/s
 - DTO-D15 (2026-08-26) changed the served tiered-example config: verify.sh coding/generic gates and the digest re-pin are pending before the example status can be claimed green again
 - Human sign-off pending on M2–M4 design reviews
@@ -112,6 +115,13 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
+
+### 2026-09-17 — [progress] Kubernetes Runner scale actuator
+- What: added bounded Deployment/StatefulSet scale-subresource mutation, live
+  resourceVersion conflict detection, idempotent retries, and fail-closed response
+  validation, with a tested composition through the existing autoscaler leader gate.
+- Refs: docs/design/runner-state-v1.md; kairyu/runners/scale_actuator.py;
+  tests/unit/test_runner_scale_actuator.py
 
 ### 2026-09-15 — [progress] Durable autoscaler observation and decision log
 - What: added bounded source-timestamped scaling windows, exact policy/input

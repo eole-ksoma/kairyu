@@ -372,8 +372,14 @@ operational horizon.
 
 ## Next integration boundary
 
-WP3.3 should consume these validated records to calculate and apply a bounded
-desired replica count, without yet weakening the single-writer fence. WP3.4
-then propagates the leader fencing token through the decision/CAS mutation
-boundary. Durable Runner-status persistence and Kubernetes deletion remain
-separate changes.
+WP3.3 consumes a validated decision record and applies its bounded desired
+replica count through the Deployment or StatefulSet `scale` subresource. The
+actuator reads the live `Scale`, skips exact retries and hold decisions, and
+uses its `resourceVersion` for a single idempotent write. Conflicts and malformed
+responses fail closed. Callers must enter through `mutate_autoscaler()` so only
+a fresh leader can begin the mutation; WP3.4 then makes this structural by
+propagating the leader fencing token and decision generation through that CAS
+boundary. The actuator therefore remains deliberately unwired and is not safe
+for production deployment until WP3.4 closes the post-authorization lease race.
+Durable Runner-status persistence and Kubernetes deletion remain separate
+changes.

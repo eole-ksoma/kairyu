@@ -188,6 +188,7 @@ def test_pre_wp34_record_fingerprint_remains_readable() -> None:
     legacy_payload.pop("decision_generation")
     legacy_payload.pop("target_revision")
     legacy_payload.pop("quota_admission")
+    legacy_payload.pop("prewarm_plan")
     legacy_fingerprint = hashlib.sha256(
         json.dumps(
             legacy_payload,

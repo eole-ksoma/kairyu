@@ -108,12 +108,13 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
   and parent-workload JSON Patch CAS. WP3.5 adds fail-closed Kueue admission
   parsing, Kueue-owned atomic GPU reservations projected across nested
   cluster/model-family/tenant-model budgets, and final freshness reauthorization
-  durably bound to one scale target in scale-up decisions. Unfenced scale writes
-  and quota revision rollbacks are rejected by default; immutable target-derived
-  Kueue Workload names prevent reservation rebinding. Deployment wiring,
-  cache-aware prewarm,
-  scale-down drain integration, durable Runner status, and runtime instrumentation
-  remain open.
+  durably bound to one scale target in scale-up decisions. WP3.6 adds
+  cache-aware staged scale-out: durable placement-level cache intent/Runner-start
+  plans, Kueue ResourceFlavor and deployment placement binding, and final cache
+  freshness plus quota/prewarm consistency reauthorization.
+  Unfenced scale writes and quota/cache revision rollbacks are rejected by
+  default. Deployment wiring, scale-down drain integration, durable Runner
+  status, and runtime instrumentation remain open.
 - Qwen3.8-Flash-Next MTP speculative decoding stays off in `qwen3.8-flash-next-dp2-8gpu` until upstream fixes vllm#53912 (prefix caching + MTP output corruption on hybrid GDN); single-stream decode 104 vs 175 tok/s
 - DTO-D15 (2026-08-26) changed the served tiered-example config: verify.sh coding/generic gates and the digest re-pin are pending before the example status can be claimed green again
 - Human sign-off pending on M2–M4 design reviews
@@ -122,6 +123,13 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
+
+### 2026-09-17 — [progress] Cache-aware staged Runner scale-out
+- What: split quota-admitted scale-out into durable placement-level cache intent
+  and ready-cache Runner-start stages, bound starts to model/flavor/deployment
+  placement identity, and added final cache/quota consistency reauthorization.
+- Refs: docs/design/runner-state-v1.md; kairyu/runners/prewarm.py;
+  kairyu/runners/scale_actuator.py; tests/unit/test_runner_prewarm.py
 
 ### 2026-09-17 — [progress] Quota-fenced Runner scale-up
 - What: added strict Kueue Workload admission parsing, priority-reservation-aware

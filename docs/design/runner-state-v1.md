@@ -470,5 +470,70 @@ original evidence after append.
 
 Kueue CRD installation, ClusterQueue/LocalQueue/ResourceFlavor definitions,
 the global reservation snapshot producer, and RBAC belong to deployment wiring
-in private-ai-cloud-iac. Cache-aware prewarm, scale-down drain integration,
-durable Runner status, and Kubernetes deletion remain separate changes.
+in private-ai-cloud-iac. Scale-down drain integration, durable Runner status,
+and Kubernetes deletion remain separate changes.
+
+## Cache-aware staged scale-out
+
+WP3.6 makes cache locality an explicit, fail-closed scale-out input instead of
+letting a newly created Runner discover a cold model after scheduling. A
+`ScalingPrewarmSnapshot` identifies one immutable model class, model revision,
+artifact digest, and deployment-owned placement binding plus a monotonic cache revision. Its canonical placement
+inventory records node and ResourceFlavor, an approved hardware profile and
+compatibility record, assignment/health/schedulability gates, and one of
+`absent`, `filling`, `ready`, or `failed`. Placements are replica-sized units;
+an implementation may publish multiple units for a node only when that
+capacity is independently schedulable.
+
+`plan_cache_aware_scale_up()` receives the final quota-admitted target and its
+Kueue ResourceFlavor. It selects only unassigned, healthy, schedulable
+placements of that flavor, then deterministically splits the delta into:
+
+1. ready placements that may start Runners immediately;
+2. filling placements that remain pending;
+3. absent placements that require cache-fill commands; and
+4. unplanned replicas for which no eligible placement exists.
+
+The returned `ScalingPrewarmPlan` persists all four outcomes in the append-only
+decision. The quota target remains the eventual capacity goal while
+`runner_target_replicas` is the only immediately actuated count. A plan with no
+ready placement produces a `cache_prewarm` HOLD rather than a cold Runner; a
+mixed plan can start ready capacity while retaining its remaining cache-fill
+intent. In WP3.6 those placement IDs are durable desired-work evidence, not an
+executable cache-agent command. A production consumer must not dispatch them
+directly from a HOLD record: the Phase 4 node-cache agent must add its own
+leader/target/artifact fence, monotonic command generation, placement-level
+claim/CAS, idempotent replay, and completion record. It then publishes a later
+monotonic snapshot as placements move through `filling` to `ready`, and
+reconciliation creates a new scaling decision rather than editing the earlier
+record. This boundary prevents a stale HOLD decision from becoming an
+unfenced cache mutation before the cache-agent protocol exists.
+
+Cache locality never overrides health, schedulability, the explicit hardware
+compatibility approval, or Kueue quota. The decision validator binds the plan's
+model class, model revision, current replica count, final quota target, and
+ResourceFlavor to the observation, target revision, and Kueue admission. It
+also includes the cache observation timestamp in the conservative freshness
+calculation. Startup phase EMA and p95 evidence remains in the same durable
+observation window, so the post-deployment 0→50 acceptance run can correlate
+each cache stage with image pull, model fetch, model load, compile, and warmup
+without reconstructing inputs from mutable telemetry.
+
+Production scale-up additionally requires `reauthorize_prewarm()` immediately
+before the Kubernetes JSON Patch, after leader and quota reauthorization. The
+refreshed inventory may advance in time and revision, but cannot roll back or
+change model/artifact/flavor/target identity. Every placement that justified
+the durable Runner delta must still be ready and eligible, and the refreshed
+plan must retain enough ready capacity for that delta. Staleness, eviction,
+failure, reassignment, artifact change, or capacity loss aborts before the
+workload mutation. The final refreshed quota target and prewarm target must
+still be identical; retaining only enough quota for the immediate partial
+scale cannot leave a larger cache-fill intent authorized. The parent workload
+must also carry `kairyu.ai/cache-placement-binding` equal to the plan's binding
+ID. The actuator tests that annotation in the atomic JSON Patch and requires it
+unchanged in the response. The deployment scheduler/admission integration owns
+that binding and must constrain new Pods to the selected cache topology; a
+missing or mismatched binding fails before scale-out. Its concrete scheduler,
+DaemonSet, PVC/local-storage, affinity, RBAC, Kueue, and binding-attestation
+wiring belongs to private-ai-cloud-iac and is a deployment gate before enabling
+production autoscaling.

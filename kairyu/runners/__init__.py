@@ -81,6 +81,14 @@ from kairyu.runners.observation import (
 )
 from kairyu.runners.postgres_leadership import PostgresRunnerLeaderLeaseStore
 from kairyu.runners.postgres_scaling_log import PostgresScalingDecisionLog
+from kairyu.runners.prewarm import (
+    ModelCachePlacement,
+    ModelCachePlacementState,
+    ScalingPrewarmAction,
+    ScalingPrewarmPlan,
+    ScalingPrewarmSnapshot,
+    plan_cache_aware_scale_up,
+)
 from kairyu.runners.reconciler import (
     InvalidRunnerObservationError,
     RunnerStatusReconciler,
@@ -88,6 +96,7 @@ from kairyu.runners.reconciler import (
     runner_is_routing_eligible,
 )
 from kairyu.runners.scale_actuator import (
+    CACHE_PLACEMENT_BINDING_ANNOTATION,
     SCALE_DECISION_FINGERPRINT_ANNOTATION,
     SCALE_DECISION_GENERATION_ANNOTATION,
     SCALE_DECISION_ID_ANNOTATION,
@@ -158,6 +167,9 @@ __all__ = [
     "KubernetesScaleResult",
     "KubernetesScaleTarget",
     "KubernetesScalableKind",
+    "ModelCachePlacement",
+    "ModelCachePlacementState",
+    "CACHE_PLACEMENT_BINDING_ANNOTATION",
     "SCALE_DECISION_GENERATION_ANNOTATION",
     "SCALE_DECISION_FINGERPRINT_ANNOTATION",
     "SCALE_DECISION_ID_ANNOTATION",
@@ -204,6 +216,9 @@ __all__ = [
     "RunnerWriterAuthority",
     "ScalingPolicy",
     "ScalingPolicyCatalog",
+    "ScalingPrewarmAction",
+    "ScalingPrewarmPlan",
+    "ScalingPrewarmSnapshot",
     "KueueScalingAdmission",
     "ScalingQuotaAdmission",
     "ScalingQuotaConstraint",
@@ -231,6 +246,7 @@ __all__ = [
     "authorize_runner_termination",
     "admit_scaling_quota",
     "kueue_scaling_workload_name",
+    "plan_cache_aware_scale_up",
     "parse_kueue_scaling_admission",
     "candidate_failure_domains",
     "complete_startup_phase",

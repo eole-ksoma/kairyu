@@ -17,6 +17,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from kairyu.runners.kubernetes import MODEL_REVISION_ANNOTATION, RELEASE_ID_ANNOTATION
 from kairyu.runners.leadership import RunnerWriterAuthority
+from kairyu.runners.prewarm import (
+    ModelCachePlacementState,
+    ScalingPrewarmPlan,
+)
 from kairyu.runners.scaling_log import (
     ScalingDecisionAction,
     ScalingDecisionLog,
@@ -30,6 +34,7 @@ SCALE_FENCING_TOKEN_ANNOTATION = "kairyu.ai/scale-fencing-token"
 SCALE_DECISION_GENERATION_ANNOTATION = "kairyu.ai/scale-decision-generation"
 SCALE_DECISION_ID_ANNOTATION = "kairyu.ai/scale-decision-id"
 SCALE_DECISION_FINGERPRINT_ANNOTATION = "kairyu.ai/scale-decision-fingerprint"
+CACHE_PLACEMENT_BINDING_ANNOTATION = "kairyu.ai/cache-placement-binding"
 _SCALE_AUTHORITY_ANNOTATIONS = (
     SCALE_ELECTION_ID_ANNOTATION,
     SCALE_FENCING_TOKEN_ANNOTATION,
@@ -566,6 +571,83 @@ class KubernetesScaleActuator:
         return refreshed
 
     @staticmethod
+    def _reauthorize_prewarm(
+        decision: ScalingDecisionRecord,
+        reauthorize_prewarm: Callable[[], ScalingPrewarmPlan] | None,
+        *,
+        authority: RunnerWriterAuthority,
+    ) -> ScalingPrewarmPlan:
+        original = decision.prewarm_plan
+        if original is None:
+            raise ValueError("fenced scale-up requires a durable prewarm plan")
+        if not callable(reauthorize_prewarm):
+            raise TypeError("scale-up reauthorize_prewarm must be callable")
+        refreshed = reauthorize_prewarm()
+        if not isinstance(refreshed, ScalingPrewarmPlan):
+            raise TypeError("reauthorize_prewarm must return ScalingPrewarmPlan")
+        refreshed = ScalingPrewarmPlan.model_validate(refreshed.model_dump())
+        cache_age = (
+            authority.validated_at - refreshed.snapshot.observed_at
+        ).total_seconds()
+        if not 0 <= cache_age <= decision.policy.max_observation_age_seconds:
+            raise KubernetesScaleConflictError(
+                "prewarm authority is not fresh at final scale authorization"
+            )
+        if (
+            refreshed.snapshot.model_class != original.snapshot.model_class
+            or refreshed.snapshot.model_revision != original.snapshot.model_revision
+            or refreshed.snapshot.artifact_digest != original.snapshot.artifact_digest
+            or refreshed.snapshot.placement_binding_id
+            != original.snapshot.placement_binding_id
+            or refreshed.resource_flavor != original.resource_flavor
+            or refreshed.current_replicas != original.current_replicas
+            or refreshed.quota_target_replicas != original.quota_target_replicas
+            or refreshed.snapshot.observed_at < original.snapshot.observed_at
+            or refreshed.snapshot.cache_revision < original.snapshot.cache_revision
+        ):
+            raise KubernetesScaleConflictError(
+                "prewarm authority changed during Kubernetes mutation"
+            )
+        original_placements = {
+            placement.placement_id: placement
+            for placement in original.snapshot.placements
+            if placement.placement_id in original.runner_start_placement_ids
+        }
+        refreshed_placements = {
+            placement.placement_id: placement
+            for placement in refreshed.snapshot.placements
+        }
+        retained_ready_capacity = all(
+            placement_id in refreshed_placements
+            and (
+                refreshed_placements[placement_id].node_name,
+                refreshed_placements[placement_id].resource_flavor,
+                refreshed_placements[placement_id].profile_id,
+                refreshed_placements[placement_id].compatibility_approval_id,
+            )
+            == (
+                original_placement.node_name,
+                original_placement.resource_flavor,
+                original_placement.profile_id,
+                original_placement.compatibility_approval_id,
+            )
+            and not refreshed_placements[placement_id].assigned
+            and refreshed_placements[placement_id].healthy
+            and refreshed_placements[placement_id].schedulable
+            and refreshed_placements[placement_id].state
+            is ModelCachePlacementState.READY
+            for placement_id, original_placement in original_placements.items()
+        )
+        if (
+            refreshed.runner_target_replicas < decision.desired_replicas
+            or not retained_ready_capacity
+        ):
+            raise KubernetesScaleConflictError(
+                "prewarm authority no longer provides ready cache capacity"
+            )
+        return refreshed
+
+    @staticmethod
     def _parse_workload(
         payload: Any,
         *,
@@ -933,6 +1015,7 @@ class KubernetesScaleActuator:
         fence: KubernetesScaleFence,
         reauthorize: Callable[[], RunnerWriterAuthority],
         reauthorize_quota: Callable[[], ScalingQuotaAdmission] | None = None,
+        reauthorize_prewarm: Callable[[], ScalingPrewarmPlan] | None = None,
     ) -> KubernetesFencedScaleResult:
         """Apply a durable decision only under a previously claimed leader token."""
 
@@ -987,6 +1070,11 @@ class KubernetesScaleActuator:
             and decision.quota_admission is None
         ):
             raise ValueError("fenced scale-up requires a durable quota admission")
+        if (
+            decision.action is ScalingDecisionAction.SCALE_UP
+            and decision.prewarm_plan is None
+        ):
+            raise ValueError("fenced scale-up requires a durable prewarm plan")
 
         with self._lock:
             if self._closed:
@@ -1014,6 +1102,15 @@ class KubernetesScaleActuator:
             if observed.annotations.get(MODEL_REVISION_ANNOTATION) != fence.model_revision:
                 raise KubernetesScaleConflictError(
                     "workload model revision changed since the scaling decision"
+                )
+            if (
+                decision.action is ScalingDecisionAction.SCALE_UP
+                and decision.prewarm_plan is not None
+                and observed.annotations.get(CACHE_PLACEMENT_BINDING_ANNOTATION)
+                != decision.prewarm_plan.snapshot.placement_binding_id
+            ):
+                raise KubernetesScaleConflictError(
+                    "workload cache placement binding does not match the prewarm plan"
                 )
 
             if decision.action is ScalingDecisionAction.HOLD:
@@ -1127,6 +1224,20 @@ class KubernetesScaleActuator:
                     "path": self._annotation_path(SCALE_FENCING_TOKEN_ANNOTATION),
                     "value": str(authority.fencing_token),
                 },
+                *(
+                    [
+                        {
+                            "op": "test",
+                            "path": self._annotation_path(
+                                CACHE_PLACEMENT_BINDING_ANNOTATION
+                            ),
+                            "value": decision.prewarm_plan.snapshot.placement_binding_id,
+                        }
+                    ]
+                    if decision.action is ScalingDecisionAction.SCALE_UP
+                    and decision.prewarm_plan is not None
+                    else []
+                ),
                 {
                     "op": "test",
                     "path": "/spec/replicas",
@@ -1148,11 +1259,23 @@ class KubernetesScaleActuator:
             )
             authority = self._reauthorize(authority, reauthorize)
             if decision.action is ScalingDecisionAction.SCALE_UP:
-                self._reauthorize_quota(
+                refreshed_quota = self._reauthorize_quota(
                     decision,
                     reauthorize_quota,
                     authority=authority,
                 )
+                refreshed_prewarm = self._reauthorize_prewarm(
+                    decision,
+                    reauthorize_prewarm,
+                    authority=authority,
+                )
+                if (
+                    refreshed_prewarm.quota_target_replicas
+                    != refreshed_quota.admitted_replicas
+                ):
+                    raise KubernetesScaleConflictError(
+                        "final quota and prewarm authorities disagree"
+                    )
             response = self._client.patch(
                 url,
                 headers={**headers, "Content-Type": "application/json-patch+json"},
@@ -1174,6 +1297,12 @@ class KubernetesScaleActuator:
                 or self._stored_decision(updated) != expected_decision
                 or updated.annotations.get(RELEASE_ID_ANNOTATION) != fence.release_id
                 or updated.annotations.get(MODEL_REVISION_ANNOTATION) != fence.model_revision
+                or (
+                    decision.action is ScalingDecisionAction.SCALE_UP
+                    and decision.prewarm_plan is not None
+                    and updated.annotations.get(CACHE_PLACEMENT_BINDING_ANNOTATION)
+                    != decision.prewarm_plan.snapshot.placement_binding_id
+                )
             ):
                 raise InvalidKubernetesScaleResponseError(
                     "fenced scale response violated the mutation contract"

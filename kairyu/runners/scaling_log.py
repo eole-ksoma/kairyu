@@ -13,6 +13,7 @@ from typing import Literal, Protocol, runtime_checkable
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from kairyu.runners.models import RunnerStartupPhase
+from kairyu.runners.prewarm import ScalingPrewarmAction, ScalingPrewarmPlan
 from kairyu.runners.scaling import _MAX_SIGNED_BIGINT, ScalingPolicy
 from kairyu.runners.scaling_quota import ScalingQuotaAdmission
 
@@ -102,6 +103,7 @@ class ScalingDecisionReason(StrEnum):
     COOLDOWN = "cooldown"
     FAILURE_QUARANTINE = "failure_quarantine"
     BUDGET_LIMIT = "budget_limit"
+    CACHE_PREWARM = "cache_prewarm"
     HYSTERESIS = "hysteresis"
     NO_CHANGE = "no_change"
 
@@ -411,6 +413,7 @@ class ScalingDecisionRecord(BaseModel):
     window: ScalingObservationWindow
     target_revision: ScalingDecisionTargetRevision | None = None
     quota_admission: ScalingQuotaAdmission | None = None
+    prewarm_plan: ScalingPrewarmPlan | None = None
     action: ScalingDecisionAction
     reason: ScalingDecisionReason
     reason_detail: str = Field(default="", max_length=512)
@@ -478,6 +481,8 @@ class ScalingDecisionRecord(BaseModel):
             latest_source_times.append(latest.resources.observed_at)
         if latest.startup is not None:
             latest_source_times.append(latest.startup.observed_at)
+        if self.prewarm_plan is not None:
+            latest_source_times.append(self.prewarm_plan.snapshot.observed_at)
         derived_stale = (
             self.decided_at - min(latest_source_times)
         ).total_seconds() > self.policy.max_observation_age_seconds
@@ -526,6 +531,9 @@ class ScalingDecisionRecord(BaseModel):
             if not -self.policy.max_scale_down_step <= self.target_delta < 0:
                 raise ValueError("scale-down delta must satisfy the policy step bound")
         quota_constrained = False
+        cache_waiting = False
+        if self.prewarm_plan is not None and self.quota_admission is None:
+            raise ValueError("prewarm planning requires a quota admission")
         if self.quota_admission is not None:
             quota = self.quota_admission
             if quota.snapshot.model_class != self.window.model_class:
@@ -556,13 +564,51 @@ class ScalingDecisionRecord(BaseModel):
                 raise ValueError("quota request cannot exceed policy max_replicas")
             if quota.requested_replicas - current > self.policy.max_scale_up_step:
                 raise ValueError("quota request cannot bypass the policy scale-up step")
-            if quota.admitted_replicas != self.desired_replicas:
-                raise ValueError("decision desired replicas must match quota admission")
+            expected_desired = quota.admitted_replicas
+            if self.prewarm_plan is not None:
+                prewarm = self.prewarm_plan
+                if prewarm.snapshot.model_class != self.window.model_class:
+                    raise ValueError("prewarm plan and decision model_class must match")
+                if prewarm.snapshot.observed_at > self.decided_at:
+                    raise ValueError("prewarm observation cannot postdate the decision")
+                if prewarm.current_replicas != current:
+                    raise ValueError(
+                        "prewarm plan must use the observed current replicas"
+                    )
+                if prewarm.quota_target_replicas != quota.admitted_replicas:
+                    raise ValueError(
+                        "prewarm plan must use the quota-admitted replica target"
+                    )
+                if prewarm.resource_flavor != quota.snapshot.kueue.resource_flavor:
+                    raise ValueError(
+                        "prewarm plan must use the Kueue resource flavor"
+                    )
+                if (
+                    self.target_revision is not None
+                    and prewarm.snapshot.model_revision
+                    != self.target_revision.model_revision
+                ):
+                    raise ValueError(
+                        "prewarm model revision must match the decision target revision"
+                    )
+                expected_desired = prewarm.runner_target_replicas
+                cache_waiting = expected_desired == current
+                expected_prewarm_action = (
+                    ScalingPrewarmAction.RUNNER_START
+                    if expected_desired > current
+                    else prewarm.action
+                )
+                if prewarm.action is not expected_prewarm_action:
+                    raise ValueError("prewarm action must match the immediate Runner target")
+            if expected_desired != self.desired_replicas:
+                raise ValueError(
+                    "decision desired replicas must match staged quota admission"
+                )
             if self.action is ScalingDecisionAction.SCALE_DOWN:
                 raise ValueError("scale-down decisions cannot be authorized by quota")
             expected_action = (
                 ScalingDecisionAction.SCALE_UP
-                if quota.admitted_replicas > quota.current_replicas
+                if expected_desired > quota.current_replicas
                 else ScalingDecisionAction.HOLD
             )
             if self.action is not expected_action:
@@ -579,6 +625,14 @@ class ScalingDecisionRecord(BaseModel):
             raise ValueError("budget-limit reason requires a constrained quota admission")
         if quota_constrained and not self.inputs_stale and not budget_reason:
             raise ValueError("fresh constrained quota admission requires budget-limit reason")
+        cache_reason = self.reason is ScalingDecisionReason.CACHE_PREWARM
+        expected_cache_reason = (
+            cache_waiting and not self.inputs_stale and not quota_constrained
+        )
+        if cache_reason != expected_cache_reason:
+            raise ValueError(
+                "cache-prewarm reason must match an unconstrained staged scale-up hold"
+            )
         stale_reason = self.reason is ScalingDecisionReason.STALE_OBSERVATIONS
         if stale_reason != self.inputs_stale:
             raise ValueError("stale observations reason must match inputs_stale")
@@ -594,6 +648,7 @@ class ScalingDecisionRecord(BaseModel):
             "decision_generation",
             "target_revision",
             "quota_admission",
+            "prewarm_plan",
         ):
             if fingerprint_payload[optional_field] is None:
                 del fingerprint_payload[optional_field]

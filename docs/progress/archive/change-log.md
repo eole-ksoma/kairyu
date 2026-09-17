@@ -11,6 +11,37 @@ header (above the existing entries), keeping their original order.
 
 <!-- ARCHIVE-INSERT-POINT: new trimmed entries go directly below this line -->
 
+### 2026-09-11 — [progress] V4.1 full-model API gates pass on TP8
+- What: the SM120 overlay starts all eight GPUs, captures graphs and serves default/low/high/max reasoning, tools, images and cancellation; all initial API gates pass. UI effort selection uses the existing top-level L3 field. Performance selection and final context/restart gates remain pending.
+- Why: the experimental off toggle used template kwargs rejected by the unchanged legacy L3; retaining V4's effort vocabulary keeps the requested L2/L3 structure.
+- Refs: PR #597; example `MEASUREMENTS.md` initial runs `20260911T032048Z` through `20260911T032052Z`.
+
+### 2026-09-11 — [amendment] V4.1 indexer requires 64-token blocks and MXFP4 on SM120
+- What: correct the preceding 128-token manager-block candidate to 64/BLHNC, with SWA=64, C1=64, C2=32. Enable the existing MXFP4 indexer only for V4.1 on SM120. All 16 sparse-attention and four real indexer writer/prefill/decode numerical cases pass; full-model serving remains pending.
+- Why: DeepGEMM rejects C1 pages of 128 and SM120 FP8 C2 pages of 32; its MXFP4 path supports both required sizes. The indexer oracle independently unpacks actual Q/K bytes (max error 2.4e-7), and CPU guards retain rejection for unverified model/device combinations.
+- Refs: PR #597; FN-D9 V4.1 amendment; example `MEASUREMENTS.md`, `check_sm120_pages.py`, `check_sm120_indexer.py`. Supersedes the block-size choice in the preceding SM120 cache-compatibility entry.
+
+### 2026-09-11 — [progress] V4.1 SM120 cache compatibility
+- What: pin an example-local L1 overlay with 64-token SWA pages and C1 128-token dual-cache prefill instantiations; use manager blocks 128/BLHNC and disable unsupported adaptive verification. All 16 packed-cache GPU numerical cases pass at upstream DSV4 tolerances; full-model serving and tuning remain pending.
+- Why: the official V4.1 image's SWA pages and indexer layout assumptions fail startup on SM120 before serving. Source-anchored adaptations retain the existing kernel arithmetic and keep L2/L3 unchanged.
+- Refs: PR #597; `examples/deepseek-v4.1-flash-8gpu/{patch_runtime.py,check_sm120_pages.py,MEASUREMENTS.md}`; FN-D9 V4.1 amendment.
+
+### 2026-09-11 — [amendment] FN-D9: V4.1 Flash on one eight-GPU replica
+- What: add a separate V4.1 example with the existing V4 vision ReplicaPool/API/UI path; default thinking is the official high (75). Pin the checkpoint manifest and isolate runtime encoder alignment. Fixed-token measurements distinguish model output from visible content; completed-answer gates stay separate. CPU contracts pass; GPU selection is pending.
+- Why: the owner revised the initial two-replica request to one TP8 replica; the initial vLLM encoder maps high differently from the checkpoint, and content-only timing mismeasures all-reasoning output.
+- Refs: FN-D9 amendment in `docs/design/frontier-native-runtime.md`; `examples/deepseek-v4.1-flash-8gpu/`; implementation plan `2026-09-11-deepseek-v41-flash-example.md`.
+
+### 2026-09-08 — [progress] AsyncRequest API and chat worker
+- What: added tenant-scoped async Chat submission/status/result/cancel, bounded
+  persisted bodies, fixed lease-renewing workers, shared chat validation and
+  admission/metering, cancellation abort, and DeploymentSpec/lifespan wiring.
+  Review hardening keeps status/list projections body-free, derives queue
+  priority from tenant policy, bounds per-tenant queue growth, defers transient
+  quota pressure without starving other tenants, shortens heartbeats at
+  deadlines, and defers PostgreSQL connect to lifespan.
+- Refs: m10 A38; kairyu/async_requests/worker.py;
+  kairyu/entrypoints/server/async_request_routes.py; async_requests deployment
+
 ### 2026-09-07 — [progress] PostgreSQL AsyncRequest persistence
 - What: added the production RequestStore schema and backend with tenant-scoped
   idempotency, SKIP LOCKED claims, DB-clock renewal/takeover, fenced terminal

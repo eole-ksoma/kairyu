@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -14,6 +16,7 @@ from kairyu.runners import (
     ScalingDecisionAction,
     ScalingDecisionCapacityError,
     ScalingDecisionConflictError,
+    ScalingDecisionGenerationError,
     ScalingDecisionLog,
     ScalingDecisionReason,
     ScalingDecisionRecord,
@@ -41,6 +44,8 @@ def _record(
     decided_at: datetime | None = None,
     model_class: str = "interactive-14b",
     reason: ScalingDecisionReason = ScalingDecisionReason.NO_CHANGE,
+    action: ScalingDecisionAction = ScalingDecisionAction.HOLD,
+    decision_generation: int | None = None,
 ) -> ScalingDecisionRecord:
     observed_at = (decided_at or NOW + timedelta(seconds=1)) - timedelta(seconds=1)
     policy = ScalingPolicy(
@@ -80,6 +85,7 @@ def _record(
     )
     return ScalingDecisionRecord(
         decision_id=decision_id,
+        decision_generation=decision_generation,
         decided_at=decided_at or NOW + timedelta(seconds=1),
         catalog_revision=9,
         policy=policy,
@@ -90,12 +96,12 @@ def _record(
             ended_at=observed_at,
             observations=(observation,),
         ),
-        action=ScalingDecisionAction.HOLD,
+        action=action,
         reason=reason,
         demand_replicas=3,
         buffered_target_replicas=6,
-        desired_replicas=3,
-        target_delta=0,
+        desired_replicas=4 if action is ScalingDecisionAction.SCALE_UP else 3,
+        target_delta=1 if action is ScalingDecisionAction.SCALE_UP else 0,
     )
 
 
@@ -176,6 +182,35 @@ def test_cross_instance_append_replay_get_and_filtered_list(store_factory) -> No
     assert first.list(since=NOW + timedelta(seconds=2)) == (batch, newest)
 
 
+def test_pre_wp34_record_fingerprint_remains_readable() -> None:
+    record = _record()
+    legacy_payload = record.model_dump(mode="json")
+    legacy_payload.pop("decision_generation")
+    legacy_payload.pop("target_revision")
+    legacy_fingerprint = hashlib.sha256(
+        json.dumps(
+            legacy_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    row = (
+        record.decision_id,
+        record.policy.model_class,
+        record.decided_at,
+        record.window.started_at,
+        record.window.ended_at,
+        record.catalog_revision,
+        record.policy.policy_revision,
+        record.action.value,
+        legacy_fingerprint,
+        legacy_payload,
+    )
+
+    assert record.fingerprint == legacy_fingerprint
+    assert PostgresScalingDecisionLog._record(row) == record
+
+
 def test_changed_replay_conflicts_across_instances(store_factory) -> None:
     create, _store_id = store_factory
     first = create()
@@ -233,6 +268,44 @@ def test_concurrent_cross_instance_append_is_exactly_once(store_factory) -> None
             (store_id,),
         ).fetchone()
     assert count == (1,)
+
+
+def test_cross_instance_mutation_generation_is_durable_and_atomic(store_factory) -> None:
+    create, _store_id = store_factory
+    stores = tuple(create() for _ in range(8))
+    drafts = tuple(
+        _record(
+            f"scale-{index}",
+            action=ScalingDecisionAction.SCALE_UP,
+            reason=ScalingDecisionReason.QUEUE_PRESSURE,
+        )
+        for index in range(8)
+    )
+    with ThreadPoolExecutor(max_workers=len(stores)) as pool:
+        results = tuple(
+            pool.map(
+                lambda pair: pair[0].append(pair[1]),
+                zip(stores, drafts, strict=True),
+            )
+        )
+
+    assert {record.decision_generation for record in results} == set(range(1, 9))
+    replay = stores[0].append(drafts[0])
+    assert replay == stores[1].get(drafts[0].decision_id)
+
+
+def test_postgres_rejects_forged_generation_for_new_decision(store_factory) -> None:
+    create, _store_id = store_factory
+    store = create()
+    forged = _record(
+        "scale-forged",
+        action=ScalingDecisionAction.SCALE_UP,
+        reason=ScalingDecisionReason.QUEUE_PRESSURE,
+        decision_generation=4,
+    )
+
+    with pytest.raises(ScalingDecisionGenerationError, match="must not supply"):
+        store.append(forged)
 
 
 def test_startup_without_initialization_rejects_missing_tables(

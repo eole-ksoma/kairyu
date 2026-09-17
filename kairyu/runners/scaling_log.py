@@ -50,6 +50,42 @@ class ScalingDecisionAction(StrEnum):
     HOLD = "hold"
 
 
+class ScalingDecisionTargetRevision(BaseModel):
+    """Immutable Kubernetes workload revision bound into one decision."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    schema_version: Literal["runner-scaling-target-revision-v1"] = (
+        "runner-scaling-target-revision-v1"
+    )
+    target_kind: Literal["Deployment", "StatefulSet"]
+    namespace: str = Field(max_length=253)
+    name: str = Field(max_length=253)
+    election_id: str = Field(max_length=255)
+    fencing_token: int = Field(ge=1, le=_MAX_SIGNED_BIGINT)
+    workload_uid: str = Field(max_length=255)
+    workload_generation: int = Field(ge=1, le=_MAX_SIGNED_BIGINT)
+    release_id: str = Field(max_length=255)
+    model_revision: str = Field(max_length=255)
+
+    @field_validator(
+        "namespace",
+        "name",
+        "election_id",
+        "workload_uid",
+        "release_id",
+        "model_revision",
+    )
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _non_empty(value, name=info.field_name)
+
+    @field_validator("fencing_token", "workload_generation", mode="before")
+    @classmethod
+    def validate_integer(cls, value: object, info) -> object:
+        return _integer(value, name=info.field_name)
+
+
 class ScalingDecisionReason(StrEnum):
     INSUFFICIENT_OBSERVATIONS = "insufficient_observations"
     STALE_OBSERVATIONS = "stale_observations"
@@ -367,10 +403,12 @@ class ScalingDecisionRecord(BaseModel):
         "runner-scaling-decision-v1"
     )
     decision_id: str = Field(max_length=255)
+    decision_generation: int | None = Field(default=None, ge=1, le=_MAX_SIGNED_BIGINT)
     decided_at: datetime
     catalog_revision: int = Field(ge=1, le=_MAX_SIGNED_BIGINT)
     policy: ScalingPolicy
     window: ScalingObservationWindow
+    target_revision: ScalingDecisionTargetRevision | None = None
     action: ScalingDecisionAction
     reason: ScalingDecisionReason
     reason_detail: str = Field(default="", max_length=512)
@@ -402,6 +440,7 @@ class ScalingDecisionRecord(BaseModel):
 
     @field_validator(
         "catalog_revision",
+        "decision_generation",
         "demand_replicas",
         "buffered_target_replicas",
         "desired_replicas",
@@ -410,6 +449,8 @@ class ScalingDecisionRecord(BaseModel):
     )
     @classmethod
     def validate_integer(cls, value: object, info) -> object:
+        if value is None and info.field_name == "decision_generation":
+            return value
         return _integer(value, name=info.field_name)
 
     @field_validator("inputs_stale", mode="before")
@@ -474,6 +515,8 @@ class ScalingDecisionRecord(BaseModel):
                 raise ValueError("desired_replicas must satisfy policy min/max")
         if self.action is ScalingDecisionAction.HOLD and self.target_delta != 0:
             raise ValueError("hold decisions require target_delta=0")
+        if self.action is ScalingDecisionAction.HOLD and self.decision_generation is not None:
+            raise ValueError("hold decisions cannot consume a decision generation")
         if self.action is ScalingDecisionAction.SCALE_UP:
             if not 0 < self.target_delta <= self.policy.max_scale_up_step:
                 raise ValueError("scale-up delta must satisfy the policy step bound")
@@ -490,12 +533,26 @@ class ScalingDecisionRecord(BaseModel):
     @property
     def fingerprint(self) -> str:
         validated = type(self).model_validate(self.model_dump())
+        fingerprint_payload = validated.model_dump(mode="json")
+        for optional_field in ("decision_generation", "target_revision"):
+            if fingerprint_payload[optional_field] is None:
+                del fingerprint_payload[optional_field]
         payload = json.dumps(
-            validated.model_dump(mode="json"),
+            fingerprint_payload,
             sort_keys=True,
             separators=(",", ":"),
         ).encode()
         return hashlib.sha256(payload).hexdigest()
+
+    @property
+    def intent_fingerprint(self) -> str:
+        """Hash immutable decision content before durable generation allocation."""
+
+        validated = type(self).model_validate(self.model_dump())
+        payload = validated.model_dump(mode="json", exclude={"decision_generation"})
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
 
 
 class ScalingDecisionConflictError(RuntimeError):
@@ -504,6 +561,10 @@ class ScalingDecisionConflictError(RuntimeError):
 
 class ScalingDecisionCapacityError(RuntimeError):
     """The bounded decision log cannot accept another unique record."""
+
+
+class ScalingDecisionGenerationError(RuntimeError):
+    """A new mutating decision supplied or exhausted its durable generation."""
 
 
 @runtime_checkable
@@ -539,18 +600,43 @@ class InMemoryScalingDecisionLog:
 
     def append(self, record: ScalingDecisionRecord) -> ScalingDecisionRecord:
         record = self._validated(record)
-        fingerprint = record.fingerprint
         with self._lock:
             existing = self._records.get(record.decision_id)
             if existing is not None:
-                if existing[0] != fingerprint:
+                stored = existing[1]
+                matches = (
+                    stored.intent_fingerprint == record.intent_fingerprint
+                    if record.decision_generation is None
+                    else stored.fingerprint == record.fingerprint
+                )
+                if not matches:
                     raise ScalingDecisionConflictError(
                         "decision ID was already used with different content"
                     )
-                return existing[1].model_copy(deep=True)
+                return stored.model_copy(deep=True)
             if len(self._records) >= self._max_records:
                 raise ScalingDecisionCapacityError("decision log capacity is exhausted")
-            self._records[record.decision_id] = (fingerprint, record)
+            if record.action is not ScalingDecisionAction.HOLD:
+                if record.decision_generation is not None:
+                    raise ScalingDecisionGenerationError(
+                        "new scaling decisions must not supply decision_generation"
+                    )
+                previous = max(
+                    (
+                        stored.decision_generation or 0
+                        for _, stored in self._records.values()
+                        if stored.policy.model_class == record.policy.model_class
+                    ),
+                    default=0,
+                )
+                if previous >= _MAX_SIGNED_BIGINT:
+                    raise ScalingDecisionGenerationError(
+                        "scaling decision generation is exhausted"
+                    )
+                record = ScalingDecisionRecord.model_validate(
+                    record.model_copy(update={"decision_generation": previous + 1}).model_dump()
+                )
+            self._records[record.decision_id] = (record.fingerprint, record)
             return record.model_copy(deep=True)
 
     def get(self, decision_id: str) -> ScalingDecisionRecord:

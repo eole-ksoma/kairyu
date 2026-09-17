@@ -20,7 +20,14 @@ from kairyu.runners import (
     RunnerWriterAuthority,
 )
 from kairyu.runners.kubernetes import MODEL_REVISION_ANNOTATION, RELEASE_ID_ANNOTATION
+from kairyu.runners.prewarm import (
+    ModelCachePlacement,
+    ModelCachePlacementState,
+    ScalingPrewarmSnapshot,
+    plan_cache_aware_scale_up,
+)
 from kairyu.runners.scale_actuator import (
+    CACHE_PLACEMENT_BINDING_ANNOTATION,
     SCALE_DECISION_FINGERPRINT_ANNOTATION,
     SCALE_DECISION_GENERATION_ANNOTATION,
     SCALE_DECISION_ID_ANNOTATION,
@@ -112,6 +119,82 @@ def _quota_admission(*, current: int, requested: int):
     )
 
 
+def _prewarm_plan(
+    *,
+    current: int,
+    requested: int,
+    observed_at: datetime = NOW,
+    cache_revision: int = 7,
+    states: tuple[ModelCachePlacementState, ...] | None = None,
+):
+    if states is None:
+        states = (ModelCachePlacementState.READY,) * (requested - current)
+    snapshot = ScalingPrewarmSnapshot(
+        snapshot_id=f"cache-{current}-{requested}-{cache_revision}",
+        cache_revision=cache_revision,
+        observed_at=observed_at,
+        model_class="qwen-14b",
+        model_revision="model-revision-a",
+        artifact_digest="sha256:model-artifact-a",
+        placement_binding_id="binding-qwen-h100-a",
+        placements=tuple(
+            ModelCachePlacement(
+                placement_id=f"placement-{index:03d}",
+                node_name=f"gpu-node-{index:03d}",
+                resource_flavor="h100-sxm",
+                profile_id="h100-sxm-tp1",
+                compatibility_approval_id="compat-h100-qwen-v1",
+                state=state,
+            )
+            for index, state in enumerate(states)
+        ),
+    )
+    return plan_cache_aware_scale_up(
+        snapshot,
+        current_replicas=current,
+        quota_target_replicas=requested,
+        resource_flavor="h100-sxm",
+    )
+
+
+def _refresh_prewarm(
+    decision: ScalingDecisionRecord,
+    *,
+    state: ModelCachePlacementState = ModelCachePlacementState.READY,
+    observed_at: datetime = NOW + timedelta(seconds=1),
+    cache_revision: int = 8,
+    artifact_digest: str = "sha256:model-artifact-a",
+    node_name: str | None = None,
+):
+    original = decision.prewarm_plan
+    assert original is not None
+    snapshot = ScalingPrewarmSnapshot.model_validate(
+        original.snapshot.model_copy(
+            update={
+                "snapshot_id": f"cache-refresh-{cache_revision}",
+                "cache_revision": cache_revision,
+                "observed_at": observed_at,
+                "artifact_digest": artifact_digest,
+                "placements": tuple(
+                    placement.model_copy(
+                        update={
+                            "state": state,
+                            **({"node_name": node_name} if node_name is not None else {}),
+                        }
+                    )
+                    for placement in original.snapshot.placements
+                ),
+            }
+        ).model_dump()
+    )
+    return plan_cache_aware_scale_up(
+        snapshot,
+        current_replicas=original.current_replicas,
+        quota_target_replicas=original.quota_target_replicas,
+        resource_flavor=original.resource_flavor,
+    )
+
+
 def _decision(
     *,
     action: ScalingDecisionAction = ScalingDecisionAction.SCALE_UP,
@@ -164,6 +247,11 @@ def _decision(
         target_revision=target_revision,
         quota_admission=(
             _quota_admission(current=current, requested=desired)
+            if action is ScalingDecisionAction.SCALE_UP
+            else None
+        ),
+        prewarm_plan=(
+            _prewarm_plan(current=current, requested=desired)
             if action is ScalingDecisionAction.SCALE_UP
             else None
         ),
@@ -251,6 +339,7 @@ def _annotations(
     annotations = {
         RELEASE_ID_ANNOTATION: "release-a",
         MODEL_REVISION_ANNOTATION: "model-revision-a",
+        CACHE_PLACEMENT_BINDING_ANNOTATION: "binding-qwen-h100-a",
     }
     if token is not None:
         annotations.update(
@@ -344,6 +433,12 @@ def test_claim_then_fenced_scale_persists_full_decision_identity_and_retries(
             assert decision is not None
             values = {operation["path"]: operation.get("value") for operation in patch}
             assert values["/metadata/annotations/kairyu.ai~1scale-fencing-token"] == "1"
+            assert (
+                values[
+                    "/metadata/annotations/kairyu.ai~1cache-placement-binding"
+                ]
+                == "binding-qwen-h100-a"
+            )
             assert values["/metadata/annotations/kairyu.ai~1scale-decision-generation"] == "1"
             assert values["/metadata/annotations/kairyu.ai~1scale-decision-id"] == "decision-a"
             assert (
@@ -372,6 +467,7 @@ def test_claim_then_fenced_scale_persists_full_decision_identity_and_retries(
         fence=_fence(),
         reauthorize=lambda: _authority(),
         reauthorize_quota=lambda: decision.quota_admission,
+        reauthorize_prewarm=lambda: decision.prewarm_plan,
     )
     retry = actuator.apply_fenced(
         decision,
@@ -380,6 +476,7 @@ def test_claim_then_fenced_scale_persists_full_decision_identity_and_retries(
         fence=_fence(),
         reauthorize=lambda: _authority(),
         reauthorize_quota=lambda: decision.quota_admission,
+        reauthorize_prewarm=lambda: decision.prewarm_plan,
     )
 
     assert claim.applied is True
@@ -469,6 +566,7 @@ def test_successor_claim_between_old_read_and_patch_invalidates_old_cas(
             fence=_fence(),
             reauthorize=lambda: _authority(token=1),
             reauthorize_quota=lambda: decision.quota_admission,
+            reauthorize_prewarm=lambda: decision.prewarm_plan,
         )
     assert methods == ["GET", "PATCH"]
     client.close()
@@ -552,6 +650,7 @@ def test_revoked_quota_between_decision_and_patch_prevents_scale_up(
             fence=_fence(),
             reauthorize=lambda: _authority(),
             reauthorize_quota=lambda: revoked,
+            reauthorize_prewarm=lambda: decision.prewarm_plan,
         )
     assert methods == ["GET"]
     client.close()
@@ -577,6 +676,306 @@ def test_scale_up_requires_final_quota_reauthorization(tmp_path: Path) -> None:
             authority=_authority(),
             fence=_fence(),
             reauthorize=lambda: _authority(),
+        )
+    assert methods == ["GET"]
+    client.close()
+
+
+def test_scale_up_requires_final_prewarm_reauthorization(tmp_path: Path) -> None:
+    methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        return httpx.Response(
+            200,
+            json=_workload_payload(annotations=_annotations(token=1)),
+        )
+
+    actuator, client, log = _actuator(tmp_path, handler)
+    decision = _persist(log, _decision())
+
+    with pytest.raises(TypeError, match="reauthorize_prewarm"):
+        actuator.apply_fenced(
+            decision,
+            _target(),
+            authority=_authority(),
+            fence=_fence(),
+            reauthorize=lambda: _authority(),
+            reauthorize_quota=lambda: decision.quota_admission,
+        )
+    assert methods == ["GET"]
+    client.close()
+
+
+def test_revoked_ready_cache_between_decision_and_patch_prevents_scale_up(
+    tmp_path: Path,
+) -> None:
+    methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        return httpx.Response(
+            200,
+            json=_workload_payload(annotations=_annotations(token=1)),
+        )
+
+    actuator, client, log = _actuator(tmp_path, handler)
+    decision = _persist(log, _decision())
+    revoked = _refresh_prewarm(
+        decision,
+        state=ModelCachePlacementState.FAILED,
+    )
+
+    with pytest.raises(KubernetesScaleConflictError, match="ready cache capacity"):
+        actuator.apply_fenced(
+            decision,
+            _target(),
+            authority=_authority(),
+            fence=_fence(),
+            reauthorize=lambda: _authority(validated_at=NOW + timedelta(seconds=1)),
+            reauthorize_quota=lambda: decision.quota_admission,
+            reauthorize_prewarm=lambda: revoked,
+        )
+    assert methods == ["GET"]
+    client.close()
+
+
+def test_prewarm_revision_rollback_prevents_scale_up(tmp_path: Path) -> None:
+    methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        return httpx.Response(
+            200,
+            json=_workload_payload(annotations=_annotations(token=1)),
+        )
+
+    actuator, client, log = _actuator(tmp_path, handler)
+    decision = _persist(log, _decision())
+    rolled_back = _refresh_prewarm(decision, cache_revision=6)
+
+    with pytest.raises(KubernetesScaleConflictError, match="prewarm authority changed"):
+        actuator.apply_fenced(
+            decision,
+            _target(),
+            authority=_authority(),
+            fence=_fence(),
+            reauthorize=lambda: _authority(validated_at=NOW + timedelta(seconds=1)),
+            reauthorize_quota=lambda: decision.quota_admission,
+            reauthorize_prewarm=lambda: rolled_back,
+        )
+    assert methods == ["GET"]
+    client.close()
+
+
+def test_prewarm_artifact_change_prevents_scale_up(tmp_path: Path) -> None:
+    methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        return httpx.Response(
+            200,
+            json=_workload_payload(annotations=_annotations(token=1)),
+        )
+
+    actuator, client, log = _actuator(tmp_path, handler)
+    decision = _persist(log, _decision())
+    changed = _refresh_prewarm(
+        decision,
+        artifact_digest="sha256:other-model-artifact",
+    )
+
+    with pytest.raises(KubernetesScaleConflictError, match="prewarm authority changed"):
+        actuator.apply_fenced(
+            decision,
+            _target(),
+            authority=_authority(),
+            fence=_fence(),
+            reauthorize=lambda: _authority(validated_at=NOW + timedelta(seconds=1)),
+            reauthorize_quota=lambda: decision.quota_admission,
+            reauthorize_prewarm=lambda: changed,
+        )
+    assert methods == ["GET"]
+    client.close()
+
+
+def test_prewarm_placement_rebinding_prevents_scale_up(tmp_path: Path) -> None:
+    methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        return httpx.Response(
+            200,
+            json=_workload_payload(annotations=_annotations(token=1)),
+        )
+
+    actuator, client, log = _actuator(tmp_path, handler)
+    decision = _persist(log, _decision())
+    rebound = _refresh_prewarm(decision, node_name="replacement-gpu-node")
+
+    with pytest.raises(KubernetesScaleConflictError, match="ready cache capacity"):
+        actuator.apply_fenced(
+            decision,
+            _target(),
+            authority=_authority(),
+            fence=_fence(),
+            reauthorize=lambda: _authority(validated_at=NOW + timedelta(seconds=1)),
+            reauthorize_quota=lambda: decision.quota_admission,
+            reauthorize_prewarm=lambda: rebound,
+        )
+    assert methods == ["GET"]
+    client.close()
+
+
+def test_workload_cache_binding_mismatch_prevents_scale_up(tmp_path: Path) -> None:
+    methods: list[str] = []
+    annotations = _annotations(token=1)
+    annotations[CACHE_PLACEMENT_BINDING_ANNOTATION] = "other-binding"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        return httpx.Response(
+            200,
+            json=_workload_payload(annotations=annotations),
+        )
+
+    actuator, client, log = _actuator(tmp_path, handler)
+    decision = _persist(log, _decision())
+
+    with pytest.raises(KubernetesScaleConflictError, match="placement binding"):
+        actuator.apply_fenced(
+            decision,
+            _target(),
+            authority=_authority(),
+            fence=_fence(),
+            reauthorize=lambda: _authority(),
+            reauthorize_quota=lambda: decision.quota_admission,
+            reauthorize_prewarm=lambda: decision.prewarm_plan,
+        )
+    assert methods == ["GET"]
+    client.close()
+
+
+def test_final_quota_and_mixed_prewarm_target_must_still_agree(
+    tmp_path: Path,
+) -> None:
+    methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        return httpx.Response(
+            200,
+            json=_workload_payload(
+                replicas=3,
+                annotations=_annotations(token=1),
+            ),
+        )
+
+    original_quota = _quota_admission(current=3, requested=6)
+    original_prewarm = _prewarm_plan(
+        current=3,
+        requested=6,
+        states=(
+            ModelCachePlacementState.READY,
+            ModelCachePlacementState.READY,
+            ModelCachePlacementState.ABSENT,
+        ),
+    )
+    draft = ScalingDecisionRecord.model_validate(
+        _decision(current=3, desired=5, target_revision=_target_revision())
+        .model_copy(
+            update={
+                "quota_admission": original_quota,
+                "prewarm_plan": original_prewarm,
+            }
+        )
+        .model_dump()
+    )
+    original_kueue = original_quota.snapshot.kueue
+    reduced_snapshot = ScalingQuotaSnapshot.model_validate(
+        original_quota.snapshot.model_copy(
+            update={
+                "snapshot_id": "quota-reduced-final",
+                "quota_revision": 8,
+                "observed_at": NOW + timedelta(seconds=1),
+                "target_reserved_gpus": 10,
+                "kueue": original_kueue.model_copy(
+                    update={
+                        "resource_version": "42",
+                        "admitted_pods": 5,
+                        "admitted_gpus": 10,
+                    }
+                ),
+            }
+        ).model_dump()
+    )
+    reduced_quota = admit_scaling_quota(
+        reduced_snapshot,
+        current_replicas=3,
+        requested_replicas=6,
+    )
+    log = InMemoryScalingDecisionLog()
+    decision = log.append(draft)
+    actuator, client, _unused = _actuator(
+        tmp_path,
+        handler,
+        decision_log=log,
+    )
+
+    with pytest.raises(KubernetesScaleConflictError, match="disagree"):
+        actuator.apply_fenced(
+            decision,
+            _target(),
+            authority=_authority(),
+            fence=_fence(),
+            reauthorize=lambda: _authority(validated_at=NOW + timedelta(seconds=1)),
+            reauthorize_quota=lambda: reduced_quota,
+            reauthorize_prewarm=lambda: original_prewarm,
+        )
+    assert methods == ["GET"]
+    client.close()
+
+
+def test_stale_prewarm_at_final_authorization_prevents_scale_up(
+    tmp_path: Path,
+) -> None:
+    methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        return httpx.Response(
+            200,
+            json=_workload_payload(annotations=_annotations(token=1)),
+        )
+
+    actuator, client, log = _actuator(tmp_path, handler)
+    decision = _persist(log, _decision())
+    original_quota = decision.quota_admission
+    assert original_quota is not None
+    fresh_quota_snapshot = ScalingQuotaSnapshot.model_validate(
+        original_quota.snapshot.model_copy(
+            update={
+                "snapshot_id": "quota-final-auth",
+                "quota_revision": 8,
+                "observed_at": NOW + timedelta(seconds=1),
+            }
+        ).model_dump()
+    )
+    fresh_quota = admit_scaling_quota(
+        fresh_quota_snapshot,
+        current_replicas=original_quota.current_replicas,
+        requested_replicas=original_quota.requested_replicas,
+    )
+
+    with pytest.raises(KubernetesScaleConflictError, match="prewarm authority is not fresh"):
+        actuator.apply_fenced(
+            decision,
+            _target(),
+            authority=_authority(),
+            fence=_fence(),
+            reauthorize=lambda: _authority(validated_at=NOW + timedelta(seconds=31)),
+            reauthorize_quota=lambda: fresh_quota,
+            reauthorize_prewarm=lambda: decision.prewarm_plan,
         )
     assert methods == ["GET"]
     client.close()
@@ -611,6 +1010,7 @@ def test_stale_quota_at_final_authorization_prevents_scale_up(tmp_path: Path) ->
             fence=_fence(),
             reauthorize=lambda: late_authority,
             reauthorize_quota=lambda: decision.quota_admission,
+            reauthorize_prewarm=lambda: decision.prewarm_plan,
         )
     assert methods == ["GET"]
     client.close()
@@ -653,6 +1053,7 @@ def test_quota_revision_rollback_prevents_scale_up(tmp_path: Path) -> None:
             fence=_fence(),
             reauthorize=lambda: _authority(validated_at=NOW + timedelta(seconds=1)),
             reauthorize_quota=lambda: rolled_back,
+            reauthorize_prewarm=lambda: decision.prewarm_plan,
         )
     assert methods == ["GET"]
     client.close()
@@ -711,6 +1112,7 @@ def test_newer_generation_skips_abandoned_decision_and_delayed_one_is_rejected(
         fence=_fence(workload_generation=8),
         reauthorize=lambda: _authority(),
         reauthorize_quota=lambda: current.quota_admission,
+        reauthorize_prewarm=lambda: current.prewarm_plan,
     )
     assert applied.scale.applied is True
     assert current.decision_generation == 3
@@ -722,6 +1124,7 @@ def test_newer_generation_skips_abandoned_decision_and_delayed_one_is_rejected(
             fence=_fence(workload_generation=8),
             reauthorize=lambda: _authority(),
             reauthorize_quota=lambda: abandoned.quota_admission,
+            reauthorize_prewarm=lambda: abandoned.prewarm_plan,
         )
     client.close()
 
@@ -785,7 +1188,7 @@ def test_fenced_scale_up_requires_durable_quota_admission_before_io(
     log = InMemoryScalingDecisionLog()
     without_quota = ScalingDecisionRecord.model_validate(
         _decision(target_revision=_target_revision())
-        .model_copy(update={"quota_admission": None})
+        .model_copy(update={"quota_admission": None, "prewarm_plan": None})
         .model_dump()
     )
     decision = log.append(without_quota)
@@ -803,6 +1206,36 @@ def test_fenced_scale_up_requires_durable_quota_admission_before_io(
             fence=_fence(),
             reauthorize=lambda: _authority(),
             reauthorize_quota=lambda: decision.quota_admission,
+            reauthorize_prewarm=lambda: decision.prewarm_plan,
+        )
+    client.close()
+
+
+def test_fenced_scale_up_requires_durable_prewarm_plan_before_io(
+    tmp_path: Path,
+) -> None:
+    log = InMemoryScalingDecisionLog()
+    without_prewarm = ScalingDecisionRecord.model_validate(
+        _decision(target_revision=_target_revision())
+        .model_copy(update={"prewarm_plan": None})
+        .model_dump()
+    )
+    decision = log.append(without_prewarm)
+    actuator, client, _unused = _actuator(
+        tmp_path,
+        lambda _request: pytest.fail("Kubernetes must not be called"),
+        decision_log=log,
+    )
+
+    with pytest.raises(ValueError, match="durable prewarm plan"):
+        actuator.apply_fenced(
+            decision,
+            _target(),
+            authority=_authority(),
+            fence=_fence(),
+            reauthorize=lambda: _authority(),
+            reauthorize_quota=lambda: decision.quota_admission,
+            reauthorize_prewarm=lambda: decision.prewarm_plan,
         )
     client.close()
 
@@ -928,6 +1361,7 @@ def test_fenced_response_requires_exact_authority_decision_and_generation(
             fence=_fence(),
             reauthorize=lambda: _authority(),
             reauthorize_quota=lambda: decision.quota_admission,
+            reauthorize_prewarm=lambda: decision.prewarm_plan,
         )
     client.close()
 
@@ -959,6 +1393,7 @@ def test_fenced_result_revalidates_cross_field_identity(tmp_path: Path) -> None:
         fence=_fence(),
         reauthorize=lambda: _authority(),
         reauthorize_quota=lambda: decision.quota_admission,
+        reauthorize_prewarm=lambda: decision.prewarm_plan,
     )
     bypass = result.model_copy(
         update={"decision": decision.model_copy(update={"decision_id": "other"})}
@@ -1023,6 +1458,7 @@ def test_leader_gate_claims_before_fenced_scale(tmp_path: Path) -> None:
             fence=_fence(),
             reauthorize=elector.authority,
             reauthorize_quota=lambda: decision.quota_admission,
+            reauthorize_prewarm=lambda: decision.prewarm_plan,
         )
     )
     assert claim.applied is True

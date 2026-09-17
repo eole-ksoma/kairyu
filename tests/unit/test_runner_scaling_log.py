@@ -13,6 +13,8 @@ from pydantic import ValidationError
 from kairyu.runners import (
     InMemoryScalingDecisionLog,
     KueueScalingAdmission,
+    ModelCachePlacement,
+    ModelCachePlacementState,
     RunnerStartupPhase,
     ScalingDecisionAction,
     ScalingDecisionCapacityError,
@@ -24,6 +26,7 @@ from kairyu.runners import (
     ScalingObservation,
     ScalingObservationWindow,
     ScalingPolicy,
+    ScalingPrewarmSnapshot,
     ScalingQueueSnapshot,
     ScalingQuotaLimit,
     ScalingQuotaScope,
@@ -34,6 +37,7 @@ from kairyu.runners import (
     ScalingStartupSnapshot,
     admit_scaling_quota,
     kueue_scaling_workload_name,
+    plan_cache_aware_scale_up,
 )
 from kairyu.runners.postgres_scaling_log import PostgresScalingDecisionLog
 
@@ -225,6 +229,42 @@ def _quota_admission(
     )
 
 
+def _prewarm_plan(
+    *,
+    quota_target: int,
+    states: tuple[ModelCachePlacementState, ...],
+    observed_at: datetime = NOW,
+    resource_flavor: str = "h100-sxm",
+):
+    placements = tuple(
+        ModelCachePlacement(
+            placement_id=f"placement-{index:02d}",
+            node_name=f"gpu-node-{index:02d}",
+            resource_flavor=resource_flavor,
+            profile_id="h100-sxm-tp1",
+            compatibility_approval_id="compat-h100-qwen-v1",
+            state=state,
+        )
+        for index, state in enumerate(states)
+    )
+    snapshot = ScalingPrewarmSnapshot(
+        snapshot_id="prewarm-snapshot-1",
+        cache_revision=3,
+        observed_at=observed_at,
+        model_class="interactive-14b",
+        model_revision="model-revision-a",
+        artifact_digest="sha256:model-artifact-a",
+        placement_binding_id="binding-interactive-h100-a",
+        placements=placements,
+    )
+    return plan_cache_aware_scale_up(
+        snapshot,
+        current_replicas=3,
+        quota_target_replicas=quota_target,
+        resource_flavor=resource_flavor,
+    )
+
+
 def test_observation_captures_all_planned_input_families() -> None:
     observation = _observation("1", observed_at=NOW)
 
@@ -352,6 +392,7 @@ def test_legacy_schema_v1_fingerprint_and_postgres_row_remain_readable() -> None
         "decision_generation",
         "target_revision",
         "quota_admission",
+        "prewarm_plan",
     ):
         legacy_payload.pop(optional_field)
     legacy_fingerprint = hashlib.sha256(
@@ -390,6 +431,99 @@ def test_decision_persists_unconstrained_quota_and_kueue_admission() -> None:
 
     assert decision.quota_admission == quota
     assert decision.quota_admission.snapshot.kueue.cluster_queue == "tenant-a-gpu"
+
+
+def test_cache_fill_stage_holds_runner_start_and_persists_full_plan() -> None:
+    quota = _quota_admission(requested=6)
+    prewarm = _prewarm_plan(
+        quota_target=quota.admitted_replicas,
+        states=(
+            ModelCachePlacementState.FILLING,
+            ModelCachePlacementState.ABSENT,
+            ModelCachePlacementState.ABSENT,
+        ),
+    )
+
+    decision = _record(
+        quota_admission=quota,
+        prewarm_plan=prewarm,
+        action=ScalingDecisionAction.HOLD,
+        reason=ScalingDecisionReason.CACHE_PREWARM,
+    )
+
+    assert decision.desired_replicas == 3
+    assert decision.prewarm_plan is not None
+    assert decision.prewarm_plan.cache_fill_placement_ids == (
+        "placement-01",
+        "placement-02",
+    )
+
+
+def test_runner_start_stage_uses_only_ready_cache_capacity() -> None:
+    quota = _quota_admission(requested=6)
+    prewarm = _prewarm_plan(
+        quota_target=quota.admitted_replicas,
+        states=(
+            ModelCachePlacementState.READY,
+            ModelCachePlacementState.READY,
+            ModelCachePlacementState.ABSENT,
+        ),
+    )
+
+    decision = _record(
+        quota_admission=quota,
+        prewarm_plan=prewarm,
+        action=ScalingDecisionAction.SCALE_UP,
+        reason=ScalingDecisionReason.QUEUE_PRESSURE,
+        desired_replicas=5,
+        target_delta=2,
+    )
+
+    assert decision.prewarm_plan is not None
+    assert decision.prewarm_plan.quota_target_replicas == 6
+    assert decision.desired_replicas == 5
+    assert decision.prewarm_plan.runner_start_placement_ids == (
+        "placement-00",
+        "placement-01",
+    )
+
+
+def test_prewarm_plan_requires_quota_flavor_and_current_replica_binding() -> None:
+    quota = _quota_admission(requested=6)
+    wrong_flavor = _prewarm_plan(
+        quota_target=quota.admitted_replicas,
+        states=(ModelCachePlacementState.READY,),
+        resource_flavor="l40s-pcie",
+    )
+
+    with pytest.raises(ValidationError, match="Kueue resource flavor"):
+        _record(
+            quota_admission=quota,
+            prewarm_plan=wrong_flavor,
+            action=ScalingDecisionAction.SCALE_UP,
+            reason=ScalingDecisionReason.QUEUE_PRESSURE,
+            desired_replicas=4,
+            target_delta=1,
+        )
+
+
+def test_stale_prewarm_evidence_cannot_hide_behind_cache_hold() -> None:
+    quota = _quota_admission(requested=6)
+    prewarm = _prewarm_plan(
+        quota_target=quota.admitted_replicas,
+        states=(ModelCachePlacementState.ABSENT,) * 3,
+        observed_at=NOW - timedelta(seconds=31),
+    )
+
+    decision = _record(
+        quota_admission=quota,
+        prewarm_plan=prewarm,
+        action=ScalingDecisionAction.HOLD,
+        reason=ScalingDecisionReason.STALE_OBSERVATIONS,
+        inputs_stale=True,
+    )
+
+    assert decision.inputs_stale is True
 
 
 def test_budget_limit_reason_is_derived_from_quota_clamp() -> None:

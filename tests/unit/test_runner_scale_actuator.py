@@ -134,8 +134,26 @@ def _actuator(
         api_server="https://kubernetes.example",
         token_path=token_path,
         client=client,
+        allow_unfenced=True,
     )
     return actuator, client
+
+
+def test_unfenced_scale_is_disabled_by_default(tmp_path: Path) -> None:
+    token_path = tmp_path / "token"
+    token_path.write_text("token-one\n", encoding="utf-8")
+    client = httpx.Client(
+        transport=httpx.MockTransport(lambda _request: pytest.fail("must not perform I/O"))
+    )
+    actuator = KubernetesScaleActuator(
+        api_server="https://kubernetes.example",
+        token_path=token_path,
+        client=client,
+    )
+
+    with pytest.raises(RuntimeError, match="unfenced scale writes are disabled"):
+        actuator.apply(_decision(), _target())
+    client.close()
 
 
 def test_deployment_scale_uses_resource_version_cas_and_is_idempotent(

@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from kairyu.runners.models import RunnerStartupPhase
 from kairyu.runners.scaling import _MAX_SIGNED_BIGINT, ScalingPolicy
+from kairyu.runners.scaling_quota import ScalingQuotaAdmission
 
 _MAX_BUFFERED_TARGET_REPLICAS = 11_000_000
 
@@ -409,6 +410,7 @@ class ScalingDecisionRecord(BaseModel):
     policy: ScalingPolicy
     window: ScalingObservationWindow
     target_revision: ScalingDecisionTargetRevision | None = None
+    quota_admission: ScalingQuotaAdmission | None = None
     action: ScalingDecisionAction
     reason: ScalingDecisionReason
     reason_detail: str = Field(default="", max_length=512)
@@ -523,6 +525,60 @@ class ScalingDecisionRecord(BaseModel):
         if self.action is ScalingDecisionAction.SCALE_DOWN:
             if not -self.policy.max_scale_down_step <= self.target_delta < 0:
                 raise ValueError("scale-down delta must satisfy the policy step bound")
+        quota_constrained = False
+        if self.quota_admission is not None:
+            quota = self.quota_admission
+            if quota.snapshot.model_class != self.window.model_class:
+                raise ValueError("quota admission and decision model_class must match")
+            if self.target_revision is not None:
+                kueue = quota.snapshot.kueue
+                quota_target = (
+                    kueue.target_kind,
+                    kueue.target_namespace,
+                    kueue.target_name,
+                    kueue.target_uid,
+                )
+                decision_target = (
+                    self.target_revision.target_kind,
+                    self.target_revision.namespace,
+                    self.target_revision.name,
+                    self.target_revision.workload_uid,
+                )
+                if quota_target != decision_target:
+                    raise ValueError(
+                        "quota reservation target must match the decision target revision"
+                    )
+            if quota.snapshot.observed_at > self.decided_at:
+                raise ValueError("quota observation cannot postdate the decision")
+            if quota.current_replicas != current:
+                raise ValueError("quota admission must use the observed current replicas")
+            if quota.requested_replicas > self.policy.max_replicas:
+                raise ValueError("quota request cannot exceed policy max_replicas")
+            if quota.requested_replicas - current > self.policy.max_scale_up_step:
+                raise ValueError("quota request cannot bypass the policy scale-up step")
+            if quota.admitted_replicas != self.desired_replicas:
+                raise ValueError("decision desired replicas must match quota admission")
+            if self.action is ScalingDecisionAction.SCALE_DOWN:
+                raise ValueError("scale-down decisions cannot be authorized by quota")
+            expected_action = (
+                ScalingDecisionAction.SCALE_UP
+                if quota.admitted_replicas > quota.current_replicas
+                else ScalingDecisionAction.HOLD
+            )
+            if self.action is not expected_action:
+                raise ValueError("decision action must match the quota-admitted delta")
+            quota_age = (self.decided_at - quota.snapshot.observed_at).total_seconds()
+            if (
+                self.action is ScalingDecisionAction.SCALE_UP
+                and quota_age > self.policy.max_observation_age_seconds
+            ):
+                raise ValueError("stale quota evidence cannot authorize scale-up")
+            quota_constrained = quota.constrained
+        budget_reason = self.reason is ScalingDecisionReason.BUDGET_LIMIT
+        if budget_reason and not quota_constrained:
+            raise ValueError("budget-limit reason requires a constrained quota admission")
+        if quota_constrained and not self.inputs_stale and not budget_reason:
+            raise ValueError("fresh constrained quota admission requires budget-limit reason")
         stale_reason = self.reason is ScalingDecisionReason.STALE_OBSERVATIONS
         if stale_reason != self.inputs_stale:
             raise ValueError("stale observations reason must match inputs_stale")
@@ -534,7 +590,11 @@ class ScalingDecisionRecord(BaseModel):
     def fingerprint(self) -> str:
         validated = type(self).model_validate(self.model_dump())
         fingerprint_payload = validated.model_dump(mode="json")
-        for optional_field in ("decision_generation", "target_revision"):
+        for optional_field in (
+            "decision_generation",
+            "target_revision",
+            "quota_admission",
+        ):
             if fingerprint_payload[optional_field] is None:
                 del fingerprint_payload[optional_field]
         payload = json.dumps(

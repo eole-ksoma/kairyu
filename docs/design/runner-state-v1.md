@@ -374,9 +374,9 @@ serializes capacity checks, per-model mutation-generation allocation, and
 inserts. The primary key provides exactly-once decision IDs; reads revalidate
 both the JSON payload and its duplicated indexed metadata/fingerprint before
 returning it. Replaying either the original unallocated draft or the returned
-allocated record resolves to the same durable record. Optional WP3.4 fields are
-omitted from the canonical fingerprint when absent, preserving the fingerprint
-and readability of pre-WP3.4 schema-v1 rows.
+allocated record resolves to the same durable record. Optional WP3.4/WP3.5
+fields are omitted from the canonical fingerprint when absent, preserving the
+fingerprint and readability of older schema-v1 rows.
 
 PostgreSQL objects live in the explicitly qualified `public` schema. Startup
 fails closed unless ordered columns, nullability, primary/foreign/check
@@ -406,6 +406,69 @@ resolves the supplied decision by ID from its configured durable log and
 requires the complete fingerprint, so a caller-created generation is not an
 actuation capability. Parent workload PATCH is broader than scale-subresource
 RBAC, so deployment must use a dedicated service account and constrain the
-permitted workload/fields with admission policy. Quota/Kueue policy,
-cache-aware prewarm, scale-down drain integration, durable Runner status, and
-Kubernetes deletion remain separate changes.
+permitted workload/fields with admission policy.
+The legacy `apply()` scale-subresource primitive is disabled by default and can
+only be enabled explicitly for isolated verification; the production runtime
+must use `apply_fenced()`.
+
+## Quota and Kueue admission fence
+
+WP3.5 keeps quota allocation in the component that owns the complete tenant and
+cluster view. Kairyu does not duplicate Kueue cohort borrowing, lending, fair
+sharing, or preemption. `parse_kueue_scaling_admission()` instead converts one
+Kueue Workload v1beta1/v1beta2 response into an immutable admission identity:
+namespace/name/UID/generation/resourceVersion, LocalQueue, ClusterQueue,
+pod-set name/count, ResourceFlavor, GPU resource quantity, and full workload
+priority-class identity. Four required `kairyu.ai/scale-target-{kind,namespace,
+name,uid}` Workload annotations bind that reservation to exactly one Deployment
+or StatefulSet; the binding must equal the decision target revision before a
+write. The Workload's immutable `metadata.name` must additionally equal
+`kairyu-scale-<sha256(kind NUL namespace NUL name NUL uid)>`; changing only the
+annotations therefore cannot rebind an admitted reservation during a later
+decision, and a recreated target UID requires a new Workload. The admitted pod
+count and GPU quantity must match the target's immutable
+GPUs-per-replica shape. An inactive Workload, absent
+`Admitted=True` condition, or absent admission assignment produces a
+zero-capacity result. Ambiguous pod-set assignments, fractional GPU quantities,
+unsupported API versions, incomplete identity, or an `Admitted=True` condition
+whose `observedGeneration` does not equal the Workload generation fail closed.
+Kueue priority uses its native ordering where the higher integer has precedence.
+
+`ScalingQuotaSnapshot` combines that exact Kueue admission with three canonical
+nested budgets: cluster, model family, and tenant/model. Each budget records its
+hard GPU limit, usage excluding the target, and capacity reserved for
+higher-priority workloads. `target_reserved_gpus` is not an advisory local
+counter: it must equal the GPU quantity atomically admitted for the target
+Kueue Workload and fit the available capacity of every nested budget. Cluster,
+model-family, and tenant/model limits must therefore be projections of the same
+Kueue-owned reservation, with the deployment's ClusterQueue/cohort hierarchy
+encoding those budgets. They must never be produced by independent read/check
+logic. This makes Kueue the serialization point for simultaneous scale-ups of
+different models; Kairyu only derives independently auditable total replica
+ceilings from that reservation after dividing by the immutable GPUs-per-replica
+value.
+
+`admit_scaling_quota()` clamps a requested scale-up to the minimum cluster,
+family, tenant/model, and Kueue ceiling. It never converts exhausted quota into
+a scale-down: capacity below the live replica count yields HOLD. Every limiting
+scope is persisted in `ScalingQuotaAdmission`; a constrained decision must use
+the `budget_limit` reason unless stale-observation safety takes precedence,
+while an unconstrained decision cannot claim a budget limit. The decision
+validator binds the quota snapshot ID/revision and
+tenant/model capacity evidence to the observed current replicas, policy
+max/step, model class, and freshness window. `apply_fenced()` refuses a
+production scale-up without this durable admission and requires a fresh quota
+reauthorization immediately before PATCH. The refreshed nested limits must
+still admit the desired count and the Kueue Workload, queue, flavor, resource,
+and priority identity must be unchanged. Its observation timestamp is checked
+again against the just-refreshed leader authority and the policy freshness
+window, so replaying an unchanged but old admission cannot authorize a delayed
+PATCH. Quota revisions may advance but cannot roll back. Revocation,
+reassignment, a target-binding change, stale observation, revision rollback, or
+a lower ceiling fails closed. The decision fingerprint prevents replacing the
+original evidence after append.
+
+Kueue CRD installation, ClusterQueue/LocalQueue/ResourceFlavor definitions,
+the global reservation snapshot producer, and RBAC belong to deployment wiring
+in private-ai-cloud-iac. Cache-aware prewarm, scale-down drain integration,
+durable Runner status, and Kubernetes deletion remain separate changes.

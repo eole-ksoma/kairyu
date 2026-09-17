@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from kairyu.runners.models import RunnerStartupPhase
 from kairyu.runners.prewarm import ScalingPrewarmAction, ScalingPrewarmPlan
 from kairyu.runners.scaling import _MAX_SIGNED_BIGINT, ScalingPolicy
+from kairyu.runners.scaling_drain import ScalingDrainPlan
 from kairyu.runners.scaling_quota import ScalingQuotaAdmission
 
 _MAX_BUFFERED_TARGET_REPLICAS = 11_000_000
@@ -414,6 +415,7 @@ class ScalingDecisionRecord(BaseModel):
     target_revision: ScalingDecisionTargetRevision | None = None
     quota_admission: ScalingQuotaAdmission | None = None
     prewarm_plan: ScalingPrewarmPlan | None = None
+    drain_plan: ScalingDrainPlan | None = None
     action: ScalingDecisionAction
     reason: ScalingDecisionReason
     reason_detail: str = Field(default="", max_length=512)
@@ -483,6 +485,8 @@ class ScalingDecisionRecord(BaseModel):
             latest_source_times.append(latest.startup.observed_at)
         if self.prewarm_plan is not None:
             latest_source_times.append(self.prewarm_plan.snapshot.observed_at)
+        if self.drain_plan is not None:
+            latest_source_times.append(self.drain_plan.source_observed_at)
         derived_stale = (
             self.decided_at - min(latest_source_times)
         ).total_seconds() > self.policy.max_observation_age_seconds
@@ -530,6 +534,41 @@ class ScalingDecisionRecord(BaseModel):
         if self.action is ScalingDecisionAction.SCALE_DOWN:
             if not -self.policy.max_scale_down_step <= self.target_delta < 0:
                 raise ValueError("scale-down delta must satisfy the policy step bound")
+        if self.drain_plan is not None:
+            drain = self.drain_plan
+            if self.action is not ScalingDecisionAction.SCALE_DOWN:
+                raise ValueError("drain plans may authorize only scale-down decisions")
+            if drain.snapshot.model_class != self.window.model_class:
+                raise ValueError("drain plan and decision model_class must match")
+            if drain.snapshot.observed_at > self.decided_at:
+                raise ValueError("drain observation cannot postdate the decision")
+            if drain.current_replicas != current:
+                raise ValueError("drain plan must use the observed current replicas")
+            if drain.desired_replicas != self.desired_replicas:
+                raise ValueError("drain plan must use the decision replica target")
+            if self.target_revision is not None:
+                drain_target = (
+                    "StatefulSet",
+                    drain.snapshot.namespace,
+                    drain.snapshot.statefulset_name,
+                    drain.snapshot.workload_uid,
+                    drain.snapshot.workload_generation,
+                    drain.snapshot.release_id,
+                    drain.snapshot.model_revision,
+                )
+                decision_target = (
+                    self.target_revision.target_kind,
+                    self.target_revision.namespace,
+                    self.target_revision.name,
+                    self.target_revision.workload_uid,
+                    self.target_revision.workload_generation,
+                    self.target_revision.release_id,
+                    self.target_revision.model_revision,
+                )
+                if drain_target != decision_target:
+                    raise ValueError(
+                        "drain plan must match the decision target revision"
+                    )
         quota_constrained = False
         cache_waiting = False
         if self.prewarm_plan is not None and self.quota_admission is None:
@@ -649,6 +688,7 @@ class ScalingDecisionRecord(BaseModel):
             "target_revision",
             "quota_admission",
             "prewarm_plan",
+            "drain_plan",
         ):
             if fingerprint_payload[optional_field] is None:
                 del fingerprint_payload[optional_field]

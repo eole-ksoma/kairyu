@@ -470,8 +470,7 @@ original evidence after append.
 
 Kueue CRD installation, ClusterQueue/LocalQueue/ResourceFlavor definitions,
 the global reservation snapshot producer, and RBAC belong to deployment wiring
-in private-ai-cloud-iac. Scale-down drain integration, durable Runner status,
-and Kubernetes deletion remain separate changes.
+in private-ai-cloud-iac. Durable Runner-status storage remains separate wiring.
 
 ## Cache-aware staged scale-out
 
@@ -537,3 +536,63 @@ missing or mismatched binding fails before scale-out. Its concrete scheduler,
 DaemonSet, PVC/local-storage, affinity, RBAC, Kueue, and binding-attestation
 wiring belongs to private-ai-cloud-iac and is a deployment gate before enabling
 production autoscaling.
+
+## Drain-authorized deterministic scale-down
+
+WP3.7 connects the WP2.4 drain proof to the production scaling actuator without
+letting a replica-count write choose an unverified victim. Each candidate first
+stops queue intake and leaves routing through `ReplicaPoolDrainController`, then
+records authoritative post-fence `active_requests=0` evidence and an exact
+`RunnerTerminationAuthorization`. Before authorization, deployment-side drain
+integration must install the `kairyu.ai/scale-down-drain` Pod finalizer and RBAC
+must reserve removal of that deletion hold to the leader-fenced scale actuator;
+that installer remains part of the deferred runtime wiring. A
+`ScalingDrainSnapshot` binds those immutable
+Runner and Pod identities to one StatefulSet UID, generation, release, model
+revision, and monotonic drain revision. `plan_statefulset_scale_down()` selects
+exactly the ordinal interval `[desired_replicas, current_replicas)`, which is the
+highest-ordinal suffix removed by an ordinary StatefulSet replica reduction.
+Missing authorization for any selected ordinal fails closed. This version
+supports the standard zero start ordinal only; a StatefulSet configured with a
+non-zero `spec.ordinals.start` is rejected until that offset is part of the
+durable plan contract.
+
+The append-only scale decision persists that complete `ScalingDrainPlan`; its
+fingerprint, oldest selected Runner observation time, current count, desired
+count, and target revision are validated with the other decision inputs. A new
+outer snapshot timestamp therefore cannot launder stale `active_requests=0`
+evidence. Immediately before mutation, `reauthorize_drain()` must return a
+fresh, non-rollback snapshot with the same target and exact candidate Runner,
+Pod, ordinal, and termination-authorization evidence. The actuator then reads
+each selected Pod and verifies its UID, StatefulSet owner, deletion hold, and
+non-deleting state. The finalizer prevents that exact Pod from disappearing and
+being replaced between this check and the parent replica-count patch.
+
+After the parent StatefulSet PATCH commits, Kairyu issues DELETE for every
+selected Pod with a UID precondition and removes only its own finalizer through
+a UID/finalizer JSON Patch. Finalizers are released one ordinal at a time from
+highest to lowest. A lower ordinal remains held until every higher selected Pod
+is absent. The actuator waits up to 30 seconds for each zero-grace deletion; a
+timeout returns an explicit cleanup-pending error, and the standard controller
+retry resumes the same durable decision. This lets the StatefulSet controller
+preserve ordered termination while completing the already-authorized removal
+without a replacement-UID race.
+Existing decision annotations and parent resourceVersion/generation tests retain
+concurrent-write behavior. If the actuator crashes after committing the parent
+scale but before releasing every Pod, an exact retry uses the durable plan to
+release only surviving held UIDs; already absent ordinals are read-only no-ops.
+If leadership changes in that interval, a successor with the same election ID
+and a strictly newer fencing token may perform only this cleanup after proving
+the exact decision fingerprint, applied generation, and desired count on the
+parent; it cannot reuse the old decision for another parent mutation.
+The watcher/reconciler later observes each Pod disappearance and records the
+corresponding terminal Runner state.
+
+Deployment scale-down remains disabled in the fenced production path. A
+Deployment replica decrease permits its controller to choose victims, while
+pod-deletion-cost and similar hints do not provide the exact deletion guarantee
+required by a drain authorization. Supporting Deployment shrink therefore
+requires a future targeted-eviction adapter with equivalent identity, fencing,
+and idempotency semantics. Kubernetes runtime wiring, durable status inventory,
+and the live drain/scale acceptance run remain deployment gates and are deferred
+to the consolidated Phase 3 environment verification.

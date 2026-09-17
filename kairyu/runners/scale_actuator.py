@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import os
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
@@ -21,6 +22,7 @@ from kairyu.runners.prewarm import (
     ModelCachePlacementState,
     ScalingPrewarmPlan,
 )
+from kairyu.runners.scaling_drain import ScalingDrainCandidate, ScalingDrainPlan
 from kairyu.runners.scaling_log import (
     ScalingDecisionAction,
     ScalingDecisionLog,
@@ -35,6 +37,7 @@ SCALE_DECISION_GENERATION_ANNOTATION = "kairyu.ai/scale-decision-generation"
 SCALE_DECISION_ID_ANNOTATION = "kairyu.ai/scale-decision-id"
 SCALE_DECISION_FINGERPRINT_ANNOTATION = "kairyu.ai/scale-decision-fingerprint"
 CACHE_PLACEMENT_BINDING_ANNOTATION = "kairyu.ai/cache-placement-binding"
+SCALE_DOWN_DRAIN_FINALIZER = "kairyu.ai/scale-down-drain"
 _SCALE_AUTHORITY_ANNOTATIONS = (
     SCALE_ELECTION_ID_ANNOTATION,
     SCALE_FENCING_TOKEN_ANNOTATION,
@@ -48,6 +51,10 @@ _SCALE_DECISION_ANNOTATIONS = (
 
 class KubernetesScaleConflictError(RuntimeError):
     """The workload changed concurrently with a scale-subresource write."""
+
+
+class KubernetesScaleCleanupPendingError(KubernetesScaleConflictError):
+    """An applied ordered scale-down still has a terminating higher ordinal."""
 
 
 class InvalidKubernetesScaleResponseError(RuntimeError):
@@ -198,6 +205,7 @@ class KubernetesFencedScaleResult(BaseModel):
     decision: ScalingDecisionRecord
     authority: RunnerWriterAuthority
     fence: KubernetesScaleFence
+    successor_cleanup: bool = False
     workload_generation_before: int = Field(ge=1, le=2**63 - 1)
     workload_generation_after: int = Field(ge=1, le=2**63 - 1)
 
@@ -210,6 +218,13 @@ class KubernetesFencedScaleResult(BaseModel):
     def validate_integer(cls, value: object, info) -> object:
         if type(value) is not int:
             raise ValueError(f"{info.field_name} must be an integer")
+        return value
+
+    @field_validator("successor_cleanup", mode="before")
+    @classmethod
+    def validate_boolean(cls, value: object) -> object:
+        if type(value) is not bool:
+            raise ValueError("successor_cleanup must be a boolean")
         return value
 
     @model_validator(mode="after")
@@ -229,14 +244,28 @@ class KubernetesFencedScaleResult(BaseModel):
             revision.target_kind != self.scale.target.kind.value
             or revision.namespace != self.scale.target.namespace
             or revision.name != self.scale.target.name
-            or revision.election_id != self.authority.election_id
-            or revision.fencing_token != self.authority.fencing_token
             or revision.workload_uid != self.fence.workload_uid
             or revision.workload_generation != self.fence.workload_generation
             or revision.release_id != self.fence.release_id
             or revision.model_revision != self.fence.model_revision
         ):
             raise ValueError("fenced result decision target revision is inconsistent")
+        authority_matches_decision = (
+            revision.election_id == self.authority.election_id
+            and revision.fencing_token == self.authority.fencing_token
+        )
+        if self.successor_cleanup:
+            if (
+                self.scale.applied
+                or self.decision.action is not ScalingDecisionAction.SCALE_DOWN
+                or revision.election_id != self.authority.election_id
+                or self.authority.fencing_token <= revision.fencing_token
+            ):
+                raise ValueError(
+                    "successor cleanup requires a newer leader and a previously applied scale-down"
+                )
+        elif not authority_matches_decision:
+            raise ValueError("fenced result authority must match the scale decision")
         if self.decision.action is ScalingDecisionAction.HOLD:
             if self.decision.decision_generation is not None:
                 raise ValueError("hold result cannot consume a decision generation")
@@ -331,11 +360,20 @@ class KubernetesScaleAuthorityClaim(BaseModel):
 @dataclass(frozen=True)
 class _WorkloadSnapshot:
     replicas: int
+    statefulset_start_ordinal: int | None
     resource_version: str
     uid: str
     generation: int
     annotations: dict[str, str]
     annotations_present: bool
+
+
+@dataclass(frozen=True)
+class _DrainPodSnapshot:
+    name: str
+    uid: str
+    finalizers: tuple[str, ...]
+    deleting: bool
 
 
 class KubernetesScaleActuator:
@@ -351,6 +389,8 @@ class KubernetesScaleActuator:
     """
 
     _SERVICE_ACCOUNT_DIR = Path("/var/run/secrets/kubernetes.io/serviceaccount")
+    _DRAIN_DELETE_WAIT_SECONDS = 30.0
+    _DRAIN_DELETE_POLL_SECONDS = 0.25
 
     def __init__(
         self,
@@ -408,6 +448,11 @@ class KubernetesScaleActuator:
         namespace = quote(target.namespace, safe="")
         name = quote(target.name, safe="")
         return f"{self._api_server}/apis/apps/v1/namespaces/{namespace}/{target.kind.plural}/{name}"
+
+    def _pod_url(self, *, namespace: str, name: str) -> str:
+        namespace = quote(namespace, safe="")
+        name = quote(name, safe="")
+        return f"{self._api_server}/api/v1/namespaces/{namespace}/pods/{name}"
 
     def _headers(self) -> dict[str, str]:
         token = self._token_path.read_text(encoding="utf-8").strip()
@@ -648,6 +693,97 @@ class KubernetesScaleActuator:
         return refreshed
 
     @staticmethod
+    def _reauthorize_drain(
+        decision: ScalingDecisionRecord,
+        reauthorize_drain: Callable[[], ScalingDrainPlan] | None,
+        *,
+        authority: RunnerWriterAuthority,
+    ) -> ScalingDrainPlan:
+        original = decision.drain_plan
+        if original is None:
+            raise ValueError("fenced scale-down requires a durable drain plan")
+        if not callable(reauthorize_drain):
+            raise TypeError("scale-down reauthorize_drain must be callable")
+        refreshed = reauthorize_drain()
+        if not isinstance(refreshed, ScalingDrainPlan):
+            raise TypeError("reauthorize_drain must return ScalingDrainPlan")
+        refreshed = ScalingDrainPlan.model_validate(refreshed.model_dump())
+        drain_age = (
+            authority.validated_at - refreshed.source_observed_at
+        ).total_seconds()
+        if not 0 <= drain_age <= decision.policy.max_observation_age_seconds:
+            raise KubernetesScaleConflictError(
+                "drain authority is not fresh at final scale authorization"
+            )
+        original_identity = (
+            original.snapshot.model_class,
+            original.snapshot.namespace,
+            original.snapshot.statefulset_name,
+            original.snapshot.workload_uid,
+            original.snapshot.workload_generation,
+            original.snapshot.release_id,
+            original.snapshot.model_revision,
+            original.current_replicas,
+            original.desired_replicas,
+            original.candidate_runner_ids,
+            original.candidate_pod_uids,
+        )
+        refreshed_identity = (
+            refreshed.snapshot.model_class,
+            refreshed.snapshot.namespace,
+            refreshed.snapshot.statefulset_name,
+            refreshed.snapshot.workload_uid,
+            refreshed.snapshot.workload_generation,
+            refreshed.snapshot.release_id,
+            refreshed.snapshot.model_revision,
+            refreshed.current_replicas,
+            refreshed.desired_replicas,
+            refreshed.candidate_runner_ids,
+            refreshed.candidate_pod_uids,
+        )
+        if (
+            refreshed_identity != original_identity
+            or refreshed.snapshot.observed_at < original.snapshot.observed_at
+            or refreshed.snapshot.drain_revision < original.snapshot.drain_revision
+            or refreshed.source_observed_at < original.source_observed_at
+        ):
+            raise KubernetesScaleConflictError(
+                "drain authority changed during Kubernetes mutation"
+            )
+        original_candidates = {
+            candidate.workload_ordinal: candidate
+            for candidate in original.snapshot.candidates
+            if candidate.status.pod_uid in original.candidate_pod_uids
+        }
+        refreshed_candidates = {
+            candidate.workload_ordinal: candidate
+            for candidate in refreshed.snapshot.candidates
+            if candidate.status.pod_uid in refreshed.candidate_pod_uids
+        }
+        evidence_retained = original_candidates.keys() == refreshed_candidates.keys() and all(
+            (
+                refreshed_candidates[ordinal].pod_name,
+                refreshed_candidates[ordinal].status.runner_id,
+                refreshed_candidates[ordinal].status.pod_uid,
+                refreshed_candidates[ordinal].status.termination_authorization,
+            )
+            == (
+                candidate.pod_name,
+                candidate.status.runner_id,
+                candidate.status.pod_uid,
+                candidate.status.termination_authorization,
+            )
+            and refreshed_candidates[ordinal].status.observed_at
+            >= candidate.status.observed_at
+            for ordinal, candidate in original_candidates.items()
+        )
+        if not evidence_retained:
+            raise KubernetesScaleConflictError(
+                "drain authority no longer authorizes the removed StatefulSet ordinals"
+            )
+        return refreshed
+
+    @staticmethod
     def _parse_workload(
         payload: Any,
         *,
@@ -687,6 +823,24 @@ class KubernetesScaleActuator:
             raise InvalidKubernetesScaleResponseError(
                 "workload spec.replicas must be an integer in [0, 100000]"
             )
+        statefulset_start_ordinal: int | None = None
+        if target.kind is KubernetesScalableKind.STATEFUL_SET:
+            ordinals = spec.get("ordinals")
+            if ordinals is None:
+                statefulset_start_ordinal = 0
+            elif not isinstance(ordinals, dict):
+                raise InvalidKubernetesScaleResponseError(
+                    "StatefulSet spec.ordinals must be an object"
+                )
+            else:
+                statefulset_start_ordinal = ordinals.get("start", 0)
+                if (
+                    type(statefulset_start_ordinal) is not int
+                    or not 0 <= statefulset_start_ordinal <= 100_000
+                ):
+                    raise InvalidKubernetesScaleResponseError(
+                        "StatefulSet start ordinal must be an integer in [0, 100000]"
+                    )
         annotations_present = "annotations" in metadata
         annotations_payload = metadata.get("annotations", {})
         if not isinstance(annotations_payload, dict) or any(
@@ -698,12 +852,226 @@ class KubernetesScaleActuator:
             )
         return _WorkloadSnapshot(
             replicas=replicas,
+            statefulset_start_ordinal=statefulset_start_ordinal,
             resource_version=resource_version,
             uid=uid,
             generation=generation,
             annotations=dict(annotations_payload),
             annotations_present=annotations_present,
         )
+
+    @staticmethod
+    def _parse_drain_pod(
+        payload: Any,
+        *,
+        candidate: ScalingDrainCandidate,
+        plan: ScalingDrainPlan,
+    ) -> _DrainPodSnapshot:
+        if not isinstance(payload, dict):
+            raise InvalidKubernetesScaleResponseError(
+                "drain Pod response must be an object"
+            )
+        if payload.get("apiVersion") != "v1" or payload.get("kind") != "Pod":
+            raise InvalidKubernetesScaleResponseError(
+                "drain Pod response must use v1 kind Pod"
+            )
+        metadata = payload.get("metadata")
+        if not isinstance(metadata, dict):
+            raise InvalidKubernetesScaleResponseError(
+                "drain Pod response metadata must be an object"
+            )
+        name = metadata.get("name")
+        namespace = metadata.get("namespace")
+        uid = metadata.get("uid")
+        if (
+            name != candidate.pod_name
+            or namespace != plan.snapshot.namespace
+            or uid != candidate.status.pod_uid
+        ):
+            raise KubernetesScaleConflictError(
+                "drain Pod identity changed before StatefulSet scale-down"
+            )
+        finalizers = metadata.get("finalizers", [])
+        if (
+            not isinstance(finalizers, list)
+            or any(not isinstance(value, str) or not value for value in finalizers)
+            or len(set(finalizers)) != len(finalizers)
+        ):
+            raise InvalidKubernetesScaleResponseError(
+                "drain Pod finalizers must be unique non-empty strings"
+            )
+        owner_references = metadata.get("ownerReferences", [])
+        if not isinstance(owner_references, list) or not any(
+            isinstance(owner, dict)
+            and owner.get("apiVersion") == "apps/v1"
+            and owner.get("kind") == "StatefulSet"
+            and owner.get("name") == plan.snapshot.statefulset_name
+            and owner.get("uid") == plan.snapshot.workload_uid
+            and owner.get("controller") is True
+            for owner in owner_references
+        ):
+            raise KubernetesScaleConflictError(
+                "drain Pod is not controlled by the planned StatefulSet"
+            )
+        deletion_timestamp = metadata.get("deletionTimestamp")
+        if deletion_timestamp is not None and not isinstance(deletion_timestamp, str):
+            raise InvalidKubernetesScaleResponseError(
+                "drain Pod deletionTimestamp must be a string"
+            )
+        return _DrainPodSnapshot(
+            name=name,
+            uid=uid,
+            finalizers=tuple(finalizers),
+            deleting=deletion_timestamp is not None,
+        )
+
+    def _observe_drain_pods(
+        self,
+        plan: ScalingDrainPlan,
+        *,
+        headers: dict[str, str],
+        allow_absent: bool,
+        allow_deleting: bool,
+        allow_released: bool,
+    ) -> tuple[_DrainPodSnapshot, ...]:
+        observed: list[_DrainPodSnapshot] = []
+        for candidate in plan.selected_candidates:
+            response = self._client.get(
+                self._pod_url(
+                    namespace=plan.snapshot.namespace,
+                    name=candidate.pod_name,
+                ),
+                headers=headers,
+            )
+            if response.status_code == 404 and allow_absent:
+                continue
+            if response.status_code == 404:
+                raise KubernetesScaleConflictError(
+                    "drain Pod disappeared before StatefulSet scale-down"
+                )
+            response.raise_for_status()
+            pod = self._parse_drain_pod(
+                self._response_payload(response),
+                candidate=candidate,
+                plan=plan,
+            )
+            if SCALE_DOWN_DRAIN_FINALIZER not in pod.finalizers:
+                if allow_released and pod.deleting:
+                    observed.append(pod)
+                    continue
+                raise KubernetesScaleConflictError(
+                    "drain Pod is missing its scale-down deletion hold"
+                )
+            if pod.deleting and not allow_deleting:
+                raise KubernetesScaleConflictError(
+                    "drain Pod deletion started before StatefulSet scale-down"
+                )
+            observed.append(pod)
+        return tuple(observed)
+
+    def _release_drain_pods(
+        self,
+        plan: ScalingDrainPlan,
+        pods: tuple[_DrainPodSnapshot, ...],
+        *,
+        authority: RunnerWriterAuthority,
+        reauthorize: Callable[[], RunnerWriterAuthority],
+        headers: dict[str, str],
+    ) -> RunnerWriterAuthority:
+        pods_by_name = {pod.name: pod for pod in pods}
+        for candidate in reversed(plan.selected_candidates):
+            pod = pods_by_name.get(candidate.pod_name)
+            if pod is None:
+                continue
+            if SCALE_DOWN_DRAIN_FINALIZER not in pod.finalizers:
+                self._wait_for_drain_pod_absence(
+                    candidate,
+                    plan,
+                    headers=headers,
+                )
+                continue
+            authority = self._reauthorize(authority, reauthorize)
+            url = self._pod_url(namespace=plan.snapshot.namespace, name=pod.name)
+            response = self._client.request(
+                "DELETE",
+                url,
+                headers={**headers, "Content-Type": "application/json"},
+                json={
+                    "apiVersion": "v1",
+                    "kind": "DeleteOptions",
+                    "gracePeriodSeconds": 0,
+                    "preconditions": {"uid": pod.uid},
+                },
+            )
+            if response.status_code in {409, 422}:
+                raise KubernetesScaleConflictError(
+                    "drain Pod changed before preconditioned deletion"
+                )
+            if response.status_code == 404:
+                raise KubernetesScaleConflictError(
+                    "held drain Pod disappeared before preconditioned deletion"
+                )
+            response.raise_for_status()
+            finalizer_index = pod.finalizers.index(SCALE_DOWN_DRAIN_FINALIZER)
+            response = self._client.patch(
+                url,
+                headers={**headers, "Content-Type": "application/json-patch+json"},
+                json=[
+                    {"op": "test", "path": "/metadata/uid", "value": pod.uid},
+                    {
+                        "op": "test",
+                        "path": "/metadata/finalizers",
+                        "value": list(pod.finalizers),
+                    },
+                    {
+                        "op": "remove",
+                        "path": f"/metadata/finalizers/{finalizer_index}",
+                    },
+                ],
+            )
+            if response.status_code in {404, 409, 422}:
+                raise KubernetesScaleConflictError(
+                    "drain Pod deletion hold changed before release"
+                )
+            response.raise_for_status()
+            self._wait_for_drain_pod_absence(
+                candidate,
+                plan,
+                headers=headers,
+            )
+        return authority
+
+    def _wait_for_drain_pod_absence(
+        self,
+        candidate: ScalingDrainCandidate,
+        plan: ScalingDrainPlan,
+        *,
+        headers: dict[str, str],
+    ) -> None:
+        deadline = time.monotonic() + self._DRAIN_DELETE_WAIT_SECONDS
+        url = self._pod_url(
+            namespace=plan.snapshot.namespace,
+            name=candidate.pod_name,
+        )
+        while True:
+            response = self._client.get(url, headers=headers)
+            if response.status_code == 404:
+                return
+            response.raise_for_status()
+            pod = self._parse_drain_pod(
+                self._response_payload(response),
+                candidate=candidate,
+                plan=plan,
+            )
+            if not pod.deleting or SCALE_DOWN_DRAIN_FINALIZER in pod.finalizers:
+                raise KubernetesScaleConflictError(
+                    "drain Pod did not retain preconditioned deletion progress"
+                )
+            if time.monotonic() >= deadline:
+                raise KubernetesScaleCleanupPendingError(
+                    "ordered scale-down cleanup remains pending; retry the decision"
+                )
+            time.sleep(self._DRAIN_DELETE_POLL_SECONDS)
 
     @staticmethod
     def _stored_authority(snapshot: _WorkloadSnapshot) -> tuple[str, int] | None:
@@ -1016,6 +1384,7 @@ class KubernetesScaleActuator:
         reauthorize: Callable[[], RunnerWriterAuthority],
         reauthorize_quota: Callable[[], ScalingQuotaAdmission] | None = None,
         reauthorize_prewarm: Callable[[], ScalingPrewarmPlan] | None = None,
+        reauthorize_drain: Callable[[], ScalingDrainPlan] | None = None,
     ) -> KubernetesFencedScaleResult:
         """Apply a durable decision only under a previously claimed leader token."""
 
@@ -1047,19 +1416,30 @@ class KubernetesScaleActuator:
         target_revision = decision.target_revision
         if target_revision is None:
             raise ValueError("fenced decision must persist its target revision")
-        expected_target_revision = ScalingDecisionTargetRevision(
-            target_kind=target.kind.value,
-            namespace=target.namespace,
-            name=target.name,
-            election_id=authority.election_id,
-            fencing_token=authority.fencing_token,
-            workload_uid=fence.workload_uid,
-            workload_generation=fence.workload_generation,
-            release_id=fence.release_id,
-            model_revision=fence.model_revision,
+        target_matches_fence = (
+            target_revision.target_kind == target.kind.value
+            and target_revision.namespace == target.namespace
+            and target_revision.name == target.name
+            and target_revision.workload_uid == fence.workload_uid
+            and target_revision.workload_generation == fence.workload_generation
+            and target_revision.release_id == fence.release_id
+            and target_revision.model_revision == fence.model_revision
         )
-        if target_revision != expected_target_revision:
+        if not target_matches_fence:
             raise ValueError("decision target revision must match target and fence")
+        authority_matches_decision = (
+            target_revision.election_id == authority.election_id
+            and target_revision.fencing_token == authority.fencing_token
+        )
+        successor_cleanup = False
+        if not authority_matches_decision:
+            successor_cleanup = (
+                decision.action is ScalingDecisionAction.SCALE_DOWN
+                and target_revision.election_id == authority.election_id
+                and authority.fencing_token > target_revision.fencing_token
+            )
+            if not successor_cleanup:
+                raise ValueError("decision target revision must match leader authority")
         if (
             decision.action is not ScalingDecisionAction.HOLD
             and decision.decision_generation is None
@@ -1075,6 +1455,13 @@ class KubernetesScaleActuator:
             and decision.prewarm_plan is None
         ):
             raise ValueError("fenced scale-up requires a durable prewarm plan")
+        if decision.action is ScalingDecisionAction.SCALE_DOWN:
+            if target.kind is not KubernetesScalableKind.STATEFUL_SET:
+                raise ValueError(
+                    "fenced scale-down requires deterministic StatefulSet ordinals"
+                )
+            if decision.drain_plan is None:
+                raise ValueError("fenced scale-down requires a durable drain plan")
 
         with self._lock:
             if self._closed:
@@ -1102,6 +1489,13 @@ class KubernetesScaleActuator:
             if observed.annotations.get(MODEL_REVISION_ANNOTATION) != fence.model_revision:
                 raise KubernetesScaleConflictError(
                     "workload model revision changed since the scaling decision"
+                )
+            if (
+                decision.action is ScalingDecisionAction.SCALE_DOWN
+                and observed.statefulset_start_ordinal != 0
+            ):
+                raise KubernetesScaleConflictError(
+                    "scale-down requires the standard zero StatefulSet start ordinal"
                 )
             if (
                 decision.action is ScalingDecisionAction.SCALE_UP
@@ -1152,6 +1546,23 @@ class KubernetesScaleActuator:
                     raise KubernetesScaleConflictError(
                         "recorded scaling decision no longer matches live replicas"
                     )
+                if decision.action is ScalingDecisionAction.SCALE_DOWN:
+                    assert decision.drain_plan is not None
+                    remaining_pods = self._observe_drain_pods(
+                        decision.drain_plan,
+                        headers=headers,
+                        allow_absent=True,
+                        allow_deleting=True,
+                        allow_released=True,
+                    )
+                    if remaining_pods:
+                        authority = self._release_drain_pods(
+                            decision.drain_plan,
+                            remaining_pods,
+                            authority=authority,
+                            reauthorize=reauthorize,
+                            headers=headers,
+                        )
                 scale_result = self._scale_result(
                     decision=decision,
                     target=target,
@@ -1166,8 +1577,13 @@ class KubernetesScaleActuator:
                     decision=decision,
                     authority=authority,
                     fence=fence,
+                    successor_cleanup=successor_cleanup,
                     workload_generation_before=observed.generation,
                     workload_generation_after=observed.generation,
+                )
+            if successor_cleanup:
+                raise KubernetesScaleConflictError(
+                    "successor leader may only finish an already applied scale-down"
                 )
             if (
                 stored_decision is not None
@@ -1257,6 +1673,7 @@ class KubernetesScaleActuator:
                 }
                 for name, value in annotations.items()
             )
+            held_drain_pods: tuple[_DrainPodSnapshot, ...] = ()
             authority = self._reauthorize(authority, reauthorize)
             if decision.action is ScalingDecisionAction.SCALE_UP:
                 refreshed_quota = self._reauthorize_quota(
@@ -1276,6 +1693,48 @@ class KubernetesScaleActuator:
                     raise KubernetesScaleConflictError(
                         "final quota and prewarm authorities disagree"
                     )
+            elif decision.action is ScalingDecisionAction.SCALE_DOWN:
+                refreshed_drain = self._reauthorize_drain(
+                    decision,
+                    reauthorize_drain,
+                    authority=authority,
+                )
+                held_drain_pods = self._observe_drain_pods(
+                    refreshed_drain,
+                    headers=headers,
+                    allow_absent=False,
+                    allow_deleting=False,
+                    allow_released=False,
+                )
+                authority = self._reauthorize(authority, reauthorize)
+                final_drain = self._reauthorize_drain(
+                    decision,
+                    reauthorize_drain,
+                    authority=authority,
+                )
+                refreshed_candidate_times = {
+                    candidate.workload_ordinal: candidate.status.observed_at
+                    for candidate in refreshed_drain.selected_candidates
+                }
+                final_candidate_times = {
+                    candidate.workload_ordinal: candidate.status.observed_at
+                    for candidate in final_drain.selected_candidates
+                }
+                if (
+                    final_drain.snapshot.observed_at
+                    < refreshed_drain.snapshot.observed_at
+                    or final_drain.source_observed_at
+                    < refreshed_drain.source_observed_at
+                    or final_drain.snapshot.drain_revision
+                    < refreshed_drain.snapshot.drain_revision
+                    or any(
+                        final_candidate_times[ordinal] < observed_at
+                        for ordinal, observed_at in refreshed_candidate_times.items()
+                    )
+                ):
+                    raise KubernetesScaleConflictError(
+                        "drain authority rolled back during Pod hold verification"
+                    )
             response = self._client.patch(
                 url,
                 headers={**headers, "Content-Type": "application/json-patch+json"},
@@ -1290,6 +1749,8 @@ class KubernetesScaleActuator:
             if (
                 updated.uid != observed.uid
                 or updated.replicas != decision.desired_replicas
+                or updated.statefulset_start_ordinal
+                != observed.statefulset_start_ordinal
                 or updated.resource_version == observed.resource_version
                 or updated.generation != observed.generation + 1
                 or self._stored_authority(updated)
@@ -1306,6 +1767,15 @@ class KubernetesScaleActuator:
             ):
                 raise InvalidKubernetesScaleResponseError(
                     "fenced scale response violated the mutation contract"
+                )
+            if decision.action is ScalingDecisionAction.SCALE_DOWN:
+                assert decision.drain_plan is not None
+                authority = self._release_drain_pods(
+                    decision.drain_plan,
+                    held_drain_pods,
+                    authority=authority,
+                    reauthorize=reauthorize,
+                    headers=headers,
                 )
             scale_result = self._scale_result(
                 decision=decision,

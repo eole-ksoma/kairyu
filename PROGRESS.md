@@ -111,10 +111,12 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
   durably bound to one scale target in scale-up decisions. WP3.6 adds
   cache-aware staged scale-out: durable placement-level cache intent/Runner-start
   plans, Kueue ResourceFlavor and deployment placement binding, and final cache
-  freshness plus quota/prewarm consistency reauthorization.
-  Unfenced scale writes and quota/cache revision rollbacks are rejected by
-  default. Deployment wiring, scale-down drain integration, durable Runner
-  status, and runtime instrumentation remain open.
+  freshness plus quota/prewarm consistency reauthorization. WP3.7 adds exact
+  drain-authorized StatefulSet scale-down with final freshness/revision checks;
+  Deployment scale-down fails closed because its victim choice is not exact.
+  Unfenced scale writes and quota/cache/drain revision rollbacks are rejected by
+  default. Deployment wiring, durable Runner status, runtime instrumentation,
+  and live environment acceptance remain open.
 - Qwen3.8-Flash-Next MTP speculative decoding stays off in `qwen3.8-flash-next-dp2-8gpu` until upstream fixes vllm#53912 (prefix caching + MTP output corruption on hybrid GDN); single-stream decode 104 vs 175 tok/s
 - DTO-D15 (2026-08-26) changed the served tiered-example config: verify.sh coding/generic gates and the digest re-pin are pending before the example status can be claimed green again
 - Human sign-off pending on M2–M4 design reviews
@@ -123,6 +125,14 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
+
+### 2026-09-17 — [progress] Drain-authorized Runner scale-down
+- What: bound scale-down decisions to termination-authorized Runner/Pod evidence,
+  selected the exact highest StatefulSet ordinals, required a Pod UID deletion
+  hold, added final freshness/revision reauthorization, and rejected unsafe
+  Deployment scale-down; finalizer installation remains deployment wiring.
+- Refs: docs/design/runner-state-v1.md; kairyu/runners/scaling_drain.py;
+  kairyu/runners/scale_actuator.py; tests/unit/test_runner_scaling_drain.py
 
 ### 2026-09-17 — [progress] Cache-aware staged Runner scale-out
 - What: split quota-admitted scale-out into durable placement-level cache intent

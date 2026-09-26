@@ -120,8 +120,10 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 - Model artifact manifest v1 binds immutable upstream, tokenizer, license, blob
   tree, hardware/resource, environment, and signer metadata into a canonical
   digest. Ed25519 trust verification and file-backed GitOps deployment-intent
-  admission are available offline; deployment wiring, blob transfer, and
-  node-cache verification remain WP4.2+.
+  admission are available offline. WP4.2 adds digest-locked, resumable blob
+  transfer into a private staging tree, per-blob SHA-256 verification, and
+  atomic node-cache publication. Deployment wiring, durable cache index/policy,
+  corruption quarantine, and live environment acceptance remain WP4.3+.
 - Qwen3.8-Flash-Next MTP speculative decoding stays off in `qwen3.8-flash-next-dp2-8gpu` until upstream fixes vllm#53912 (prefix caching + MTP output corruption on hybrid GDN); single-stream decode 104 vs 175 tok/s
 - DTO-D15 (2026-08-26) changed the served tiered-example config: verify.sh coding/generic gates and the digest re-pin are pending before the example status can be claimed green again
 - Human sign-off pending on M2–M4 design reviews
@@ -130,6 +132,15 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
+
+### 2026-09-26 — [progress] Verified node-local model cache fill
+- What: added digest-scoped file locking, HTTP Range/local blob sources,
+  resumable staging, strict size/SHA-256 verification, durable completion
+  metadata, and same-filesystem atomic publication for admitted artifacts.
+- Why: Runners must never observe a partial or unverified model tree, including
+  during concurrent fills and source interruption.
+- Refs: docs/design/node-model-cache-v1.md; kairyu/artifacts/node_cache.py;
+  tests/unit/test_node_model_cache.py
 
 ### 2026-09-26 — [design] Signed model artifact identity and admission
 - What: added canonical immutable model/blob schemas, file-tree and manifest

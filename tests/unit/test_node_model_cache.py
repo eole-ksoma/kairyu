@@ -33,6 +33,9 @@ from kairyu.artifacts import (
     ModelArtifactTokenizer,
     ModelArtifactTrustStore,
     NodeModelCacheAgent,
+    NodeModelCacheIndex,
+    NodeModelCacheIndexError,
+    NodeModelCacheIndexUnverifiedError,
     NodeModelCacheLockTimeoutError,
     SignedModelArtifactManifest,
     TrustedModelSigner,
@@ -215,6 +218,115 @@ def test_cold_fill_verifies_and_atomically_publishes_then_hits(tmp_path: Path):
     assert hit.cache_hit is True
     assert hit.downloaded_bytes == 0
     assert source.calls == first_calls
+
+
+def test_cache_agent_records_fill_and_hit_in_durable_index(tmp_path: Path):
+    envelope, trust_store, request = _signed_artifact()
+    cache_root = tmp_path / "cache"
+    now = [100]
+    index = NodeModelCacheIndex(
+        cache_root / "cache-index.sqlite3",
+        node_id="node-a",
+        clock_ns=lambda: now[0],
+    )
+    source = RecordingSource()
+    agent = NodeModelCacheAgent(cache_root, source, index=index)
+
+    now[0] = 200
+    agent.ensure_cached(envelope, trust_store, request)
+    filled = index.get(envelope.manifest_digest)
+    now[0] = 300
+    agent.ensure_cached(envelope, trust_store, request)
+    hit = index.get(envelope.manifest_digest)
+
+    assert filled is not None
+    assert filled.model_id == envelope.manifest.model_id
+    assert filled.model_revision == envelope.manifest.model_revision
+    assert filled.verification_source == "filled"
+    assert filled.verified_at_ns == 200
+    assert hit is not None
+    assert hit.verification_source == "filled"
+    assert hit.verified_at_ns == 200
+    assert hit.last_access_at_ns == 300
+    assert hit.generation == filled.generation + 1
+
+
+def test_interrupted_fill_does_not_create_residency_record(tmp_path: Path):
+    envelope, trust_store, request = _signed_artifact()
+    cache_root = tmp_path / "cache"
+    index = NodeModelCacheIndex(
+        cache_root / "cache-index.sqlite3",
+        node_id="node-a",
+    )
+    agent = NodeModelCacheAgent(
+        cache_root,
+        RecordingSource(fail_once_path="weights/model.bin"),
+        index=index,
+        chunk_size_bytes=4,
+    )
+
+    with pytest.raises(ModelArtifactDownloadError, match="download failed"):
+        agent.ensure_cached(envelope, trust_store, request)
+
+    assert index.get(envelope.manifest_digest) is None
+
+
+def test_index_failure_after_publish_is_repaired_by_hit_without_redownload(
+    tmp_path: Path,
+):
+    class FailingOnceIndex(NodeModelCacheIndex):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.fail_next_record = True
+
+        def record_verified(self, **kwargs):
+            if self.fail_next_record:
+                self.fail_next_record = False
+                raise NodeModelCacheIndexError("injected index failure")
+            return super().record_verified(**kwargs)
+
+    envelope, trust_store, request = _signed_artifact()
+    cache_root = tmp_path / "cache"
+    index = FailingOnceIndex(
+        cache_root / "cache-index.sqlite3",
+        node_id="node-a",
+    )
+    source = RecordingSource()
+    agent = NodeModelCacheAgent(cache_root, source, index=index)
+
+    with pytest.raises(NodeModelCacheIndexError, match="injected index failure"):
+        agent.ensure_cached(envelope, trust_store, request)
+
+    calls_after_publish = list(source.calls)
+    _assert_published_content(cache_root, envelope)
+    assert index.get(envelope.manifest_digest) is None
+
+    repaired = agent.ensure_cached(envelope, trust_store, request)
+    record = index.get(envelope.manifest_digest)
+
+    assert repaired.cache_hit is True
+    assert source.calls == calls_after_publish
+    assert record is not None
+    assert record.verification_source == "published_marker"
+
+
+def test_index_unverified_state_blocks_structural_cache_hit(tmp_path: Path):
+    envelope, trust_store, request = _signed_artifact()
+    cache_root = tmp_path / "cache"
+    index = NodeModelCacheIndex(
+        cache_root / "cache-index.sqlite3",
+        node_id="node-a",
+    )
+    source = RecordingSource()
+    agent = NodeModelCacheAgent(cache_root, source, index=index)
+    agent.ensure_cached(envelope, trust_store, request)
+    calls = list(source.calls)
+    index.mark_unverified(envelope.manifest_digest, reason="operator corruption report")
+
+    with pytest.raises(NodeModelCacheIndexUnverifiedError, match="verified refill"):
+        agent.ensure_cached(envelope, trust_store, request)
+
+    assert source.calls == calls
 
 
 def test_interrupted_fill_is_not_published_and_retry_resumes(tmp_path: Path):

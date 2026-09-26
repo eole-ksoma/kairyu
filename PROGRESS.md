@@ -122,8 +122,10 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
   digest. Ed25519 trust verification and file-backed GitOps deployment-intent
   admission are available offline. WP4.2 adds digest-locked, resumable blob
   transfer into a private staging tree, per-blob SHA-256 verification, and
-  atomic node-cache publication. Deployment wiring, durable cache index/policy,
-  corruption quarantine, and live environment acceptance remain WP4.3+.
+  atomic node-cache publication. WP4.3 adds a node-bound durable SQLite index
+  for model revision, bytes, verification/access time, generation, and
+  owner-scoped pins. Deployment wiring, placement/eviction policy, corruption
+  quarantine, and live environment acceptance remain WP4.4+.
 - Qwen3.8-Flash-Next MTP speculative decoding stays off in `qwen3.8-flash-next-dp2-8gpu` until upstream fixes vllm#53912 (prefix caching + MTP output corruption on hybrid GDN); single-stream decode 104 vs 175 tok/s
 - DTO-D15 (2026-08-26) changed the served tiered-example config: verify.sh coding/generic gates and the digest re-pin are pending before the example status can be claimed green again
 - Human sign-off pending on M2–M4 design reviews
@@ -132,6 +134,15 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
+
+### 2026-09-26 — [progress] Durable node model-cache index
+- What: added a node-bound WAL/FULL SQLite residency index, immutable digest
+  identity checks, monotonic access records, generations, and composable
+  owner-scoped pins; successful WP4.2 fill/hit paths now update it.
+- Why: placement and eviction need durable node/model/bytes/verified/access/pin
+  evidence without treating mutable filesystem paths as authority.
+- Refs: docs/design/node-model-cache-index-v1.md;
+  kairyu/artifacts/cache_index.py; tests/unit/test_node_model_cache_index.py
 
 ### 2026-09-26 — [progress] Verified node-local model cache fill
 - What: added digest-scoped file locking, HTTP Range/local blob sources,

@@ -1,5 +1,13 @@
-"""Signed model-artifact identity and admission contracts."""
+"""Signed model-artifact identity, admission, and node-cache contracts."""
 
+from kairyu.artifacts.cache_index import (
+    NodeModelCacheIndex,
+    NodeModelCacheIndexEntryNotFoundError,
+    NodeModelCacheIndexError,
+    NodeModelCacheIndexIdentityError,
+    NodeModelCacheIndexUnverifiedError,
+    NodeModelCacheRecord,
+)
 from kairyu.artifacts.manifest import (
     InvalidModelArtifactError,
     ModelArtifactAdmission,
@@ -55,11 +63,17 @@ __all__ = [
     "ModelArtifactResourceEstimate",
     "ModelArtifactTokenizer",
     "ModelArtifactTrustStore",
+    "NodeModelCacheIndex",
+    "NodeModelCacheIndexEntryNotFoundError",
+    "NodeModelCacheIndexError",
+    "NodeModelCacheIndexIdentityError",
+    "NodeModelCacheIndexUnverifiedError",
     "NodeModelCacheAgent",
     "NodeModelCacheCompletion",
     "NodeModelCacheError",
     "NodeModelCacheFillResult",
     "NodeModelCacheLockTimeoutError",
+    "NodeModelCacheRecord",
     "SignedModelArtifactManifest",
     "TrustedModelSigner",
     "VerifiedModelArtifact",

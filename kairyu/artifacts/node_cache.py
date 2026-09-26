@@ -21,7 +21,7 @@ import time
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Literal, Protocol, Self
+from typing import TYPE_CHECKING, Any, Literal, Protocol, Self
 from urllib.parse import quote
 
 import httpx
@@ -36,6 +36,9 @@ from kairyu.artifacts.manifest import (
     admit_model_artifact,
     canonical_model_manifest_bytes,
 )
+
+if TYPE_CHECKING:
+    from kairyu.artifacts.cache_index import NodeModelCacheIndex
 
 _MAX_SIGNED_BIGINT = 2**63 - 1
 _MAX_COMPLETION_BYTES = 64 * 1024
@@ -361,6 +364,7 @@ class NodeModelCacheAgent:
         root: Path,
         source: ModelArtifactBlobSource,
         *,
+        index: NodeModelCacheIndex | None = None,
         chunk_size_bytes: int = _DEFAULT_CHUNK_BYTES,
         lock_timeout_seconds: float | None = None,
     ) -> None:
@@ -375,6 +379,7 @@ class NodeModelCacheAgent:
                 raise ValueError("lock_timeout_seconds must be finite and non-negative")
         self._root = root
         self._source = source
+        self._index = index
         self._chunk_size_bytes = chunk_size_bytes
         self._lock_timeout_seconds = (
             None if lock_timeout_seconds is None else float(lock_timeout_seconds)
@@ -399,7 +404,7 @@ class NodeModelCacheAgent:
             published = self._root / "artifacts" / digest
             if published.exists() or published.is_symlink():
                 self._validate_published(published, envelope)
-                return self._result(
+                result = self._result(
                     admission=admission,
                     envelope=envelope,
                     artifact_path=published / "tree",
@@ -407,6 +412,12 @@ class NodeModelCacheAgent:
                     resumed_bytes=0,
                     downloaded_bytes=0,
                 )
+                self._record_index(
+                    result,
+                    envelope=envelope,
+                    verification_source="published_marker",
+                )
+                return result
 
             staging = self._prepare_staging(envelope)
             tree = staging / "tree"
@@ -448,7 +459,7 @@ class NodeModelCacheAgent:
                 ) from exc
             self._fsync_directory(published.parent)
             self._validate_published(published, envelope)
-            return self._result(
+            result = self._result(
                 admission=admission,
                 envelope=envelope,
                 artifact_path=published / "tree",
@@ -456,6 +467,12 @@ class NodeModelCacheAgent:
                 resumed_bytes=resumed_bytes,
                 downloaded_bytes=downloaded_bytes,
             )
+            self._record_index(
+                result,
+                envelope=envelope,
+                verification_source="filled",
+            )
+            return result
 
     def _prepare_root(self) -> None:
         try:
@@ -956,4 +973,23 @@ class NodeModelCacheAgent:
             downloaded_bytes=downloaded_bytes,
             file_count=len(manifest.files),
             total_bytes=sum(blob.size_bytes for blob in manifest.files),
+        )
+
+    def _record_index(
+        self,
+        result: NodeModelCacheFillResult,
+        *,
+        envelope: SignedModelArtifactManifest,
+        verification_source: Literal["filled", "published_marker"],
+    ) -> None:
+        if self._index is None:
+            return
+        self._index.record_verified(
+            manifest_digest=result.manifest_digest,
+            model_id=envelope.manifest.model_id,
+            model_revision=envelope.manifest.model_revision,
+            artifact_path=result.artifact_path,
+            total_bytes=result.total_bytes,
+            file_count=result.file_count,
+            verification_source=verification_source,
         )

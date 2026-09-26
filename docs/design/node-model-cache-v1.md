@@ -1,7 +1,7 @@
 # Node model cache v1
 
-Status: WP4.2 implemented as a node-local cache fill library; daemon/Pod wiring
-and WP4.3 cache indexing remain open.
+Status: WP4.2 implemented as a node-local cache fill library and integrated
+with the WP4.3 durable index; daemon/Pod wiring remains open.
 
 ## Purpose and authority boundary
 
@@ -131,9 +131,9 @@ when it observes structural or size corruption and does not overwrite it.
 - bytes downloaded during this invocation; and
 - signed file-count and total-byte totals.
 
-These fields are process-local evidence for WP4.2. Durable node residency,
-verification timestamps, last access, and pin state belong to the WP4.3 cache
-index and must not be inferred from this result after the process exits.
+These fields are process-local evidence for WP4.2. WP4.3 persists node
+residency, verification timestamps, last access, and owner-scoped pins in the
+index described by `docs/design/node-model-cache-index-v1.md`.
 
 ## Fail-closed behavior
 
@@ -153,7 +153,6 @@ revision.
 
 ## Deferred work
 
-- WP4.3: durable node/model/bytes/verified/last-access/pin index.
 - WP4.4: expose verified residency as scheduler/controller placement hints.
 - WP4.5: high/low watermarks and eviction with active/pinned revision
   protection.

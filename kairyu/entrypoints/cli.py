@@ -1,4 +1,4 @@
-"""``kairyu`` console entrypoint: serve and validate commands."""
+"""``kairyu`` console entrypoint: serving and offline validation commands."""
 
 from __future__ import annotations
 
@@ -10,9 +10,7 @@ from kairyu.models.generation import GENERATION_CONFIG_MODES
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="kairyu", description="Kairyu serving CLI"
-    )
+    parser = argparse.ArgumentParser(prog="kairyu", description="Kairyu serving CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
     serve = subparsers.add_parser(
         "serve",
@@ -33,11 +31,90 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     validate = subparsers.add_parser(
         "validate",
-        help="Validate a DeploymentSpec and its local linked artifacts without "
-        "starting a server.",
+        help="Validate a DeploymentSpec and its local linked artifacts without starting a server.",
     )
     validate.add_argument("config", type=Path, help="Path to a DeploymentSpec YAML")
+
+    artifact = subparsers.add_parser(
+        "artifact",
+        help="Validate or admit a signed model-artifact manifest.",
+    )
+    artifact_commands = artifact.add_subparsers(
+        dest="artifact_command",
+        required=True,
+    )
+    artifact_validate = artifact_commands.add_parser(
+        "validate",
+        help="Verify a manifest digest, signer trust, and Ed25519 signature.",
+    )
+    artifact_validate.add_argument("manifest", type=Path)
+    artifact_validate.add_argument("--trust-store", type=Path, required=True)
+
+    artifact_admit = artifact_commands.add_parser(
+        "admit",
+        help="Verify and authorize an exact GitOps deployment binding.",
+    )
+    artifact_admit.add_argument("manifest", type=Path)
+    artifact_admit.add_argument("--trust-store", type=Path, required=True)
+    artifact_admit.add_argument(
+        "--request",
+        type=Path,
+        required=True,
+        help="Version-controlled GitOps model deployment-intent JSON.",
+    )
     return parser
+
+
+def _safe_cli_text(value: object) -> str:
+    rendered = "".join(
+        character if character.isprintable() else character.encode("unicode_escape").decode("ascii")
+        for character in str(value)
+    )
+    return rendered if len(rendered) <= 1024 else rendered[:1021] + "..."
+
+
+def _run_artifact_command(args: argparse.Namespace) -> None:
+    from pydantic import ValidationError
+
+    from kairyu.artifacts import (
+        InvalidModelArtifactError,
+        admit_model_artifact,
+        load_model_artifact_admission_request,
+        load_model_artifact_trust_store,
+        load_signed_model_artifact,
+        verify_model_artifact_manifest,
+    )
+
+    try:
+        envelope = load_signed_model_artifact(args.manifest)
+        trust_store = load_model_artifact_trust_store(args.trust_store)
+        if args.artifact_command == "validate":
+            verified = verify_model_artifact_manifest(envelope, trust_store)
+            print(
+                f"VALID manifest={verified.manifest_digest} "
+                f"signer={_safe_cli_text(verified.signer_key_id)}"
+            )
+            return
+        request = load_model_artifact_admission_request(args.request)
+        admission = admit_model_artifact(envelope, trust_store, request)
+        print(
+            f"ADMITTED manifest={admission.manifest_digest} "
+            f"deployment={_safe_cli_text(admission.deployment_id)} "
+            f"model={_safe_cli_text(admission.model_id)} "
+            f"revision={_safe_cli_text(admission.model_revision)} "
+            f"environment={_safe_cli_text(admission.environment)} "
+            f"gpu_profile={_safe_cli_text(admission.gpu_profile)} "
+            f"signer={_safe_cli_text(admission.signer_key_id)}"
+        )
+    except (InvalidModelArtifactError, ValidationError) as exc:
+        if isinstance(exc, ValidationError):
+            detail = exc.errors(include_input=False, include_url=False)[0]
+            location = ".".join(str(part) for part in detail.get("loc", ()))
+            message = f"admission schema validation failed at {location or '<root>'}"
+        else:
+            message = str(exc)
+        print(f"INVALID artifact: {_safe_cli_text(message)}")
+        raise SystemExit(1) from None
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -78,6 +155,8 @@ def main(argv: list[str] | None = None) -> None:
         print(report.render_text())
         if not report.valid:
             sys.exit(1)
+    elif args.command == "artifact":
+        _run_artifact_command(args)
 
 
 if __name__ == "__main__":

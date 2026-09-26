@@ -23,7 +23,7 @@ beat frontier APIs as measured by the committed harness (G6 gate P-C1).
 
 ## Current Status
 
-Snapshot date: 2026-09-17. Hardware context: all GPU evidence so far is on
+Snapshot date: 2026-09-26. Hardware context: all GPU evidence so far is on
 8× RTX PRO 6000 Blackwell (SM120), PCIe-only interconnect (P2P 30–37 GB/s);
 NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 `bench/results/` (see `index.json`); decisions and rationale in `docs/design/`.
@@ -117,6 +117,11 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
   Unfenced scale writes and quota/cache/drain revision rollbacks are rejected by
   default. Deployment wiring, durable Runner status, runtime instrumentation,
   and live environment acceptance remain open.
+- Model artifact manifest v1 binds immutable upstream, tokenizer, license, blob
+  tree, hardware/resource, environment, and signer metadata into a canonical
+  digest. Ed25519 trust verification and file-backed GitOps deployment-intent
+  admission are available offline; deployment wiring, blob transfer, and
+  node-cache verification remain WP4.2+.
 - Qwen3.8-Flash-Next MTP speculative decoding stays off in `qwen3.8-flash-next-dp2-8gpu` until upstream fixes vllm#53912 (prefix caching + MTP output corruption on hybrid GDN); single-stream decode 104 vs 175 tok/s
 - DTO-D15 (2026-08-26) changed the served tiered-example config: verify.sh coding/generic gates and the digest re-pin are pending before the example status can be claimed green again
 - Human sign-off pending on M2–M4 design reviews
@@ -125,6 +130,15 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
+
+### 2026-09-26 — [design] Signed model artifact identity and admission
+- What: added canonical immutable model/blob schemas, file-tree and manifest
+  digests, Ed25519 trust verification, bounded offline CLI validation, and a
+  file-backed GitOps model/environment/GPU admission primitive.
+- Why: cache and Runner work must consume a signed digest identity before any
+  mutable path, tag, or unverified artifact can enter the control plane.
+- Refs: docs/design/model-artifact-manifest-v1.md; kairyu/artifacts/manifest.py;
+  tests/unit/test_model_artifact_manifest.py
 
 ### 2026-09-17 — [progress] Drain-authorized Runner scale-down
 - What: bound scale-down decisions to termination-authorized Runner/Pod evidence,

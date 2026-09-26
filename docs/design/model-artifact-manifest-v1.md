@@ -1,6 +1,7 @@
 # Model artifact manifest v1
 
-Status: WP4.1 implemented; blob transfer and node-cache enforcement remain WP4.2+.
+Status: WP4.1 implemented; WP4.2 consumes this contract for verified node-cache
+fills. Deployment wiring and WP4.3+ policy remain open.
 
 ## Purpose and boundary
 
@@ -10,9 +11,9 @@ configuration use the manifest SHA-256, never a mutable repository tag or local
 path.
 
 WP4.1 validates signed metadata. It does not download blobs or claim that local
-bytes match the declared per-blob digests. WP4.2 must verify those bytes while
-filling a temporary tree and publish the tree atomically only after every digest
-matches.
+bytes match the declared per-blob digests. WP4.2 now performs that verification
+while filling a temporary tree and publishes the tree atomically only after
+every digest matches. See `docs/design/node-model-cache-v1.md`.
 
 ## Contracts
 
@@ -141,6 +142,7 @@ admission must not be treated as proof that a running workload uses the digest.
 Downstream components must accept `ModelArtifactAdmission` plus the signed
 envelope or a durably equivalent verified record. They must not reconstruct an
 authorization from a model name, repository URL, tag, path, or unverified
-manifest object. Cache publication requires a fresh per-blob and tree-digest
-verification; cache residency, eviction protection, quarantine, and pre-stage
-status arrive in WP4.2–WP4.7.
+manifest object. WP4.2 cache publication re-runs admission, verifies each blob's
+size and digest in a private staging tree, and atomically publishes only the
+complete tree. Durable residency/index state, eviction protection, quarantine,
+and pre-stage status remain WP4.3–WP4.7.

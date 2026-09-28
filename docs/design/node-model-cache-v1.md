@@ -154,8 +154,8 @@ revision.
 ## Deferred work
 
 - WP4.4: expose verified residency as scheduler/controller placement hints.
-- WP4.5: high/low watermarks and eviction with active/pinned revision
-  protection.
+- WP4.5 is implemented in `docs/design/node-model-cache-eviction-v1.md` with
+  high/low watermarks, deterministic LRU, and generation/pin-fenced deletion.
 - WP4.6: same-size corruption detection, quarantine, audit, re-fetch, and
   Runner-start refusal.
 - WP4.7: deployment/autoscale-driven pre-staging across the target node pool.

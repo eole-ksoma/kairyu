@@ -125,8 +125,9 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
   atomic node-cache publication. WP4.3 adds a node-bound durable SQLite index
   for model revision, bytes, verification/access time, generation, and
   owner-scoped pins. WP4.4 adds bounded verified placement hints and exact WP3.6
-  controller joins without overriding health/quota gates. Deployment wiring, eviction,
-  corruption recovery, and live environment acceptance remain WP4.5+.
+  controller joins without overriding health/quota gates. WP4.5 adds watermarked,
+  generation/pin-fenced LRU eviction. Deployment wiring, corruption recovery,
+  and live environment acceptance remain WP4.6+.
 - Qwen3.8-Flash-Next MTP speculative decoding stays off in `qwen3.8-flash-next-dp2-8gpu` until upstream fixes vllm#53912 (prefix caching + MTP output corruption on hybrid GDN); single-stream decode 104 vs 175 tok/s
 - DTO-D15 (2026-08-26) changed the served tiered-example config: verify.sh coding/generic gates and the digest re-pin are pending before the example status can be claimed green again
 - Human sign-off pending on M2–M4 design reviews
@@ -135,6 +136,11 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
+
+### 2026-09-28 — [progress] Fenced node model-cache eviction
+- What: added high/low watermarks, unpinned LRU, revision/generation fences, digest locks, atomic detach, and crash recovery.
+- Why: NVMe pressure must never remove active, rollback, or manually pinned artifacts.
+- Refs: docs/design/node-model-cache-eviction-v1.md; kairyu/artifacts/eviction.py; tests/unit/test_node_model_cache_eviction.py
 
 ### 2026-09-28 — [progress] Verified model-cache placement hints
 - What: added monotonic node-index snapshots, verified-only TTL publications,
@@ -192,9 +198,3 @@ in `.claude/rules/progress-log.md`).
   opt-in.
 - Refs: kairyu/runners/scaling_quota.py; kairyu/runners/scaling_log.py;
   tests/unit/test_runner_scaling_quota.py
-
-### 2026-09-17 — [progress] Leader-fenced Runner scale decisions
-- What: added claim-before-observe workload authority, durable per-model mutation
-  generations, complete decision fingerprints, and atomic revision/replica CAS.
-- Refs: docs/design/runner-state-v1.md; kairyu/runners/scale_actuator.py;
-  kairyu/runners/scaling_log.py; tests/unit/test_runner_fenced_scale_actuator.py

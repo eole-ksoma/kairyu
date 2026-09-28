@@ -39,6 +39,14 @@ class NodeModelCacheIndexUnverifiedError(NodeModelCacheIndexError):
     """An operation requires residency that is still marked verified."""
 
 
+class NodeModelCacheIndexEvictionConflictError(NodeModelCacheIndexError):
+    """An eviction fence no longer matches the current residency state."""
+
+
+class NodeModelCacheIndexPinnedError(NodeModelCacheIndexError):
+    """An eviction attempted to remove owner-pinned residency."""
+
+
 class NodeModelCacheRecord(BaseModel):
     """One immutable artifact identity plus mutable node-local residency state."""
 
@@ -512,6 +520,77 @@ class NodeModelCacheIndex:
         except sqlite3.Error as exc:
             raise NodeModelCacheIndexError("cannot snapshot cache residency") from exc
 
+    @contextlib.contextmanager
+    def fenced_eviction(
+        self,
+        manifest_digest: str,
+        *,
+        expected_index_revision: int,
+        expected_generation: int,
+    ) -> Iterator[NodeModelCacheRecord]:
+        """Hold a write fence while a caller atomically detaches one artifact tree.
+
+        The caller may perform the same-filesystem rename while the transaction is
+        open.  Returning from the context deletes the exact unpinned generation;
+        raising rolls the database transaction back so the caller can restore the
+        detached tree before releasing its digest lock.
+        """
+
+        digest = self._validate_digest(manifest_digest)
+        index_revision = self._validate_integer(
+            expected_index_revision,
+            name="expected_index_revision",
+            minimum=1,
+            maximum=_MAX_SIGNED_BIGINT,
+        )
+        generation = self._validate_integer(
+            expected_generation,
+            name="expected_generation",
+            minimum=1,
+            maximum=_MAX_SIGNED_BIGINT,
+        )
+        try:
+            with self._write_transaction() as connection:
+                revision_row = connection.execute(
+                    "SELECT revision FROM cache_index_revision WHERE singleton = 1"
+                ).fetchone()
+                if revision_row is None or revision_row["revision"] != index_revision:
+                    raise NodeModelCacheIndexEvictionConflictError(
+                        "cache index revision changed before eviction"
+                    )
+                row = connection.execute(
+                    "SELECT * FROM cache_entries WHERE manifest_digest = ?",
+                    (digest,),
+                ).fetchone()
+                if row is None or row["generation"] != generation:
+                    raise NodeModelCacheIndexEvictionConflictError(
+                        "cache residency generation changed before eviction"
+                    )
+                pin = connection.execute(
+                    "SELECT 1 FROM cache_pins WHERE manifest_digest = ? LIMIT 1",
+                    (digest,),
+                ).fetchone()
+                if pin is not None:
+                    raise NodeModelCacheIndexPinnedError("pinned cache residency cannot be evicted")
+                record = self._record_from_row(connection, row)
+                yield record
+                cursor = connection.execute(
+                    """
+                    DELETE FROM cache_entries
+                    WHERE manifest_digest = ? AND generation = ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM cache_pins WHERE manifest_digest = ?
+                      )
+                    """,
+                    (digest, generation, digest),
+                )
+                if cursor.rowcount != 1:
+                    raise NodeModelCacheIndexEvictionConflictError(
+                        "cache residency changed while eviction was fenced"
+                    )
+        except sqlite3.Error as exc:
+            raise NodeModelCacheIndexError("cannot evict cache residency") from exc
+
     def _prepare_parent(self) -> None:
         try:
             self._path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -763,6 +842,7 @@ class NodeModelCacheIndex:
                 "AFTER UPDATE OF last_access_at_ns, verification_source, verified, "
                 "verification_failure, verified_at_ns ON cache_entries"
             ),
+            "cache_entries_revision_delete": "AFTER DELETE ON cache_entries",
             "cache_pins_revision_insert": "AFTER INSERT ON cache_pins",
             "cache_pins_revision_update": "AFTER UPDATE ON cache_pins",
             "cache_pins_revision_delete": "AFTER DELETE ON cache_pins",
@@ -791,6 +871,7 @@ class NodeModelCacheIndex:
         expected = {
             "cache_entries_revision_insert",
             "cache_entries_revision_update",
+            "cache_entries_revision_delete",
             "cache_pins_revision_insert",
             "cache_pins_revision_update",
             "cache_pins_revision_delete",

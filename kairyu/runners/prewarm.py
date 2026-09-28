@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from enum import StrEnum
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from kairyu.artifacts.placement_hint import NodeModelCachePlacementHintSnapshot
 from kairyu.runners.scaling import _MAX_SIGNED_BIGINT
+
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _non_empty(value: str, *, name: str) -> str:
@@ -57,6 +61,39 @@ class ModelCachePlacement(BaseModel):
     profile_id: str = Field(max_length=255)
     compatibility_approval_id: str = Field(max_length=255)
     state: ModelCachePlacementState
+    assigned: bool = False
+    healthy: bool = True
+    schedulable: bool = True
+
+    @field_validator(
+        "placement_id",
+        "node_name",
+        "resource_flavor",
+        "profile_id",
+        "compatibility_approval_id",
+    )
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _non_empty(value, name=info.field_name)
+
+    @field_validator("assigned", "healthy", "schedulable", mode="before")
+    @classmethod
+    def validate_boolean(cls, value: object, info) -> object:
+        if type(value) is not bool:
+            raise ValueError(f"{info.field_name} must be a boolean")
+        return value
+
+
+class ModelCachePlacementCandidate(BaseModel):
+    """Controller-owned placement facts before advisory cache state is joined."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    placement_id: str = Field(max_length=255)
+    node_name: str = Field(max_length=253)
+    resource_flavor: str = Field(max_length=253)
+    profile_id: str = Field(max_length=255)
+    compatibility_approval_id: str = Field(max_length=255)
     assigned: bool = False
     healthy: bool = True
     schedulable: bool = True
@@ -185,9 +222,7 @@ class ScalingPrewarmPlan(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
 
-    schema_version: Literal["runner-scaling-prewarm-plan-v1"] = (
-        "runner-scaling-prewarm-plan-v1"
-    )
+    schema_version: Literal["runner-scaling-prewarm-plan-v1"] = "runner-scaling-prewarm-plan-v1"
     snapshot: ScalingPrewarmSnapshot
     resource_flavor: str = Field(max_length=253)
     current_replicas: int = Field(ge=0, le=100_000)
@@ -289,4 +324,116 @@ def plan_cache_aware_scale_up(
         pending_fill_placement_ids=pending,
         unplanned_replicas=unplanned,
         action=action,
+    )
+
+
+def build_cache_placement_snapshot(
+    hints: tuple[NodeModelCachePlacementHintSnapshot, ...],
+    candidates: tuple[ModelCachePlacementCandidate, ...],
+    *,
+    snapshot_id: str,
+    cache_revision: int,
+    observed_at: datetime,
+    model_class: str,
+    model_id: str,
+    model_revision: str,
+    artifact_digest: str,
+    placement_binding_id: str,
+) -> ScalingPrewarmSnapshot:
+    """Join fresh exact-residency hints to controller-owned placement facts."""
+
+    snapshot_id = _non_empty(snapshot_id, name="snapshot_id")
+    model_class = _non_empty(model_class, name="model_class")
+    model_id = _non_empty(model_id, name="model_id")
+    model_revision = _non_empty(model_revision, name="model_revision")
+    artifact_digest = _non_empty(artifact_digest, name="artifact_digest")
+    placement_binding_id = _non_empty(
+        placement_binding_id,
+        name="placement_binding_id",
+    )
+    if len(model_id) > 255:
+        raise ValueError("model_id exceeds maximum length")
+    if not _SHA256_PATTERN.fullmatch(artifact_digest):
+        raise ValueError("artifact_digest must be a lowercase SHA-256 digest")
+    observed_at = _aware(observed_at, name="observed_at")
+    cache_revision = _integer(cache_revision, name="cache_revision")
+    assert isinstance(cache_revision, int)
+    if not 1 <= cache_revision <= _MAX_SIGNED_BIGINT:
+        raise ValueError("cache_revision must be in [1, 2^63-1]")
+    if not isinstance(hints, tuple):
+        raise TypeError("hints must be a tuple")
+    if not isinstance(candidates, tuple):
+        raise TypeError("candidates must be a tuple")
+    if len(hints) > 100_000:
+        raise ValueError("hints exceed maximum node count")
+    if len(candidates) > 100_000:
+        raise ValueError("candidates exceed maximum placement count")
+
+    validated_hints_list = []
+    for hint in hints:
+        if not isinstance(hint, NodeModelCachePlacementHintSnapshot):
+            raise TypeError("hints must contain NodeModelCachePlacementHintSnapshot values")
+        validated_hints_list.append(
+            NodeModelCachePlacementHintSnapshot.model_validate(hint.model_dump())
+        )
+    validated_hints = tuple(validated_hints_list)
+    hint_nodes = tuple(hint.node_id for hint in validated_hints)
+    if len(set(hint_nodes)) != len(hint_nodes):
+        raise ValueError("placement hints must use unique node IDs")
+    hints_by_node = {hint.node_id: hint for hint in validated_hints}
+
+    validated_candidates_list = []
+    for candidate in candidates:
+        if not isinstance(candidate, ModelCachePlacementCandidate):
+            raise TypeError("candidates must contain ModelCachePlacementCandidate values")
+        validated_candidates_list.append(
+            ModelCachePlacementCandidate.model_validate(candidate.model_dump())
+        )
+    validated_candidates = tuple(validated_candidates_list)
+    placement_ids = tuple(candidate.placement_id for candidate in validated_candidates)
+    if len(set(placement_ids)) != len(placement_ids):
+        raise ValueError("placement candidates must use unique placement IDs")
+
+    placements = []
+    for candidate in sorted(validated_candidates, key=lambda value: value.placement_id):
+        hint = hints_by_node.get(candidate.node_name)
+        fresh = (
+            hint is not None and hint.observed_at <= observed_at and observed_at < hint.valid_until
+        )
+        resident = (
+            hint.resident_for(
+                manifest_digest=artifact_digest,
+                model_id=model_id,
+                model_revision=model_revision,
+            )
+            if fresh and hint is not None
+            else None
+        )
+        placements.append(
+            ModelCachePlacement(
+                placement_id=candidate.placement_id,
+                node_name=candidate.node_name,
+                resource_flavor=candidate.resource_flavor,
+                profile_id=candidate.profile_id,
+                compatibility_approval_id=candidate.compatibility_approval_id,
+                state=(
+                    ModelCachePlacementState.READY
+                    if resident is not None
+                    else ModelCachePlacementState.ABSENT
+                ),
+                assigned=candidate.assigned,
+                healthy=candidate.healthy,
+                schedulable=candidate.schedulable,
+            )
+        )
+
+    return ScalingPrewarmSnapshot(
+        snapshot_id=snapshot_id,
+        cache_revision=cache_revision,
+        observed_at=observed_at,
+        model_class=model_class,
+        model_revision=model_revision,
+        artifact_digest=artifact_digest,
+        placement_binding_id=placement_binding_id,
+        placements=tuple(placements),
     )

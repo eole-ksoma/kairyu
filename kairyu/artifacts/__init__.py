@@ -5,6 +5,7 @@ from kairyu.artifacts.cache_index import (
     NodeModelCacheIndexEntryNotFoundError,
     NodeModelCacheIndexError,
     NodeModelCacheIndexIdentityError,
+    NodeModelCacheIndexSnapshot,
     NodeModelCacheIndexUnverifiedError,
     NodeModelCacheRecord,
 )
@@ -45,6 +46,11 @@ from kairyu.artifacts.node_cache import (
     NodeModelCacheFillResult,
     NodeModelCacheLockTimeoutError,
 )
+from kairyu.artifacts.placement_hint import (
+    NodeModelCachePlacementHintPublisher,
+    NodeModelCachePlacementHintSnapshot,
+    NodeModelCacheResidentHint,
+)
 
 __all__ = [
     "InvalidModelArtifactError",
@@ -67,13 +73,17 @@ __all__ = [
     "NodeModelCacheIndexEntryNotFoundError",
     "NodeModelCacheIndexError",
     "NodeModelCacheIndexIdentityError",
+    "NodeModelCacheIndexSnapshot",
     "NodeModelCacheIndexUnverifiedError",
     "NodeModelCacheAgent",
     "NodeModelCacheCompletion",
     "NodeModelCacheError",
     "NodeModelCacheFillResult",
     "NodeModelCacheLockTimeoutError",
+    "NodeModelCachePlacementHintPublisher",
+    "NodeModelCachePlacementHintSnapshot",
     "NodeModelCacheRecord",
+    "NodeModelCacheResidentHint",
     "SignedModelArtifactManifest",
     "TrustedModelSigner",
     "VerifiedModelArtifact",

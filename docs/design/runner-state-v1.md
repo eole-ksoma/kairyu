@@ -537,6 +537,15 @@ DaemonSet, PVC/local-storage, affinity, RBAC, Kueue, and binding-attestation
 wiring belongs to private-ai-cloud-iac and is a deployment gate before enabling
 production autoscaling.
 
+WP4.4 now supplies the library-side producer for this input. A node publishes a
+short-lived, verified-only, path-free hint from its WP4.3 index, and
+`build_cache_placement_snapshot()` joins exact digest/revision matches to the
+controller-owned placement inventory. Missing, expired, future, or non-exact
+hints remain `absent`; cache locality does not alter health, schedulability,
+assignment, ResourceFlavor, profile, or compatibility facts. The transport,
+durable global revision CAS, and scheduler binding remain the deployment gate
+described above. See `docs/design/node-model-cache-placement-hints-v1.md`.
+
 ## Drain-authorized deterministic scale-down
 
 WP3.7 connects the WP2.4 drain proof to the production scaling actuator without

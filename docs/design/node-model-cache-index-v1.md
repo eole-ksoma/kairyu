@@ -99,9 +99,9 @@ and is also idempotent.
 
 `NodeModelCacheRecord.pin_owners` is sorted and unique, and `pinned` is derived
 from whether any owner remains. Pinning an unknown digest fails closed. Reasons
-and pin timestamps remain durable internal evidence; WP4.5 will define which
-owners and reasons protect active, rollback-target, and administratively pinned
-revisions from eviction.
+and pin timestamps remain durable internal evidence. WP4.5 treats every owner
+pin as authoritative protection; controllers use distinct owners for active,
+rollback-target, pre-stage, and administrative retention lifecycles.
 
 ## Cache-agent integration
 
@@ -144,8 +144,8 @@ WP4.4's projection and controller join are defined in
 
 ## Deferred work
 
-- WP4.5: capacity watermarks, generation-fenced deletion, LRU selection, and
-  active/rollback/pin protection.
+- WP4.5 is implemented in `docs/design/node-model-cache-eviction-v1.md` with
+  capacity watermarks, generation-fenced LRU deletion, and pin protection.
 - WP4.6: connect unverified marking to corruption detection, quarantine, audit,
   and re-fetch before Runner start.
 - WP4.7: deployment/autoscale pre-staging and its pin lifecycle.

@@ -148,8 +148,8 @@ production scheduler integration.
 
 ## Deferred work
 
-- WP4.5: capacity watermarks and generation-fenced eviction. Eviction must
-  advance the global index revision so the next hint removes the resident row.
+- WP4.5 is implemented in `docs/design/node-model-cache-eviction-v1.md`;
+  successful eviction advances the node revision and removes the next hint.
 - WP4.6: corruption detection, quarantine, audit, and automatic unverified
   publication withdrawal.
 - WP4.7: fenced pre-staging commands and transitions through absent, filling,

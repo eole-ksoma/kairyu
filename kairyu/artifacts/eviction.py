@@ -242,7 +242,11 @@ def plan_node_model_cache_eviction(
     planned = 0
     if target:
         eligible = sorted(
-            (record for record in snapshot.records if not record.pinned),
+            (
+                record
+                for record in snapshot.records
+                if not record.pinned and record.recovery_id is None
+            ),
             key=lambda record: (record.last_access_at_ns, record.manifest_digest),
         )
         for record in eligible:

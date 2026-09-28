@@ -32,14 +32,13 @@ one SQLite read transaction. The durable global revision starts at one and
 advances exactly once for each observable index mutation. It does not advance
 for an idempotent touch, pin, unpin, or repeated failure mark.
 
-The global revision is a user-version-2 schema feature. Opening a version-1
-index performs a bounded, transactional migration, rebuilds the entry and pin
-tables with signed-64-bit generation bounds, and changes the schema/user
-version. Schema-level mutation triggers advance the revision even when a
-version-1 connection passed its version check immediately before migration; a
-newly opened version-1 writer fails closed on version 2. Migration rejects any
-generation sum that cannot fit the signed 64-bit revision instead of committing
-a REAL or an unusable counter.
+The global revision originated in user version 2. Opening a version-1 or
+version-2 index now performs the bounded transactional migrations through user
+version 3. Version 3 adds the WP4.6 recovery ID and DB guards while preserving
+the global revision. Schema-level mutation triggers advance the revision, and
+recovery guards stop a prechecked old writer from clearing or deleting a live
+incident. Migration rejects a v1 generation sum that cannot fit the signed
+64-bit revision instead of committing a REAL or unusable counter.
 
 `NodeModelCachePlacementHintPublisher` projects that snapshot into
 `NodeModelCachePlacementHintSnapshot`:
@@ -142,7 +141,8 @@ production scheduler integration.
 - Exact identity mismatch produces `ABSENT`; there is no fallback.
 - Duplicate publications or placements reject the aggregate.
 - Cache locality never changes controller health or quota facts.
-- A later WP4.6 unverified mark removes the hint on the next publication.
+- A WP4.6 corruption or incomplete-audit mark removes the hint on the next
+  publication.
 - A Runner placed from a still-fresh but stale-positive hint must fail or refill
   through WP4.2 before start; the hint alone is never mount authority.
 
@@ -150,8 +150,8 @@ production scheduler integration.
 
 - WP4.5 is implemented in `docs/design/node-model-cache-eviction-v1.md`;
   successful eviction advances the node revision and removes the next hint.
-- WP4.6: corruption detection, quarantine, audit, and automatic unverified
-  publication withdrawal.
+- WP4.6 is implemented in
+  `docs/design/node-model-cache-corruption-recovery-v1.md`.
 - WP4.7: fenced pre-staging commands and transitions through absent, filling,
   ready, and failed.
 - Deployment: transport, durable global revision CAS, scheduler binding, RBAC,

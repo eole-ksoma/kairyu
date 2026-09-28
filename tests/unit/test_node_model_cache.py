@@ -33,10 +33,13 @@ from kairyu.artifacts import (
     ModelArtifactTokenizer,
     ModelArtifactTrustStore,
     NodeModelCacheAgent,
+    NodeModelCacheAuditError,
+    NodeModelCacheCorruptionAuditEvent,
     NodeModelCacheIndex,
     NodeModelCacheIndexError,
     NodeModelCacheIndexUnverifiedError,
     NodeModelCacheLockTimeoutError,
+    NodeModelCacheRecoveryError,
     SignedModelArtifactManifest,
     TrustedModelSigner,
     model_file_tree_digest,
@@ -160,6 +163,30 @@ class BlockingSource(RecordingSource):
             self.started.set()
             assert self.release.wait(timeout=5)
         yield from super().iter_blob(**kwargs)
+
+
+class RecordingAuditSink:
+    def __init__(
+        self,
+        *,
+        fail: bool = False,
+        fail_on_event: str | None = None,
+        index: NodeModelCacheIndex | None = None,
+    ) -> None:
+        self.events: list[NodeModelCacheCorruptionAuditEvent] = []
+        self.fail = fail
+        self.fail_on_event = fail_on_event
+        self.index = index
+        self.verified_at_emit: list[bool] = []
+
+    def emit(self, event: NodeModelCacheCorruptionAuditEvent) -> None:
+        if self.fail or event.event == self.fail_on_event:
+            raise OSError("simulated audit failure")
+        if self.index is not None:
+            record = self.index.get(event.manifest_digest)
+            assert record is not None
+            self.verified_at_emit.append(record.verified)
+        self.events.append(event)
 
 
 def _assert_published_content(cache_root: Path, envelope: SignedModelArtifactManifest) -> None:
@@ -327,6 +354,233 @@ def test_index_unverified_state_blocks_structural_cache_hit(tmp_path: Path):
         agent.ensure_cached(envelope, trust_store, request)
 
     assert source.calls == calls
+
+
+def test_runner_start_full_digest_check_allows_verified_residency(tmp_path: Path):
+    envelope, trust_store, request = _signed_artifact()
+    cache_root = tmp_path / "cache"
+    index = NodeModelCacheIndex(
+        cache_root / "cache-index.sqlite3",
+        node_id="node-a",
+    )
+    agent = NodeModelCacheAgent(cache_root, RecordingSource(), index=index)
+    agent.ensure_cached(envelope, trust_store, request)
+    audit = RecordingAuditSink(index=index)
+
+    decision = agent.verify_for_runner_start(
+        envelope,
+        trust_store,
+        request,
+        audit_sink=audit,
+    )
+
+    assert decision.runner_start_allowed is True
+    assert decision.corruption_detected is False
+    assert decision.refetched is False
+    assert decision.artifact_path == cache_root / "artifacts" / envelope.manifest_digest / "tree"
+    assert audit.events == []
+
+
+def test_same_size_corruption_is_quarantined_audited_refetched_and_start_denied(
+    tmp_path: Path,
+):
+    envelope, trust_store, request = _signed_artifact()
+    cache_root = tmp_path / "cache"
+    index = NodeModelCacheIndex(
+        cache_root / "cache-index.sqlite3",
+        node_id="node-a",
+    )
+    source = RecordingSource()
+    agent = NodeModelCacheAgent(cache_root, source, index=index)
+    agent.ensure_cached(envelope, trust_store, request)
+    corrupt = cache_root / "artifacts" / envelope.manifest_digest / "tree/weights/model.bin"
+    corrupt.write_bytes(b"x" * len(_DATA["weights/model.bin"]))
+    audit = RecordingAuditSink(index=index)
+
+    decision = agent.verify_for_runner_start(
+        envelope,
+        trust_store,
+        request,
+        audit_sink=audit,
+    )
+
+    assert decision.runner_start_allowed is False
+    assert decision.reason == "digest_mismatch"
+    assert decision.refetched is True
+    assert decision.quarantine_path is not None
+    assert (decision.quarantine_path / "tree/weights/model.bin").read_bytes() == b"x" * len(
+        _DATA["weights/model.bin"]
+    )
+    assert [event.event for event in audit.events] == [
+        "corruption_quarantined",
+        "corruption_refetched",
+    ]
+    assert audit.verified_at_emit == [False, False]
+    assert index.get(envelope.manifest_digest).verified is True
+    _assert_published_content(cache_root, envelope)
+
+    allowed = agent.verify_for_runner_start(
+        envelope,
+        trust_store,
+        request,
+        audit_sink=audit,
+    )
+    assert allowed.runner_start_allowed is True
+
+
+def test_corruption_refetch_failure_keeps_index_unverified_and_runner_blocked(
+    tmp_path: Path,
+):
+    envelope, trust_store, request = _signed_artifact()
+    cache_root = tmp_path / "cache"
+    index = NodeModelCacheIndex(
+        cache_root / "cache-index.sqlite3",
+        node_id="node-a",
+    )
+    agent = NodeModelCacheAgent(cache_root, RecordingSource(), index=index)
+    agent.ensure_cached(envelope, trust_store, request)
+    corrupt = cache_root / "artifacts" / envelope.manifest_digest / "tree/weights/model.bin"
+    corrupt.write_bytes(b"x" * len(_DATA["weights/model.bin"]))
+    audit = RecordingAuditSink()
+    original = _DATA["weights/model.bin"]
+    _DATA["weights/model.bin"] = b"y" * len(original)
+    try:
+        with pytest.raises(NodeModelCacheRecoveryError, match="verified refill failed"):
+            agent.verify_for_runner_start(
+                envelope,
+                trust_store,
+                request,
+                audit_sink=audit,
+            )
+    finally:
+        _DATA["weights/model.bin"] = original
+
+    record = index.get(envelope.manifest_digest)
+    assert record is not None and record.verified is False
+    assert not (cache_root / "artifacts" / envelope.manifest_digest).exists()
+    assert [event.event for event in audit.events] == [
+        "corruption_quarantined",
+        "corruption_refetch_failed",
+    ]
+
+
+def test_audit_failure_leaves_corruption_quarantined_without_refetch(tmp_path: Path):
+    envelope, trust_store, request = _signed_artifact()
+    cache_root = tmp_path / "cache"
+    index = NodeModelCacheIndex(
+        cache_root / "cache-index.sqlite3",
+        node_id="node-a",
+    )
+    agent = NodeModelCacheAgent(cache_root, RecordingSource(), index=index)
+    agent.ensure_cached(envelope, trust_store, request)
+    corrupt = cache_root / "artifacts" / envelope.manifest_digest / "tree/weights/model.bin"
+    corrupt.write_bytes(b"x" * len(_DATA["weights/model.bin"]))
+
+    with pytest.raises(NodeModelCacheAuditError, match="audit sink rejected"):
+        agent.verify_for_runner_start(
+            envelope,
+            trust_store,
+            request,
+            audit_sink=RecordingAuditSink(fail=True),
+        )
+
+    record = index.get(envelope.manifest_digest)
+    assert record is not None and record.verified is False
+    assert not (cache_root / "artifacts" / envelope.manifest_digest).exists()
+    assert len(tuple((cache_root / ".quarantine").iterdir())) == 1
+
+    with pytest.raises(NodeModelCacheIndexUnverifiedError, match="fenced audit completion"):
+        agent.ensure_cached(envelope, trust_store, request)
+    pending = index.get(envelope.manifest_digest)
+    assert pending is not None and pending.recovery_id == record.recovery_id
+
+    retry_audit = RecordingAuditSink()
+    decision = agent.verify_for_runner_start(
+        envelope,
+        trust_store,
+        request,
+        audit_sink=retry_audit,
+    )
+    assert decision.runner_start_allowed is False
+    assert decision.refetched is True
+    assert [event.event for event in retry_audit.events] == [
+        "corruption_quarantined",
+        "corruption_refetched",
+    ]
+
+
+def test_refetch_audit_failure_marks_replacement_unverified(tmp_path: Path):
+    envelope, trust_store, request = _signed_artifact()
+    cache_root = tmp_path / "cache"
+    index = NodeModelCacheIndex(
+        cache_root / "cache-index.sqlite3",
+        node_id="node-a",
+    )
+    agent = NodeModelCacheAgent(cache_root, RecordingSource(), index=index)
+    agent.ensure_cached(envelope, trust_store, request)
+    corrupt = cache_root / "artifacts" / envelope.manifest_digest / "tree/weights/model.bin"
+    corrupt.write_bytes(b"x" * len(_DATA["weights/model.bin"]))
+
+    with pytest.raises(NodeModelCacheAuditError, match="audit sink rejected"):
+        agent.verify_for_runner_start(
+            envelope,
+            trust_store,
+            request,
+            audit_sink=RecordingAuditSink(fail_on_event="corruption_refetched"),
+        )
+
+    record = index.get(envelope.manifest_digest)
+    assert record is not None and record.verified is False
+    assert record.verification_failure == "digest_mismatch"
+    assert record.recovery_id is not None
+    _assert_published_content(cache_root, envelope)
+
+    retry_audit = RecordingAuditSink()
+    decision = agent.verify_for_runner_start(
+        envelope,
+        trust_store,
+        request,
+        audit_sink=retry_audit,
+    )
+    assert decision.runner_start_allowed is False
+    assert decision.refetched is True
+    assert [event.event for event in retry_audit.events] == [
+        "corruption_quarantined",
+        "corruption_refetched",
+    ]
+    assert retry_audit.events[0].recovery_id == retry_audit.events[1].recovery_id
+
+
+def test_missing_published_tree_is_recorded_and_refetched_before_start(tmp_path: Path):
+    envelope, trust_store, request = _signed_artifact()
+    cache_root = tmp_path / "cache"
+    index = NodeModelCacheIndex(
+        cache_root / "cache-index.sqlite3",
+        node_id="node-a",
+    )
+    agent = NodeModelCacheAgent(cache_root, RecordingSource(), index=index)
+    agent.ensure_cached(envelope, trust_store, request)
+    published = cache_root / "artifacts" / envelope.manifest_digest
+    os.rename(published, cache_root / "missing-tree-simulated")
+    audit = RecordingAuditSink(index=index)
+
+    decision = agent.verify_for_runner_start(
+        envelope,
+        trust_store,
+        request,
+        audit_sink=audit,
+    )
+
+    assert decision.runner_start_allowed is False
+    assert decision.reason == "structural_invalid"
+    assert decision.refetched is True
+    assert [event.event for event in audit.events] == [
+        "corruption_quarantined",
+        "corruption_refetched",
+    ]
+    assert audit.verified_at_emit == [False, False]
+    recovered = index.get(envelope.manifest_digest)
+    assert recovered is not None and recovered.verified is True
 
 
 def test_interrupted_fill_is_not_published_and_retry_resumes(tmp_path: Path):

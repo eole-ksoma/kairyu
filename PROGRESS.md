@@ -126,8 +126,9 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
   for model revision, bytes, verification/access time, generation, and
   owner-scoped pins. WP4.4 adds bounded verified placement hints and exact WP3.6
   controller joins without overriding health/quota gates. WP4.5 adds watermarked,
-  generation/pin-fenced LRU eviction. Deployment wiring, corruption recovery,
-  and live environment acceptance remain WP4.6+.
+  generation/pin-fenced LRU eviction. WP4.6 adds full-digest Runner-start
+  verification, quarantine/audit, verified refill, and fail-closed retry.
+  Pre-staging, deployment wiring, and live environment acceptance remain.
 - Qwen3.8-Flash-Next MTP speculative decoding stays off in `qwen3.8-flash-next-dp2-8gpu` until upstream fixes vllm#53912 (prefix caching + MTP output corruption on hybrid GDN); single-stream decode 104 vs 175 tok/s
 - DTO-D15 (2026-08-26) changed the served tiered-example config: verify.sh coding/generic gates and the digest re-pin are pending before the example status can be claimed green again
 - Human sign-off pending on M2–M4 design reviews
@@ -136,6 +137,11 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
+
+### 2026-09-28 — [progress] Fail-closed model-cache corruption recovery
+- What: added full-digest startup verification, atomic quarantine, mandatory audit, verified refill, and generation-fenced retry.
+- Why: same-size bit rot and incomplete audit evidence must block Runner startup.
+- Refs: docs/design/node-model-cache-corruption-recovery-v1.md; kairyu/artifacts/node_cache.py; tests/unit/test_node_model_cache.py
 
 ### 2026-09-28 — [progress] Fenced node model-cache eviction
 - What: added high/low watermarks, unpinned LRU, revision/generation fences, digest locks, atomic detach, and crash recovery.
@@ -189,12 +195,3 @@ in `.claude/rules/progress-log.md`).
   placement identity, and added final cache/quota consistency reauthorization.
 - Refs: docs/design/runner-state-v1.md; kairyu/runners/prewarm.py;
   kairyu/runners/scale_actuator.py; tests/unit/test_runner_prewarm.py
-
-### 2026-09-17 — [progress] Quota-fenced Runner scale-up
-- What: added strict Kueue Workload admission parsing, priority-reservation-aware
-  nested GPU ceilings bound to Kueue's atomic reservation, deterministic quota
-  clamping, scale-target ownership, final freshness/revision checks, and durable
-  scale-up gating; unfenced writes now require an explicit verification-only
-  opt-in.
-- Refs: kairyu/runners/scaling_quota.py; kairyu/runners/scaling_log.py;
-  tests/unit/test_runner_scaling_quota.py

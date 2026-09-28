@@ -81,6 +81,20 @@ from kairyu.runners.observation import (
 )
 from kairyu.runners.postgres_leadership import PostgresRunnerLeaderLeaseStore
 from kairyu.runners.postgres_scaling_log import PostgresScalingDecisionLog
+from kairyu.runners.prestage import (
+    InMemoryNodeModelPrestageStore,
+    NodeModelPrestageCapacityError,
+    NodeModelPrestageCommand,
+    NodeModelPrestageConflictError,
+    NodeModelPrestageError,
+    NodeModelPrestageExecutor,
+    NodeModelPrestageExpiredError,
+    NodeModelPrestageRecord,
+    NodeModelPrestageStore,
+    apply_node_model_prestage_records,
+    build_node_model_prestage_commands,
+    build_node_model_prestage_release_command,
+)
 from kairyu.runners.prewarm import (
     ModelCachePlacement,
     ModelCachePlacementCandidate,
@@ -181,6 +195,15 @@ __all__ = [
     "ModelCachePlacement",
     "ModelCachePlacementCandidate",
     "ModelCachePlacementState",
+    "InMemoryNodeModelPrestageStore",
+    "NodeModelPrestageCapacityError",
+    "NodeModelPrestageCommand",
+    "NodeModelPrestageConflictError",
+    "NodeModelPrestageError",
+    "NodeModelPrestageExecutor",
+    "NodeModelPrestageExpiredError",
+    "NodeModelPrestageRecord",
+    "NodeModelPrestageStore",
     "CACHE_PLACEMENT_BINDING_ANNOTATION",
     "SCALE_DECISION_GENERATION_ANNOTATION",
     "SCALE_DECISION_FINGERPRINT_ANNOTATION",
@@ -233,6 +256,9 @@ __all__ = [
     "ScalingPrewarmPlan",
     "ScalingPrewarmSnapshot",
     "build_cache_placement_snapshot",
+    "apply_node_model_prestage_records",
+    "build_node_model_prestage_commands",
+    "build_node_model_prestage_release_command",
     "KueueScalingAdmission",
     "ScalingQuotaAdmission",
     "ScalingQuotaConstraint",

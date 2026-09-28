@@ -539,9 +539,7 @@ class KubernetesScaleActuator:
         if not isinstance(refreshed, ScalingQuotaAdmission):
             raise TypeError("reauthorize_quota must return ScalingQuotaAdmission")
         refreshed = ScalingQuotaAdmission.model_validate(refreshed.model_dump())
-        quota_age = (
-            authority.validated_at - refreshed.snapshot.observed_at
-        ).total_seconds()
+        quota_age = (authority.validated_at - refreshed.snapshot.observed_at).total_seconds()
         if not 0 <= quota_age <= decision.policy.max_observation_age_seconds:
             raise KubernetesScaleConflictError(
                 "quota authority is not fresh at final scale authorization"
@@ -594,22 +592,15 @@ class KubernetesScaleActuator:
             refreshed.snapshot.tenant_id != original.snapshot.tenant_id
             or refreshed.snapshot.model_class != original.snapshot.model_class
             or refreshed.snapshot.model_family != original.snapshot.model_family
-            or refreshed.snapshot.gpus_per_replica
-            != original.snapshot.gpus_per_replica
+            or refreshed.snapshot.gpus_per_replica != original.snapshot.gpus_per_replica
             or refreshed.current_replicas != original.current_replicas
             or refreshed.requested_replicas != original.requested_replicas
             or refreshed.snapshot.observed_at < original.snapshot.observed_at
-            or refreshed.snapshot.quota_revision
-            < original.snapshot.quota_revision
+            or refreshed.snapshot.quota_revision < original.snapshot.quota_revision
             or refreshed_kueue_identity != original_kueue_identity
         ):
-            raise KubernetesScaleConflictError(
-                "quota authority changed during Kubernetes mutation"
-            )
-        if (
-            not refreshed_kueue.admitted
-            or refreshed.admitted_replicas < decision.desired_replicas
-        ):
+            raise KubernetesScaleConflictError("quota authority changed during Kubernetes mutation")
+        if not refreshed_kueue.admitted or refreshed.admitted_replicas < decision.desired_replicas:
             raise KubernetesScaleConflictError(
                 "quota authority no longer admits the scaling decision"
             )
@@ -631,9 +622,7 @@ class KubernetesScaleActuator:
         if not isinstance(refreshed, ScalingPrewarmPlan):
             raise TypeError("reauthorize_prewarm must return ScalingPrewarmPlan")
         refreshed = ScalingPrewarmPlan.model_validate(refreshed.model_dump())
-        cache_age = (
-            authority.validated_at - refreshed.snapshot.observed_at
-        ).total_seconds()
+        cache_age = (authority.validated_at - refreshed.snapshot.observed_at).total_seconds()
         if not 0 <= cache_age <= decision.policy.max_observation_age_seconds:
             raise KubernetesScaleConflictError(
                 "prewarm authority is not fresh at final scale authorization"
@@ -642,8 +631,7 @@ class KubernetesScaleActuator:
             refreshed.snapshot.model_class != original.snapshot.model_class
             or refreshed.snapshot.model_revision != original.snapshot.model_revision
             or refreshed.snapshot.artifact_digest != original.snapshot.artifact_digest
-            or refreshed.snapshot.placement_binding_id
-            != original.snapshot.placement_binding_id
+            or refreshed.snapshot.placement_binding_id != original.snapshot.placement_binding_id
             or refreshed.resource_flavor != original.resource_flavor
             or refreshed.current_replicas != original.current_replicas
             or refreshed.quota_target_replicas != original.quota_target_replicas
@@ -659,8 +647,7 @@ class KubernetesScaleActuator:
             if placement.placement_id in original.runner_start_placement_ids
         }
         refreshed_placements = {
-            placement.placement_id: placement
-            for placement in refreshed.snapshot.placements
+            placement.placement_id: placement for placement in refreshed.snapshot.placements
         }
         retained_ready_capacity = all(
             placement_id in refreshed_placements
@@ -679,8 +666,9 @@ class KubernetesScaleActuator:
             and not refreshed_placements[placement_id].assigned
             and refreshed_placements[placement_id].healthy
             and refreshed_placements[placement_id].schedulable
-            and refreshed_placements[placement_id].state
-            is ModelCachePlacementState.READY
+            and refreshed_placements[placement_id].state is ModelCachePlacementState.READY
+            and refreshed_placements[placement_id].cache_hint_valid_until is not None
+            and authority.validated_at < refreshed_placements[placement_id].cache_hint_valid_until
             for placement_id, original_placement in original_placements.items()
         )
         if (
@@ -708,9 +696,7 @@ class KubernetesScaleActuator:
         if not isinstance(refreshed, ScalingDrainPlan):
             raise TypeError("reauthorize_drain must return ScalingDrainPlan")
         refreshed = ScalingDrainPlan.model_validate(refreshed.model_dump())
-        drain_age = (
-            authority.validated_at - refreshed.source_observed_at
-        ).total_seconds()
+        drain_age = (authority.validated_at - refreshed.source_observed_at).total_seconds()
         if not 0 <= drain_age <= decision.policy.max_observation_age_seconds:
             raise KubernetesScaleConflictError(
                 "drain authority is not fresh at final scale authorization"
@@ -747,9 +733,7 @@ class KubernetesScaleActuator:
             or refreshed.snapshot.drain_revision < original.snapshot.drain_revision
             or refreshed.source_observed_at < original.source_observed_at
         ):
-            raise KubernetesScaleConflictError(
-                "drain authority changed during Kubernetes mutation"
-            )
+            raise KubernetesScaleConflictError("drain authority changed during Kubernetes mutation")
         original_candidates = {
             candidate.workload_ordinal: candidate
             for candidate in original.snapshot.candidates
@@ -773,8 +757,7 @@ class KubernetesScaleActuator:
                 candidate.status.pod_uid,
                 candidate.status.termination_authorization,
             )
-            and refreshed_candidates[ordinal].status.observed_at
-            >= candidate.status.observed_at
+            and refreshed_candidates[ordinal].status.observed_at >= candidate.status.observed_at
             for ordinal, candidate in original_candidates.items()
         )
         if not evidence_retained:
@@ -868,13 +851,9 @@ class KubernetesScaleActuator:
         plan: ScalingDrainPlan,
     ) -> _DrainPodSnapshot:
         if not isinstance(payload, dict):
-            raise InvalidKubernetesScaleResponseError(
-                "drain Pod response must be an object"
-            )
+            raise InvalidKubernetesScaleResponseError("drain Pod response must be an object")
         if payload.get("apiVersion") != "v1" or payload.get("kind") != "Pod":
-            raise InvalidKubernetesScaleResponseError(
-                "drain Pod response must use v1 kind Pod"
-            )
+            raise InvalidKubernetesScaleResponseError("drain Pod response must use v1 kind Pod")
         metadata = payload.get("metadata")
         if not isinstance(metadata, dict):
             raise InvalidKubernetesScaleResponseError(
@@ -1030,9 +1009,7 @@ class KubernetesScaleActuator:
                 ],
             )
             if response.status_code in {404, 409, 422}:
-                raise KubernetesScaleConflictError(
-                    "drain Pod deletion hold changed before release"
-                )
+                raise KubernetesScaleConflictError("drain Pod deletion hold changed before release")
             response.raise_for_status()
             self._wait_for_drain_pod_absence(
                 candidate,
@@ -1165,9 +1142,7 @@ class KubernetesScaleActuator:
         """Apply one decision once; exact retries become read-only no-ops."""
 
         if not self._allow_unfenced:
-            raise RuntimeError(
-                "unfenced scale writes are disabled; use apply_fenced in production"
-            )
+            raise RuntimeError("unfenced scale writes are disabled; use apply_fenced in production")
 
         if not isinstance(decision, ScalingDecisionRecord):
             raise TypeError("decision must be a ScalingDecisionRecord")
@@ -1335,9 +1310,7 @@ class KubernetesScaleActuator:
                     for name, value in annotations.items()
                 )
             else:
-                patch.append(
-                    {"op": "add", "path": "/metadata/annotations", "value": annotations}
-                )
+                patch.append({"op": "add", "path": "/metadata/annotations", "value": annotations})
             response = self._client.patch(
                 url,
                 headers={**headers, "Content-Type": "application/json-patch+json"},
@@ -1445,21 +1418,13 @@ class KubernetesScaleActuator:
             and decision.decision_generation is None
         ):
             raise ValueError("mutating decision must be appended before fenced apply")
-        if (
-            decision.action is ScalingDecisionAction.SCALE_UP
-            and decision.quota_admission is None
-        ):
+        if decision.action is ScalingDecisionAction.SCALE_UP and decision.quota_admission is None:
             raise ValueError("fenced scale-up requires a durable quota admission")
-        if (
-            decision.action is ScalingDecisionAction.SCALE_UP
-            and decision.prewarm_plan is None
-        ):
+        if decision.action is ScalingDecisionAction.SCALE_UP and decision.prewarm_plan is None:
             raise ValueError("fenced scale-up requires a durable prewarm plan")
         if decision.action is ScalingDecisionAction.SCALE_DOWN:
             if target.kind is not KubernetesScalableKind.STATEFUL_SET:
-                raise ValueError(
-                    "fenced scale-down requires deterministic StatefulSet ordinals"
-                )
+                raise ValueError("fenced scale-down requires deterministic StatefulSet ordinals")
             if decision.drain_plan is None:
                 raise ValueError("fenced scale-down requires a durable drain plan")
 
@@ -1585,10 +1550,7 @@ class KubernetesScaleActuator:
                 raise KubernetesScaleConflictError(
                     "successor leader may only finish an already applied scale-down"
                 )
-            if (
-                stored_decision is not None
-                and stored_decision[0] == decision.decision_generation
-            ):
+            if stored_decision is not None and stored_decision[0] == decision.decision_generation:
                 raise KubernetesScaleConflictError(
                     "decision generation is bound to a different decision fingerprint"
                 )
@@ -1596,10 +1558,7 @@ class KubernetesScaleActuator:
                 raise KubernetesScaleConflictError(
                     "workload generation changed since the scaling decision"
                 )
-            if (
-                stored_decision is not None
-                and decision.decision_generation <= stored_decision[0]
-            ):
+            if stored_decision is not None and decision.decision_generation <= stored_decision[0]:
                 raise KubernetesScaleConflictError(
                     "scaling decision generation must advance monotonically"
                 )
@@ -1644,9 +1603,7 @@ class KubernetesScaleActuator:
                     [
                         {
                             "op": "test",
-                            "path": self._annotation_path(
-                                CACHE_PLACEMENT_BINDING_ANNOTATION
-                            ),
+                            "path": self._annotation_path(CACHE_PLACEMENT_BINDING_ANNOTATION),
                             "value": decision.prewarm_plan.snapshot.placement_binding_id,
                         }
                     ]
@@ -1686,10 +1643,7 @@ class KubernetesScaleActuator:
                     reauthorize_prewarm,
                     authority=authority,
                 )
-                if (
-                    refreshed_prewarm.quota_target_replicas
-                    != refreshed_quota.admitted_replicas
-                ):
+                if refreshed_prewarm.quota_target_replicas != refreshed_quota.admitted_replicas:
                     raise KubernetesScaleConflictError(
                         "final quota and prewarm authorities disagree"
                     )
@@ -1721,12 +1675,9 @@ class KubernetesScaleActuator:
                     for candidate in final_drain.selected_candidates
                 }
                 if (
-                    final_drain.snapshot.observed_at
-                    < refreshed_drain.snapshot.observed_at
-                    or final_drain.source_observed_at
-                    < refreshed_drain.source_observed_at
-                    or final_drain.snapshot.drain_revision
-                    < refreshed_drain.snapshot.drain_revision
+                    final_drain.snapshot.observed_at < refreshed_drain.snapshot.observed_at
+                    or final_drain.source_observed_at < refreshed_drain.source_observed_at
+                    or final_drain.snapshot.drain_revision < refreshed_drain.snapshot.drain_revision
                     or any(
                         final_candidate_times[ordinal] < observed_at
                         for ordinal, observed_at in refreshed_candidate_times.items()
@@ -1749,8 +1700,7 @@ class KubernetesScaleActuator:
             if (
                 updated.uid != observed.uid
                 or updated.replicas != decision.desired_replicas
-                or updated.statefulset_start_ordinal
-                != observed.statefulset_start_ordinal
+                or updated.statefulset_start_ordinal != observed.statefulset_start_ordinal
                 or updated.resource_version == observed.resource_version
                 or updated.generation != observed.generation + 1
                 or self._stored_authority(updated)

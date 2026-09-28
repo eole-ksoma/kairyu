@@ -61,6 +61,13 @@ class ModelCachePlacement(BaseModel):
     profile_id: str = Field(max_length=255)
     compatibility_approval_id: str = Field(max_length=255)
     state: ModelCachePlacementState
+    cache_hint_observed_at: datetime | None = None
+    cache_hint_valid_until: datetime | None = None
+    cache_hint_index_revision: int | None = Field(
+        default=None,
+        ge=1,
+        le=_MAX_SIGNED_BIGINT,
+    )
     assigned: bool = False
     healthy: bool = True
     schedulable: bool = True
@@ -82,6 +89,35 @@ class ModelCachePlacement(BaseModel):
         if type(value) is not bool:
             raise ValueError(f"{info.field_name} must be a boolean")
         return value
+
+    @field_validator("cache_hint_observed_at", "cache_hint_valid_until")
+    @classmethod
+    def validate_cache_hint_timestamp(cls, value: datetime | None, info) -> datetime | None:
+        return None if value is None else _aware(value, name=info.field_name)
+
+    @field_validator("cache_hint_index_revision", mode="before")
+    @classmethod
+    def validate_cache_hint_index_revision(cls, value: object) -> object:
+        return value if value is None else _integer(value, name="cache_hint_index_revision")
+
+    @model_validator(mode="after")
+    def validate_cache_hint_evidence(self) -> ModelCachePlacement:
+        evidence = (
+            self.cache_hint_observed_at,
+            self.cache_hint_valid_until,
+            self.cache_hint_index_revision,
+        )
+        if any(value is None for value in evidence) and any(
+            value is not None for value in evidence
+        ):
+            raise ValueError("cache hint time, expiry, and index revision must be present together")
+        if (
+            self.cache_hint_observed_at is not None
+            and self.cache_hint_valid_until is not None
+            and self.cache_hint_observed_at >= self.cache_hint_valid_until
+        ):
+            raise ValueError("cache hint expiry must follow its observation time")
+        return self
 
 
 class ModelCachePlacementCandidate(BaseModel):
@@ -165,6 +201,19 @@ class ScalingPrewarmSnapshot(BaseModel):
             raise ValueError("cache placements must use unique placement IDs")
         if placement_ids != tuple(sorted(placement_ids)):
             raise ValueError("cache placements must use canonical placement-ID order")
+        if any(
+            placement.cache_hint_observed_at is not None
+            and placement.cache_hint_observed_at > self.observed_at
+            for placement in self.placements
+        ):
+            raise ValueError("cache hint evidence cannot be newer than the snapshot")
+        if any(
+            placement.state is ModelCachePlacementState.READY
+            and placement.cache_hint_valid_until is not None
+            and self.observed_at >= placement.cache_hint_valid_until
+            for placement in self.placements
+        ):
+            raise ValueError("ready cache hint evidence must be live at the snapshot time")
         return self
 
 
@@ -420,6 +469,11 @@ def build_cache_placement_snapshot(
                     ModelCachePlacementState.READY
                     if resident is not None
                     else ModelCachePlacementState.ABSENT
+                ),
+                cache_hint_observed_at=(hint.observed_at if fresh and hint is not None else None),
+                cache_hint_valid_until=(hint.valid_until if fresh and hint is not None else None),
+                cache_hint_index_revision=(
+                    hint.index_revision if fresh and hint is not None else None
                 ),
                 assigned=candidate.assigned,
                 healthy=candidate.healthy,

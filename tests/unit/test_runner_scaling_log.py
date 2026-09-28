@@ -505,6 +505,61 @@ def test_legacy_schema_v1_fingerprint_and_postgres_row_remain_readable() -> None
     assert PostgresScalingDecisionLog._record(row) == record
 
 
+def test_legacy_prewarm_placement_fingerprint_and_postgres_row_remain_readable() -> None:
+    quota = _quota_admission(requested=6)
+    prewarm = _prewarm_plan(
+        quota_target=quota.admitted_replicas,
+        states=(
+            ModelCachePlacementState.FILLING,
+            ModelCachePlacementState.ABSENT,
+            ModelCachePlacementState.ABSENT,
+        ),
+    )
+    record = _record(
+        quota_admission=quota,
+        prewarm_plan=prewarm,
+        action=ScalingDecisionAction.HOLD,
+        reason=ScalingDecisionReason.CACHE_PREWARM,
+    )
+    legacy_payload = record.model_dump(mode="json")
+    for optional_field in (
+        "decision_generation",
+        "target_revision",
+        "quota_admission",
+        "prewarm_plan",
+        "drain_plan",
+    ):
+        if legacy_payload[optional_field] is None:
+            legacy_payload.pop(optional_field)
+    placements = legacy_payload["prewarm_plan"]["snapshot"]["placements"]
+    for placement in placements:
+        placement.pop("cache_hint_observed_at")
+        placement.pop("cache_hint_valid_until")
+        placement.pop("cache_hint_index_revision")
+    legacy_fingerprint = hashlib.sha256(
+        json.dumps(
+            legacy_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    row = (
+        record.decision_id,
+        record.policy.model_class,
+        record.decided_at,
+        record.window.started_at,
+        record.window.ended_at,
+        record.catalog_revision,
+        record.policy.policy_revision,
+        record.action.value,
+        legacy_fingerprint,
+        legacy_payload,
+    )
+
+    assert record.fingerprint == legacy_fingerprint
+    assert PostgresScalingDecisionLog._record(row) == record
+
+
 def test_scale_down_persists_exact_drain_plan_and_target_binding() -> None:
     drain = _drain_plan()
     decision = _record(
@@ -518,9 +573,7 @@ def test_scale_down_persists_exact_drain_plan_and_target_binding() -> None:
 
     assert decision.drain_plan == drain
     assert decision.drain_plan.candidate_runner_ids == ("runner-2",)
-    assert decision.drain_plan.snapshot.workload_uid == (
-        decision.target_revision.workload_uid
-    )
+    assert decision.drain_plan.snapshot.workload_uid == (decision.target_revision.workload_uid)
 
 
 @pytest.mark.parametrize(
@@ -605,6 +658,7 @@ def test_fresh_drain_snapshot_cannot_launder_stale_runner_evidence() -> None:
             desired_replicas=2,
             target_delta=-1,
         )
+
 
 def test_decision_persists_unconstrained_quota_and_kueue_admission() -> None:
     quota = _quota_admission(requested=6)
@@ -872,9 +926,7 @@ def test_out_of_range_decisions_cannot_move_away_or_overshoot(
         model_class="interactive-14b",
         started_at=NOW - timedelta(seconds=30),
         ended_at=NOW,
-        observations=(
-            _observation("outside", observed_at=NOW, current_replicas=current),
-        ),
+        observations=(_observation("outside", observed_at=NOW, current_replicas=current),),
     )
     with pytest.raises(ValidationError, match=message):
         _record(
@@ -940,9 +992,7 @@ def test_staleness_is_derived_from_all_latest_source_times() -> None:
 
     fresh_window = _window()
     latest = fresh_window.observations[-1]
-    old_resources = latest.resources.model_copy(
-        update={"observed_at": NOW - timedelta(seconds=60)}
-    )
+    old_resources = latest.resources.model_copy(update={"observed_at": NOW - timedelta(seconds=60)})
     stale_observation = latest.model_copy(update={"resources": old_resources})
     stale_window = fresh_window.model_copy(
         update={

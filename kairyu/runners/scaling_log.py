@@ -306,9 +306,7 @@ class ScalingObservation(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
 
-    schema_version: Literal["runner-scaling-observation-v1"] = (
-        "runner-scaling-observation-v1"
-    )
+    schema_version: Literal["runner-scaling-observation-v1"] = "runner-scaling-observation-v1"
     observation_id: str = Field(max_length=255)
     model_class: str = Field(max_length=128)
     observed_at: datetime
@@ -403,9 +401,7 @@ class ScalingDecisionRecord(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
 
-    schema_version: Literal["runner-scaling-decision-v1"] = (
-        "runner-scaling-decision-v1"
-    )
+    schema_version: Literal["runner-scaling-decision-v1"] = "runner-scaling-decision-v1"
     decision_id: str = Field(max_length=255)
     decision_generation: int | None = Field(default=None, ge=1, le=_MAX_SIGNED_BIGINT)
     decided_at: datetime
@@ -491,16 +487,12 @@ class ScalingDecisionRecord(BaseModel):
             self.decided_at - min(latest_source_times)
         ).total_seconds() > self.policy.max_observation_age_seconds
         if self.inputs_stale != derived_stale:
-            raise ValueError(
-                "inputs_stale must match the policy freshness limit and source times"
-            )
+            raise ValueError("inputs_stale must match the policy freshness limit and source times")
         expected_buffered_target = self.demand_replicas + self.policy.warm_buffer_for(
             self.demand_replicas
         )
         if self.buffered_target_replicas != expected_buffered_target:
-            raise ValueError(
-                "buffered_target_replicas must equal demand plus the policy buffer"
-            )
+            raise ValueError("buffered_target_replicas must equal demand plus the policy buffer")
         current = latest.runners.current_replicas
         if self.desired_replicas - current != self.target_delta:
             raise ValueError("target_delta must equal desired minus current replicas")
@@ -508,15 +500,11 @@ class ScalingDecisionRecord(BaseModel):
             if current > self.policy.max_replicas and not (
                 self.policy.max_replicas <= self.desired_replicas < current
             ):
-                raise ValueError(
-                    "an over-max replica count must converge toward the policy max"
-                )
+                raise ValueError("an over-max replica count must converge toward the policy max")
             if current < self.policy.min_replicas and not (
                 current < self.desired_replicas <= self.policy.min_replicas
             ):
-                raise ValueError(
-                    "an under-min replica count must converge toward the policy min"
-                )
+                raise ValueError("an under-min replica count must converge toward the policy min")
             if (
                 self.policy.min_replicas <= current <= self.policy.max_replicas
                 and not self.policy.min_replicas
@@ -566,9 +554,7 @@ class ScalingDecisionRecord(BaseModel):
                     self.target_revision.model_revision,
                 )
                 if drain_target != decision_target:
-                    raise ValueError(
-                        "drain plan must match the decision target revision"
-                    )
+                    raise ValueError("drain plan must match the decision target revision")
         quota_constrained = False
         cache_waiting = False
         if self.prewarm_plan is not None and self.quota_admission is None:
@@ -611,21 +597,14 @@ class ScalingDecisionRecord(BaseModel):
                 if prewarm.snapshot.observed_at > self.decided_at:
                     raise ValueError("prewarm observation cannot postdate the decision")
                 if prewarm.current_replicas != current:
-                    raise ValueError(
-                        "prewarm plan must use the observed current replicas"
-                    )
+                    raise ValueError("prewarm plan must use the observed current replicas")
                 if prewarm.quota_target_replicas != quota.admitted_replicas:
-                    raise ValueError(
-                        "prewarm plan must use the quota-admitted replica target"
-                    )
+                    raise ValueError("prewarm plan must use the quota-admitted replica target")
                 if prewarm.resource_flavor != quota.snapshot.kueue.resource_flavor:
-                    raise ValueError(
-                        "prewarm plan must use the Kueue resource flavor"
-                    )
+                    raise ValueError("prewarm plan must use the Kueue resource flavor")
                 if (
                     self.target_revision is not None
-                    and prewarm.snapshot.model_revision
-                    != self.target_revision.model_revision
+                    and prewarm.snapshot.model_revision != self.target_revision.model_revision
                 ):
                     raise ValueError(
                         "prewarm model revision must match the decision target revision"
@@ -640,9 +619,7 @@ class ScalingDecisionRecord(BaseModel):
                 if prewarm.action is not expected_prewarm_action:
                     raise ValueError("prewarm action must match the immediate Runner target")
             if expected_desired != self.desired_replicas:
-                raise ValueError(
-                    "decision desired replicas must match staged quota admission"
-                )
+                raise ValueError("decision desired replicas must match staged quota admission")
             if self.action is ScalingDecisionAction.SCALE_DOWN:
                 raise ValueError("scale-down decisions cannot be authorized by quota")
             expected_action = (
@@ -665,9 +642,7 @@ class ScalingDecisionRecord(BaseModel):
         if quota_constrained and not self.inputs_stale and not budget_reason:
             raise ValueError("fresh constrained quota admission requires budget-limit reason")
         cache_reason = self.reason is ScalingDecisionReason.CACHE_PREWARM
-        expected_cache_reason = (
-            cache_waiting and not self.inputs_stale and not quota_constrained
-        )
+        expected_cache_reason = cache_waiting and not self.inputs_stale and not quota_constrained
         if cache_reason != expected_cache_reason:
             raise ValueError(
                 "cache-prewarm reason must match an unconstrained staged scale-up hold"
@@ -692,6 +667,22 @@ class ScalingDecisionRecord(BaseModel):
         ):
             if fingerprint_payload[optional_field] is None:
                 del fingerprint_payload[optional_field]
+        prewarm_plan = fingerprint_payload.get("prewarm_plan")
+        if isinstance(prewarm_plan, dict):
+            snapshot = prewarm_plan.get("snapshot")
+            if isinstance(snapshot, dict):
+                placements = snapshot.get("placements")
+                if isinstance(placements, list):
+                    for placement in placements:
+                        if not isinstance(placement, dict):
+                            continue
+                        for optional_field in (
+                            "cache_hint_observed_at",
+                            "cache_hint_valid_until",
+                            "cache_hint_index_revision",
+                        ):
+                            if placement.get(optional_field) is None:
+                                placement.pop(optional_field, None)
         payload = json.dumps(
             fingerprint_payload,
             sort_keys=True,
@@ -785,9 +776,7 @@ class InMemoryScalingDecisionLog:
                     default=0,
                 )
                 if previous >= _MAX_SIGNED_BIGINT:
-                    raise ScalingDecisionGenerationError(
-                        "scaling decision generation is exhausted"
-                    )
+                    raise ScalingDecisionGenerationError("scaling decision generation is exhausted")
                 record = ScalingDecisionRecord.model_validate(
                     record.model_copy(update={"decision_generation": previous + 1}).model_dump()
                 )

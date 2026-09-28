@@ -119,7 +119,8 @@ The private-cloud deployment must still provide:
 - WP4.6 is implemented in
   `docs/design/node-model-cache-corruption-recovery-v1.md`; quarantined evidence
   is outside the eviction namespace and has a separate retention policy.
-- WP4.7: controller-driven pre-stage intent and its pin lifecycle.
+- WP4.7 is implemented in `docs/design/node-model-cache-prestage-v1.md`; its
+  owner-scoped pins are protected by the same generic pin fence.
 - Deployment acceptance: fill the real node cache under active/rollback pins
   and prove no protected revision is removed.
 

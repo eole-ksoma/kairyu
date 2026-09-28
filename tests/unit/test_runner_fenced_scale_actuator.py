@@ -158,6 +158,17 @@ def _prewarm_plan(
                 profile_id="h100-sxm-tp1",
                 compatibility_approval_id="compat-h100-qwen-v1",
                 state=state,
+                cache_hint_observed_at=(
+                    observed_at if state is ModelCachePlacementState.READY else None
+                ),
+                cache_hint_valid_until=(
+                    observed_at + timedelta(minutes=5)
+                    if state is ModelCachePlacementState.READY
+                    else None
+                ),
+                cache_hint_index_revision=(
+                    cache_revision if state is ModelCachePlacementState.READY else None
+                ),
             )
             for index, state in enumerate(states)
         ),
@@ -178,6 +189,7 @@ def _refresh_prewarm(
     cache_revision: int = 8,
     artifact_digest: str = "sha256:model-artifact-a",
     node_name: str | None = None,
+    hint_valid_until: datetime | None = None,
 ):
     original = decision.prewarm_plan
     assert original is not None
@@ -192,6 +204,17 @@ def _refresh_prewarm(
                     placement.model_copy(
                         update={
                             "state": state,
+                            "cache_hint_observed_at": (
+                                observed_at if state is ModelCachePlacementState.READY else None
+                            ),
+                            "cache_hint_valid_until": (
+                                hint_valid_until or observed_at + timedelta(minutes=5)
+                                if state is ModelCachePlacementState.READY
+                                else None
+                            ),
+                            "cache_hint_index_revision": (
+                                cache_revision if state is ModelCachePlacementState.READY else None
+                            ),
                             **({"node_name": node_name} if node_name is not None else {}),
                         }
                     )
@@ -375,9 +398,7 @@ def _persist(
 ) -> ScalingDecisionRecord:
     if decision.target_revision is None:
         decision = ScalingDecisionRecord.model_validate(
-            decision.model_copy(
-                update={"target_revision": _target_revision()}
-            ).model_dump()
+            decision.model_copy(update={"target_revision": _target_revision()}).model_dump()
         )
     return log.append(decision)
 
@@ -437,9 +458,7 @@ def _annotations(
         assert decision.decision_generation is not None
         annotations.update(
             {
-                SCALE_DECISION_GENERATION_ANNOTATION: str(
-                    decision.decision_generation
-                ),
+                SCALE_DECISION_GENERATION_ANNOTATION: str(decision.decision_generation),
                 SCALE_DECISION_ID_ANNOTATION: decision.decision_id,
                 SCALE_DECISION_FINGERPRINT_ANNOTATION: decision.fingerprint,
             }
@@ -486,9 +505,7 @@ def _drain_pod_payload(
         "name": f"qwen-14b-runners-{ordinal}",
         "namespace": "model-serving",
         "uid": uid or f"pod-uid-{ordinal}",
-        "finalizers": (
-            [SCALE_DOWN_DRAIN_FINALIZER] if finalizers is None else finalizers
-        ),
+        "finalizers": ([SCALE_DOWN_DRAIN_FINALIZER] if finalizers is None else finalizers),
         "ownerReferences": [
             {
                 "apiVersion": "apps/v1",
@@ -544,17 +561,13 @@ def test_claim_then_fenced_scale_persists_full_decision_identity_and_retries(
                 {"op": "test", "path": "/metadata/resourceVersion", "value": "10"},
                 {"op": "test", "path": "/metadata/uid", "value": "workload-uid"},
             ]
-            state = _workload_payload(
-                resource_version="11", annotations=_annotations(token=1)
-            )
+            state = _workload_payload(resource_version="11", annotations=_annotations(token=1))
         else:
             assert decision is not None
             values = {operation["path"]: operation.get("value") for operation in patch}
             assert values["/metadata/annotations/kairyu.ai~1scale-fencing-token"] == "1"
             assert (
-                values[
-                    "/metadata/annotations/kairyu.ai~1cache-placement-binding"
-                ]
+                values["/metadata/annotations/kairyu.ai~1cache-placement-binding"]
                 == "binding-qwen-h100-a"
             )
             assert values["/metadata/annotations/kairyu.ai~1scale-decision-generation"] == "1"
@@ -572,12 +585,8 @@ def test_claim_then_fenced_scale_persists_full_decision_identity_and_retries(
         return httpx.Response(200, json=state)
 
     actuator, client, log = _actuator(tmp_path, handler)
-    claim = actuator.claim_authority(
-        _target(), _authority(), reauthorize=lambda: _authority()
-    )
-    decision = log.append(
-        _decision(target_revision=claim.target_revision)
-    )
+    claim = actuator.claim_authority(_target(), _authority(), reauthorize=lambda: _authority())
+    decision = log.append(_decision(target_revision=claim.target_revision))
     result = actuator.apply_fenced(
         decision,
         _target(),
@@ -618,9 +627,7 @@ def test_successor_claim_blocks_stale_leader_before_decision(tmp_path: Path) -> 
         nonlocal state
         if request.method == "GET":
             return httpx.Response(200, json=state)
-        state = _workload_payload(
-            resource_version="11", annotations=_annotations(token=2)
-        )
+        state = _workload_payload(resource_version="11", annotations=_annotations(token=2))
         return httpx.Response(200, json=state)
 
     actuator, client, log = _actuator(tmp_path, handler)
@@ -669,9 +676,7 @@ def test_successor_claim_between_old_read_and_patch_invalidates_old_cas(
     def handler(request: httpx.Request) -> httpx.Response:
         methods.append(request.method)
         if request.method == "GET":
-            return httpx.Response(
-                200, json=_workload_payload(annotations=_annotations(token=1))
-            )
+            return httpx.Response(200, json=_workload_payload(annotations=_annotations(token=1)))
         return httpx.Response(422, json={"kind": "Status", "reason": "Invalid"})
 
     actuator, client, log = _actuator(tmp_path, handler)
@@ -695,9 +700,7 @@ def test_expired_authority_between_read_and_patch_prevents_write(tmp_path: Path)
 
     def handler(request: httpx.Request) -> httpx.Response:
         methods.append(request.method)
-        return httpx.Response(
-            200, json=_workload_payload(annotations=_annotations(token=1))
-        )
+        return httpx.Response(200, json=_workload_payload(annotations=_annotations(token=1)))
 
     actuator, client, log = _actuator(tmp_path, handler)
     decision = _persist(log, _decision())
@@ -1099,6 +1102,25 @@ def test_stale_prewarm_at_final_authorization_prevents_scale_up(
     client.close()
 
 
+def test_expired_physical_cache_hint_prevents_final_scale_authorization() -> None:
+    decision = _decision()
+    refreshed = _refresh_prewarm(
+        decision,
+        observed_at=NOW + timedelta(seconds=1),
+        hint_valid_until=NOW + timedelta(seconds=2),
+    )
+
+    with pytest.raises(
+        KubernetesScaleConflictError,
+        match="no longer provides ready cache capacity",
+    ):
+        KubernetesScaleActuator._reauthorize_prewarm(
+            decision,
+            lambda: refreshed,
+            authority=_authority(validated_at=NOW + timedelta(seconds=3)),
+        )
+
+
 def test_quota_reservation_must_be_bound_to_decision_target() -> None:
     mismatched = _target_revision().model_copy(update={"name": "other-runners"})
 
@@ -1220,9 +1242,7 @@ def test_newer_generation_skips_abandoned_decision_and_delayed_one_is_rejected(
         )
         return httpx.Response(200, json=state)
 
-    actuator, client, _unused = _actuator(
-        tmp_path, handler, decision_log=log
-    )
+    actuator, client, _unused = _actuator(tmp_path, handler, decision_log=log)
     applied = actuator.apply_fenced(
         current,
         _target(),
@@ -1254,9 +1274,7 @@ def test_hold_is_generation_free_but_requires_claimed_authority(tmp_path: Path) 
         requests.append(request)
         return httpx.Response(
             200,
-            json=_workload_payload(
-                kind="StatefulSet", annotations=_annotations(token=1)
-            ),
+            json=_workload_payload(kind="StatefulSet", annotations=_annotations(token=1)),
         )
 
     actuator, client, log = _actuator(tmp_path, handler)
@@ -1374,11 +1392,7 @@ def test_statefulset_scale_down_requires_and_reauthorizes_exact_drained_ordinals
         ("PATCH", True),
         ("GET", True),
     ]
-    assert [
-        path.rsplit("-", 1)[1]
-        for method, path in requests
-        if method == "DELETE"
-    ] == ["3", "2"]
+    assert [path.rsplit("-", 1)[1] for method, path in requests if method == "DELETE"] == ["3", "2"]
     client.close()
 
 
@@ -1398,11 +1412,7 @@ def test_statefulset_scale_down_reports_ordered_cleanup_pending(
                     200,
                     json=_drain_pod_payload(
                         ordinal,
-                        finalizers=(
-                            []
-                            if ordinal in released
-                            else [SCALE_DOWN_DRAIN_FINALIZER]
-                        ),
+                        finalizers=([] if ordinal in released else [SCALE_DOWN_DRAIN_FINALIZER]),
                         deleting=ordinal in released,
                     ),
                 )
@@ -1974,9 +1984,7 @@ def test_stale_final_drain_authority_prevents_scale_down(tmp_path: Path) -> None
             _target(KubernetesScalableKind.STATEFUL_SET),
             authority=_authority(),
             fence=_fence(),
-            reauthorize=lambda: _authority(
-                validated_at=NOW + timedelta(seconds=31)
-            ),
+            reauthorize=lambda: _authority(validated_at=NOW + timedelta(seconds=31)),
             reauthorize_drain=lambda: plan,
         )
     assert methods == ["GET"]
@@ -2022,9 +2030,7 @@ def test_fresh_outer_drain_snapshot_cannot_reauthorize_stale_runner_evidence(
             _target(KubernetesScalableKind.STATEFUL_SET),
             authority=_authority(),
             fence=_fence(),
-            reauthorize=lambda: _authority(
-                validated_at=NOW + timedelta(seconds=1)
-            ),
+            reauthorize=lambda: _authority(validated_at=NOW + timedelta(seconds=1)),
             reauthorize_drain=lambda: stale_inner,
         )
     assert methods == ["GET"]
@@ -2067,9 +2073,7 @@ def test_drain_revision_rollback_prevents_scale_down(tmp_path: Path) -> None:
             _target(KubernetesScalableKind.STATEFUL_SET),
             authority=_authority(),
             fence=_fence(),
-            reauthorize=lambda: _authority(
-                validated_at=NOW + timedelta(seconds=1)
-            ),
+            reauthorize=lambda: _authority(validated_at=NOW + timedelta(seconds=1)),
             reauthorize_drain=lambda: rollback,
         )
     assert methods == ["GET"]
@@ -2127,9 +2131,7 @@ def test_drain_revision_cannot_roll_back_during_pod_hold_verification(
             _target(KubernetesScalableKind.STATEFUL_SET),
             authority=_authority(),
             fence=_fence(),
-            reauthorize=lambda: _authority(
-                validated_at=NOW + timedelta(seconds=2)
-            ),
+            reauthorize=lambda: _authority(validated_at=NOW + timedelta(seconds=2)),
             reauthorize_drain=lambda: next(refreshed),
         )
     assert methods == ["GET", "GET", "GET"]
@@ -2168,8 +2170,7 @@ def test_drain_runner_source_cannot_roll_back_during_pod_hold_verification(
                     "status": candidate.status.model_copy(
                         update={
                             "observed_at": source_observed_at[
-                                candidate.workload_ordinal
-                                - plan.desired_replicas
+                                candidate.workload_ordinal - plan.desired_replicas
                             ]
                         }
                     )
@@ -2226,9 +2227,7 @@ def test_drain_runner_source_cannot_roll_back_during_pod_hold_verification(
             _target(KubernetesScalableKind.STATEFUL_SET),
             authority=_authority(),
             fence=_fence(),
-            reauthorize=lambda: _authority(
-                validated_at=NOW + timedelta(seconds=3)
-            ),
+            reauthorize=lambda: _authority(validated_at=NOW + timedelta(seconds=3)),
             reauthorize_drain=lambda: next(refreshed),
         )
     assert methods == ["GET", "GET", "GET"]
@@ -2336,12 +2335,8 @@ def test_fenced_scale_up_requires_durable_prewarm_plan_before_io(
         ),
     ],
 )
-def test_stale_workload_identity_is_rejected(
-    tmp_path: Path, payload: dict, message: str
-) -> None:
-    actuator, client, log = _actuator(
-        tmp_path, lambda _request: httpx.Response(200, json=payload)
-    )
+def test_stale_workload_identity_is_rejected(tmp_path: Path, payload: dict, message: str) -> None:
+    actuator, client, log = _actuator(tmp_path, lambda _request: httpx.Response(200, json=payload))
     with pytest.raises(KubernetesScaleConflictError, match=message):
         actuator.apply_fenced(
             _persist(log, _decision()),
@@ -2358,9 +2353,7 @@ def test_incomplete_authority_annotations_fail_closed(tmp_path: Path) -> None:
     annotations[SCALE_FENCING_TOKEN_ANNOTATION] = "1"
     actuator, client, log = _actuator(
         tmp_path,
-        lambda _request: httpx.Response(
-            200, json=_workload_payload(annotations=annotations)
-        ),
+        lambda _request: httpx.Response(200, json=_workload_payload(annotations=annotations)),
     )
     with pytest.raises(InvalidKubernetesScaleResponseError, match="incomplete"):
         actuator.apply_fenced(
@@ -2411,9 +2404,7 @@ def test_fenced_response_requires_exact_authority_decision_and_generation(
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET":
-            return httpx.Response(
-                200, json=_workload_payload(annotations=_annotations(token=1))
-            )
+            return httpx.Response(200, json=_workload_payload(annotations=_annotations(token=1)))
         return httpx.Response(
             200,
             json=_workload_payload(
@@ -2424,9 +2415,7 @@ def test_fenced_response_requires_exact_authority_decision_and_generation(
             ),
         )
 
-    actuator, client, _unused_log = _actuator(
-        tmp_path, handler, decision_log=log
-    )
+    actuator, client, _unused_log = _actuator(tmp_path, handler, decision_log=log)
     with pytest.raises(InvalidKubernetesScaleResponseError, match="mutation contract"):
         actuator.apply_fenced(
             decision,
@@ -2457,9 +2446,7 @@ def test_fenced_result_revalidates_cross_field_identity(tmp_path: Path) -> None:
         )
         return httpx.Response(200, json=state)
 
-    actuator, client, _unused_log = _actuator(
-        tmp_path, handler, decision_log=log
-    )
+    actuator, client, _unused_log = _actuator(tmp_path, handler, decision_log=log)
     result = actuator.apply_fenced(
         decision,
         _target(),
@@ -2488,9 +2475,7 @@ def test_leader_gate_claims_before_fenced_scale(tmp_path: Path) -> None:
         if request.method == "GET":
             return httpx.Response(200, json=state)
         if SCALE_ELECTION_ID_ANNOTATION not in state["metadata"]["annotations"]:
-            state = _workload_payload(
-                resource_version="11", annotations=_annotations(token=1)
-            )
+            state = _workload_payload(resource_version="11", annotations=_annotations(token=1))
         else:
             assert decision is not None
             state = _workload_payload(

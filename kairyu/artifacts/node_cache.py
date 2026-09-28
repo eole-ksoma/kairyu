@@ -1,8 +1,8 @@
-"""Node-local verified model cache fill agent (WP4.2).
+"""Node-local verified model cache fill and recovery agent (WP4.2/WP4.6).
 
 Only a fully downloaded and digest-verified staging directory is atomically
-renamed into the published cache namespace.  Cache indexing, eviction,
-quarantine, and pre-staging policy intentionally remain WP4.3-WP4.7.
+renamed into the published cache namespace. Runner-start verification can
+quarantine later corruption and replace it from the authoritative source.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shutil
 import stat
 import time
@@ -25,7 +26,14 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, Self
 from urllib.parse import quote
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from kairyu.artifacts.manifest import (
     ModelArtifactAdmission,
@@ -80,6 +88,14 @@ class ModelArtifactDownloadError(NodeModelCacheError):
 
 class ModelArtifactDigestMismatchError(NodeModelCacheError):
     """A downloaded blob did not match its signed digest."""
+
+
+class NodeModelCacheAuditError(NodeModelCacheError):
+    """A corruption transition could not be written to the required audit sink."""
+
+
+class NodeModelCacheRecoveryError(NodeModelCacheError):
+    """A quarantined artifact could not be replaced by a verified refill."""
 
 
 def _require_secure_cache_directory(path_stat: os.stat_result, *, name: str) -> None:
@@ -194,6 +210,146 @@ class NodeModelCacheFillResult(BaseModel):
         if type(value) is not int:
             raise ValueError(f"{info.field_name} must be an integer")
         return value
+
+
+class NodeModelCacheCorruptionAuditEvent(BaseModel):
+    """Bounded audit evidence for one corruption recovery transition."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    schema_version: Literal["kairyu-node-model-cache-corruption-audit-v1"] = (
+        "kairyu-node-model-cache-corruption-audit-v1"
+    )
+    event: Literal[
+        "corruption_quarantined",
+        "corruption_refetched",
+        "corruption_refetch_failed",
+    ]
+    at_ns: int = Field(ge=0, le=_MAX_SIGNED_BIGINT)
+    node_id: str = Field(min_length=1, max_length=255)
+    deployment_id: str = Field(min_length=1, max_length=255)
+    manifest_digest: str = Field(min_length=64, max_length=64)
+    model_id: str = Field(min_length=1, max_length=255)
+    model_revision: str = Field(min_length=1, max_length=255)
+    recovery_id: str = Field(min_length=64, max_length=64)
+    record_generation: int = Field(ge=1, le=_MAX_SIGNED_BIGINT)
+    reason: Literal[
+        "digest_mismatch",
+        "structural_invalid",
+        "index_unverified",
+        "verified_refetch",
+        "refetch_failed",
+    ]
+    quarantine_path: Path
+
+    @field_validator("at_ns", "record_generation", mode="before")
+    @classmethod
+    def validate_integer(cls, value: object, info) -> object:
+        if type(value) is not int:
+            raise ValueError(f"{info.field_name} must be an integer")
+        return value
+
+    @field_validator("node_id", "deployment_id", "model_id", "model_revision")
+    @classmethod
+    def validate_text(cls, value: str, info) -> str:
+        if not value.strip() or "\x00" in value:
+            raise ValueError(f"{info.field_name} must be a non-empty string without NUL")
+        return value
+
+    @field_validator("manifest_digest")
+    @classmethod
+    def validate_digest(cls, value: str) -> str:
+        if not _SHA256_PATTERN.fullmatch(value):
+            raise ValueError("manifest_digest must be a lowercase SHA-256 digest")
+        return value
+
+    @field_validator("recovery_id")
+    @classmethod
+    def validate_recovery_id(cls, value: str) -> str:
+        if not _SHA256_PATTERN.fullmatch(value):
+            raise ValueError("recovery_id must be a lowercase 256-bit identifier")
+        return value
+
+    @field_validator("quarantine_path", mode="before")
+    @classmethod
+    def validate_quarantine_path(cls, value: object) -> object:
+        path = Path(value) if isinstance(value, (str, Path)) else None
+        if path is None or not path.is_absolute() or "\x00" in str(path):
+            raise ValueError("quarantine_path must be an absolute path without NUL")
+        return path
+
+
+class NodeModelCacheAuditSink(Protocol):
+    """Required synchronous sink for corruption state transitions."""
+
+    def emit(self, event: NodeModelCacheCorruptionAuditEvent) -> None:
+        """Persist one event or raise; silent drops are forbidden."""
+
+
+class NodeModelCacheRunnerStartDecision(BaseModel):
+    """Fail-closed result of full cache verification before Runner startup."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    schema_version: Literal["kairyu-node-model-cache-runner-start-v1"] = (
+        "kairyu-node-model-cache-runner-start-v1"
+    )
+    runner_start_allowed: bool
+    manifest_digest: str = Field(min_length=64, max_length=64)
+    artifact_path: Path | None = None
+    corruption_detected: bool
+    refetched: bool
+    quarantine_path: Path | None = None
+    reason: Literal["verified", "digest_mismatch", "structural_invalid", "index_unverified"]
+
+    @field_validator(
+        "runner_start_allowed",
+        "corruption_detected",
+        "refetched",
+        mode="before",
+    )
+    @classmethod
+    def validate_boolean(cls, value: object, info) -> object:
+        if type(value) is not bool:
+            raise ValueError(f"{info.field_name} must be a boolean")
+        return value
+
+    @field_validator("manifest_digest")
+    @classmethod
+    def validate_digest(cls, value: str) -> str:
+        if not _SHA256_PATTERN.fullmatch(value):
+            raise ValueError("manifest_digest must be a lowercase SHA-256 digest")
+        return value
+
+    @field_validator("artifact_path", "quarantine_path", mode="before")
+    @classmethod
+    def validate_optional_path(cls, value: object, info) -> object:
+        if value is None:
+            return value
+        path = Path(value) if isinstance(value, (str, Path)) else None
+        if path is None or not path.is_absolute() or "\x00" in str(path):
+            raise ValueError(f"{info.field_name} must be an absolute path without NUL")
+        return path
+
+    @model_validator(mode="after")
+    def validate_decision(self) -> NodeModelCacheRunnerStartDecision:
+        if self.runner_start_allowed:
+            if (
+                self.corruption_detected
+                or self.refetched
+                or self.quarantine_path is not None
+                or self.artifact_path is None
+                or self.reason != "verified"
+            ):
+                raise ValueError("allowed Runner start must contain only verified evidence")
+        elif (
+            not self.corruption_detected
+            or self.quarantine_path is None
+            or self.artifact_path is not None
+            or self.reason == "verified"
+        ):
+            raise ValueError("denied Runner start must contain quarantine evidence")
+        return self
 
 
 class LocalModelArtifactBlobSource:
@@ -473,6 +629,335 @@ class NodeModelCacheAgent:
                 verification_source="filled",
             )
             return result
+
+    def verify_for_runner_start(
+        self,
+        envelope: SignedModelArtifactManifest,
+        trust_store: ModelArtifactTrustStore,
+        request: ModelArtifactAdmissionRequest,
+        *,
+        audit_sink: NodeModelCacheAuditSink,
+    ) -> NodeModelCacheRunnerStartDecision:
+        """Hash every resident blob; quarantine/refetch corruption but deny this start."""
+
+        if self._index is None:
+            raise NodeModelCacheError("Runner-start verification requires a cache index")
+        emitter = getattr(audit_sink, "emit", None)
+        if not callable(emitter):
+            raise TypeError("audit_sink must provide a callable emit method")
+        admission = admit_model_artifact(envelope, trust_store, request)
+        digest = admission.manifest_digest
+        published = self._root / "artifacts" / digest
+        self._prepare_root()
+        quarantine_path: Path | None = None
+        reason: Literal[
+            "digest_mismatch",
+            "structural_invalid",
+            "index_unverified",
+        ]
+        recovery_id = ""
+        recovery_generation = 0
+        replacement_ready = False
+        with self._exclusive_lock(self._root / ".locks" / f"{digest}.lock"):
+            admission = admit_model_artifact(envelope, trust_store, request)
+            record = self._index.get(digest)
+            if record is None:
+                from kairyu.artifacts.cache_index import (
+                    NodeModelCacheIndexEntryNotFoundError,
+                )
+
+                raise NodeModelCacheIndexEntryNotFoundError(
+                    "Runner-start verification requires indexed residency"
+                )
+            expected_identity = (
+                envelope.manifest.model_id,
+                envelope.manifest.model_revision,
+                published / "tree",
+                sum(blob.size_bytes for blob in envelope.manifest.files),
+                len(envelope.manifest.files),
+            )
+            actual_identity = (
+                record.model_id,
+                record.model_revision,
+                record.artifact_path,
+                record.total_bytes,
+                record.file_count,
+            )
+            if actual_identity != expected_identity:
+                from kairyu.artifacts.cache_index import (
+                    NodeModelCacheIndexIdentityError,
+                )
+
+                raise NodeModelCacheIndexIdentityError(
+                    "indexed residency does not match Runner-start manifest"
+                )
+            if not record.verified:
+                reason = (
+                    record.verification_failure
+                    if record.verification_failure
+                    in {"digest_mismatch", "structural_invalid", "index_unverified"}
+                    else "index_unverified"
+                )
+            else:
+                try:
+                    self._validate_published(published, envelope)
+                    self._verify_artifact_digests(
+                        published / "tree",
+                        envelope.manifest.files,
+                    )
+                except ModelArtifactDigestMismatchError:
+                    reason = "digest_mismatch"
+                except InvalidNodeModelCacheEntryError:
+                    reason = "structural_invalid"
+                else:
+                    self._index.touch(digest)
+                    return NodeModelCacheRunnerStartDecision(
+                        runner_start_allowed=True,
+                        manifest_digest=digest,
+                        artifact_path=published / "tree",
+                        corruption_detected=False,
+                        refetched=False,
+                        reason="verified",
+                    )
+
+            recovery = self._index.begin_recovery(digest, reason=reason)
+            if recovery.recovery_id is None:
+                raise NodeModelCacheRecoveryError(
+                    "cache index did not persist a recovery identifier"
+                )
+            recovery_id = recovery.recovery_id
+            recovery_generation = recovery.generation
+            quarantine_root = self._root / ".quarantine"
+            try:
+                quarantine_root.mkdir(mode=0o700, exist_ok=True)
+                _require_secure_cache_directory(
+                    quarantine_root.stat(follow_symlinks=False),
+                    name="cache quarantine path",
+                )
+            except (OSError, InvalidNodeModelCacheEntryError) as exc:
+                raise InvalidNodeModelCacheEntryError(
+                    "cannot prepare cache quarantine path"
+                ) from exc
+            incident_path = quarantine_root / f"{digest}.{recovery_id}"
+            if published.exists() or published.is_symlink():
+                if record.recovery_id == recovery_id and (
+                    incident_path.exists() or incident_path.is_symlink()
+                ):
+                    try:
+                        self._validate_published(published, envelope)
+                        self._verify_artifact_digests(
+                            published / "tree",
+                            envelope.manifest.files,
+                        )
+                    except (
+                        ModelArtifactDigestMismatchError,
+                        InvalidNodeModelCacheEntryError,
+                    ):
+                        pass
+                    else:
+                        replacement_ready = True
+                        quarantine_path = incident_path
+                if not replacement_ready:
+                    quarantine_path = incident_path
+                    if quarantine_path.exists() or quarantine_path.is_symlink():
+                        quarantine_path = quarantine_root / (
+                            f"{digest}.{recovery_id}.retry.{secrets.token_hex(16)}"
+                        )
+                    try:
+                        os.rename(published, quarantine_path)
+                    except OSError as exc:
+                        raise InvalidNodeModelCacheEntryError(
+                            "cannot quarantine corrupt cache entry"
+                        ) from exc
+                    self._fsync_directory(published.parent)
+                    self._fsync_directory(quarantine_root)
+            else:
+                quarantine_path = incident_path
+                if not quarantine_path.exists() and not quarantine_path.is_symlink():
+                    try:
+                        quarantine_path.mkdir(mode=0o700)
+                    except OSError as exc:
+                        raise InvalidNodeModelCacheEntryError(
+                            "cannot persist missing-residency quarantine marker"
+                        ) from exc
+                    self._fsync_directory(quarantine_root)
+            self._emit_corruption_audit(
+                audit_sink,
+                event="corruption_quarantined",
+                reason=reason,
+                admission=admission,
+                recovery_id=recovery_id,
+                generation=recovery_generation,
+                quarantine_path=quarantine_path,
+            )
+
+        assert quarantine_path is not None
+        if not replacement_ready:
+            try:
+                refill_agent = NodeModelCacheAgent(
+                    self._root,
+                    self._source,
+                    index=None,
+                    chunk_size_bytes=self._chunk_size_bytes,
+                    lock_timeout_seconds=self._lock_timeout_seconds,
+                )
+                refill_agent.ensure_cached(envelope, trust_store, request)
+            except Exception as exc:
+                self._emit_corruption_audit(
+                    audit_sink,
+                    event="corruption_refetch_failed",
+                    reason="refetch_failed",
+                    admission=admission,
+                    recovery_id=recovery_id,
+                    generation=recovery_generation,
+                    quarantine_path=quarantine_path,
+                )
+                raise NodeModelCacheRecoveryError(
+                    "corrupt cache entry was quarantined but verified refill failed"
+                ) from exc
+
+        with self._exclusive_lock(self._root / ".locks" / f"{digest}.lock"):
+            current = self._index.get(digest)
+            if (
+                current is None
+                or current.verified
+                or current.recovery_id != recovery_id
+                or current.generation != recovery_generation
+            ):
+                raise NodeModelCacheRecoveryError(
+                    "cache recovery fence changed before audit completion"
+                )
+            try:
+                self._validate_published(published, envelope)
+                self._verify_artifact_digests(
+                    published / "tree",
+                    envelope.manifest.files,
+                )
+            except (
+                ModelArtifactDigestMismatchError,
+                InvalidNodeModelCacheEntryError,
+            ) as exc:
+                self._emit_corruption_audit(
+                    audit_sink,
+                    event="corruption_refetch_failed",
+                    reason="refetch_failed",
+                    admission=admission,
+                    recovery_id=recovery_id,
+                    generation=recovery_generation,
+                    quarantine_path=quarantine_path,
+                )
+                raise NodeModelCacheRecoveryError(
+                    "replacement failed final Runner-start verification"
+                ) from exc
+            self._emit_corruption_audit(
+                audit_sink,
+                event="corruption_refetched",
+                reason="verified_refetch",
+                admission=admission,
+                recovery_id=recovery_id,
+                generation=recovery_generation,
+                quarantine_path=quarantine_path,
+            )
+            self._index.complete_recovery(
+                manifest_digest=digest,
+                recovery_id=recovery_id,
+                expected_generation=recovery_generation,
+                model_id=envelope.manifest.model_id,
+                model_revision=envelope.manifest.model_revision,
+                artifact_path=published / "tree",
+                total_bytes=sum(blob.size_bytes for blob in envelope.manifest.files),
+                file_count=len(envelope.manifest.files),
+            )
+        return NodeModelCacheRunnerStartDecision(
+            runner_start_allowed=False,
+            manifest_digest=digest,
+            corruption_detected=True,
+            refetched=True,
+            quarantine_path=quarantine_path,
+            reason=reason,
+        )
+
+    @staticmethod
+    def _verify_artifact_digests(
+        tree: Path,
+        blobs: tuple[ModelArtifactBlob, ...],
+    ) -> None:
+        for blob in blobs:
+            path = tree / Path(*blob.path.split("/"))
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            try:
+                descriptor = os.open(path, flags)
+            except OSError as exc:
+                raise InvalidNodeModelCacheEntryError(
+                    "cannot open artifact blob for Runner-start verification"
+                ) from exc
+            digest = hashlib.sha256()
+            try:
+                blob_stat = os.fstat(descriptor)
+                _require_secure_cache_file(blob_stat, name="artifact blob")
+                if blob_stat.st_size != blob.size_bytes:
+                    raise InvalidNodeModelCacheEntryError(
+                        "artifact blob size changed before Runner start"
+                    )
+                while True:
+                    chunk = os.read(descriptor, _DEFAULT_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+            except InvalidNodeModelCacheEntryError:
+                raise
+            except OSError as exc:
+                raise InvalidNodeModelCacheEntryError(
+                    "cannot hash artifact blob before Runner start"
+                ) from exc
+            finally:
+                os.close(descriptor)
+            if digest.hexdigest() != blob.sha256:
+                raise ModelArtifactDigestMismatchError(
+                    "resident blob digest does not match signed manifest"
+                )
+
+    def _emit_corruption_audit(
+        self,
+        sink: NodeModelCacheAuditSink,
+        *,
+        event: Literal[
+            "corruption_quarantined",
+            "corruption_refetched",
+            "corruption_refetch_failed",
+        ],
+        reason: Literal[
+            "digest_mismatch",
+            "structural_invalid",
+            "index_unverified",
+            "verified_refetch",
+            "refetch_failed",
+        ],
+        admission: ModelArtifactAdmission,
+        recovery_id: str,
+        generation: int,
+        quarantine_path: Path,
+    ) -> None:
+        assert self._index is not None
+        try:
+            sink.emit(
+                NodeModelCacheCorruptionAuditEvent(
+                    event=event,
+                    at_ns=time.time_ns(),
+                    node_id=self._index.node_id,
+                    deployment_id=admission.deployment_id,
+                    manifest_digest=admission.manifest_digest,
+                    model_id=admission.model_id,
+                    model_revision=admission.model_revision,
+                    recovery_id=recovery_id,
+                    record_generation=generation,
+                    reason=reason,
+                    quarantine_path=quarantine_path,
+                )
+            )
+        except Exception as exc:
+            raise NodeModelCacheAuditError("cache corruption audit sink rejected an event") from exc
 
     def _prepare_root(self) -> None:
         try:

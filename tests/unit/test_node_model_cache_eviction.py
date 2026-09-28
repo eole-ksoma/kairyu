@@ -119,6 +119,29 @@ def test_active_rollback_and_manual_pins_are_never_selected(tmp_path: Path):
     assert plan.blocked_reclaim_bytes == 30
 
 
+def test_recovery_required_residency_is_never_selected_or_fenced_for_eviction(
+    tmp_path: Path,
+):
+    index = _index(tmp_path)
+    record = _record(index, "a", total_bytes=120)
+    recovery = index.begin_recovery(record.manifest_digest, reason="digest_mismatch")
+
+    plan = plan_node_model_cache_eviction(index.snapshot(), _policy())
+
+    assert plan.victims == ()
+    assert plan.blocked_reclaim_bytes == 70
+    with pytest.raises(
+        NodeModelCacheIndexEvictionConflictError,
+        match="recovery-required",
+    ):
+        with index.fenced_eviction(
+            record.manifest_digest,
+            expected_index_revision=index.snapshot().revision,
+            expected_generation=recovery.generation,
+        ):
+            pass
+
+
 def test_executor_detaches_tree_deletes_exact_generation_and_advances_revision(
     tmp_path: Path,
 ):

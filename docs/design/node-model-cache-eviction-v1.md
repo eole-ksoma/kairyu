@@ -23,8 +23,9 @@ about raw filesystem occupancy.
 
 ## Protection contract
 
-Every owner-scoped WP4.3 pin excludes its artifact from LRU selection. The node
-daemon must maintain pins for all protected roles, including:
+Every owner-scoped WP4.3 pin and every WP4.6 recovery-required row excludes its
+artifact from LRU selection. The node daemon must maintain pins for all
+protected roles, including:
 
 - a currently active Runner or deployment;
 - an approved rollback target;
@@ -66,7 +67,8 @@ remaining work instead of racing or over-reclaiming. For each victim it then:
 
 1. takes the same digest lock used by cache fill;
 2. opens an SQLite immediate transaction;
-3. verifies the exact row generation and absence of every pin;
+3. verifies the exact row generation, absence of every pin, and absence of a
+   recovery ID;
 4. atomically renames `<root>/artifacts/<digest>` to the private
    `<root>/.evicting/<digest>.<index-revision>.<generation>` namespace;
 5. deletes that exact index row and commits, advancing the global revision by a
@@ -114,8 +116,9 @@ The private-cloud deployment must still provide:
 
 ## Deferred work
 
-- WP4.6: corruption detection, quarantine, audit, re-fetch, and Runner-start
-  refusal.
+- WP4.6 is implemented in
+  `docs/design/node-model-cache-corruption-recovery-v1.md`; quarantined evidence
+  is outside the eviction namespace and has a separate retention policy.
 - WP4.7: controller-driven pre-stage intent and its pin lifecycle.
 - Deployment acceptance: fill the real node cache under active/rollback pins
   and prove no protected revision is removed.

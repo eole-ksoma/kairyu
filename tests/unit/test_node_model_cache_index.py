@@ -10,6 +10,7 @@ from threading import Event
 
 import pytest
 
+import kairyu.artifacts.cache_index as cache_index_module
 from kairyu.artifacts import (
     NodeModelCacheIndex,
     NodeModelCacheIndexEntryNotFoundError,
@@ -141,6 +142,47 @@ def _legacy_v1_index(
                 ("a" * 64,),
             )
     path.chmod(0o600)
+    return path
+
+
+def _legacy_v2_index(tmp_path: Path) -> Path:
+    path = _legacy_v1_index(tmp_path)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE cache_index_meta SET schema_version = ? WHERE singleton = 1",
+            ("kairyu-node-model-cache-index-v2",),
+        )
+        connection.execute("PRAGMA user_version = 2")
+        connection.execute(
+            """
+            CREATE TABLE cache_index_revision (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                revision INTEGER NOT NULL CHECK (revision BETWEEN 1 AND 9223372036854775807)
+            )
+            """
+        )
+        connection.execute("INSERT INTO cache_index_revision (singleton, revision) VALUES (1, 2)")
+        events = {
+            "cache_entries_revision_insert": "AFTER INSERT ON cache_entries",
+            "cache_entries_revision_update": (
+                "AFTER UPDATE OF last_access_at_ns, verification_source, verified, "
+                "verification_failure, verified_at_ns ON cache_entries"
+            ),
+            "cache_entries_revision_delete": "AFTER DELETE ON cache_entries",
+            "cache_pins_revision_insert": "AFTER INSERT ON cache_pins",
+            "cache_pins_revision_update": "AFTER UPDATE ON cache_pins",
+            "cache_pins_revision_delete": "AFTER DELETE ON cache_pins",
+        }
+        for name, event in events.items():
+            connection.execute(
+                f"""
+                CREATE TRIGGER {name} {event}
+                BEGIN
+                    UPDATE cache_index_revision SET revision = revision + 1
+                    WHERE singleton = 1;
+                END
+                """
+            )
     return path
 
 
@@ -297,6 +339,148 @@ def test_unverified_state_blocks_access_until_digest_verified_refill(tmp_path: P
     assert recovered.verification_failure is None
     assert recovered.verification_source == "filled"
     assert recovered.verified_at_ns == 200
+
+
+def test_recovery_required_state_needs_exact_audited_completion(tmp_path: Path):
+    index = _index(tmp_path)
+    _record(index)
+
+    recovery = index.begin_recovery("a" * 64, reason="digest_mismatch")
+
+    assert recovery.verified is False
+    assert recovery.recovery_id is not None
+    with pytest.raises(NodeModelCacheIndexUnverifiedError, match="fenced audit completion"):
+        _record(index, verification_source="filled")
+    with pytest.raises(NodeModelCacheIndexUnverifiedError, match="fence no longer matches"):
+        index.complete_recovery(
+            manifest_digest="a" * 64,
+            recovery_id=recovery.recovery_id,
+            expected_generation=recovery.generation + 1,
+            model_id="org/model",
+            model_revision="release-1",
+            artifact_path=index.path.parent / "artifacts" / ("a" * 64) / "tree",
+            total_bytes=27,
+            file_count=2,
+        )
+
+    completed = index.complete_recovery(
+        manifest_digest="a" * 64,
+        recovery_id=recovery.recovery_id,
+        expected_generation=recovery.generation,
+        model_id="org/model",
+        model_revision="release-1",
+        artifact_path=index.path.parent / "artifacts" / ("a" * 64) / "tree",
+        total_bytes=27,
+        file_count=2,
+    )
+    assert completed.verified is True
+    assert completed.recovery_id is None
+
+
+def test_recovery_id_does_not_repeat_after_delete_and_generation_reset(tmp_path: Path):
+    index = _index(tmp_path)
+    _record(index)
+    first = index.begin_recovery("a" * 64, reason="digest_mismatch")
+    assert first.recovery_id is not None
+    completed = index.complete_recovery(
+        manifest_digest="a" * 64,
+        recovery_id=first.recovery_id,
+        expected_generation=first.generation,
+        model_id="org/model",
+        model_revision="release-1",
+        artifact_path=index.path.parent / "artifacts" / ("a" * 64) / "tree",
+        total_bytes=27,
+        file_count=2,
+    )
+    with index.fenced_eviction(
+        "a" * 64,
+        expected_index_revision=index.snapshot().revision,
+        expected_generation=completed.generation,
+    ):
+        pass
+    refilled = _record(index)
+    assert refilled.generation == 1
+
+    second = index.begin_recovery("a" * 64, reason="digest_mismatch")
+
+    assert second.recovery_id is not None
+    assert second.recovery_id != first.recovery_id
+
+
+def test_v2_migration_guards_recovery_from_prechecked_old_writer(tmp_path: Path):
+    path = _legacy_v2_index(tmp_path)
+    old_writer = sqlite3.connect(path)
+    try:
+        assert old_writer.execute("PRAGMA user_version").fetchone()[0] == 2
+        index = NodeModelCacheIndex(path, node_id="node-a")
+        recovery = index.begin_recovery("a" * 64, reason="digest_mismatch")
+        assert recovery.recovery_id is not None
+
+        with pytest.raises(sqlite3.IntegrityError, match="recovery-required"):
+            old_writer.execute(
+                """
+                UPDATE cache_entries
+                SET verified = 1, verification_failure = NULL,
+                    generation = generation + 1
+                WHERE manifest_digest = ?
+                """,
+                ("a" * 64,),
+            )
+        old_writer.rollback()
+        with pytest.raises(sqlite3.IntegrityError, match="recovery-required"):
+            old_writer.execute(
+                "DELETE FROM cache_entries WHERE manifest_digest = ?",
+                ("a" * 64,),
+            )
+    finally:
+        old_writer.close()
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert (
+            connection.execute(
+                "SELECT schema_version FROM cache_index_meta WHERE singleton = 1"
+            ).fetchone()[0]
+            == "kairyu-node-model-cache-index-v3"
+        )
+
+
+def test_concurrent_v2_constructors_serialize_one_v3_migration(tmp_path: Path):
+    path = _legacy_v2_index(tmp_path)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        migrated = tuple(
+            pool.map(
+                lambda _: NodeModelCacheIndex(path, node_id="node-a"),
+                range(16),
+            )
+        )
+
+    assert all(value.snapshot().records[0].recovery_id is None for value in migrated)
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+
+
+def test_v2_migration_ddl_failure_rolls_back_without_partial_v3(tmp_path: Path):
+    path = _legacy_v2_index(tmp_path)
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TRIGGER cache_pins_revision_delete")
+
+    with pytest.raises(NodeModelCacheIndexError, match="cannot initialize"):
+        NodeModelCacheIndex(path, node_id="node-a")
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert (
+            connection.execute(
+                "SELECT schema_version FROM cache_index_meta WHERE singleton = 1"
+            ).fetchone()[0]
+            == "kairyu-node-model-cache-index-v2"
+        )
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(cache_entries)").fetchall()
+        }
+        assert "recovery_id" not in columns
 
 
 def test_index_is_bound_to_one_node_identity(tmp_path: Path):
@@ -463,6 +647,37 @@ def test_concurrent_constructors_share_one_complete_schema(tmp_path: Path):
     assert all(index.list_records() == () for index in indexes)
 
 
+def test_wal_enable_retries_sqlite_lock_within_busy_timeout(monkeypatch):
+    class LockingConnection:
+        attempts = 0
+
+        def execute(self, statement: str):
+            assert statement == "PRAGMA journal_mode = WAL"
+            self.attempts += 1
+            if self.attempts < 3:
+                raise sqlite3.OperationalError("database is locked")
+            return self
+
+        def fetchone(self):
+            return ("wal",)
+
+    monotonic_values = iter((1_000_000_000, 1_001_000_000, 1_002_000_000))
+    sleeps: list[float] = []
+    monkeypatch.setattr(
+        cache_index_module.time,
+        "monotonic_ns",
+        lambda: next(monotonic_values),
+    )
+    monkeypatch.setattr(cache_index_module.time, "sleep", sleeps.append)
+    index = object.__new__(NodeModelCacheIndex)
+    index._busy_timeout_ms = 50
+    connection = LockingConnection()
+
+    assert index._enable_wal_mode(connection) == "wal"
+    assert connection.attempts == 3
+    assert sleeps == [0.01, 0.01]
+
+
 def test_legacy_v1_index_migrates_transactionally_and_fences_old_writers(
     tmp_path: Path,
 ):
@@ -475,12 +690,12 @@ def test_legacy_v1_index_migrates_transactionally_and_fences_old_writers(
     assert snapshot.records[0].generation == 2
     assert snapshot.records[0].pin_owners == ("deployment/a",)
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
         assert (
             connection.execute(
                 "SELECT schema_version FROM cache_index_meta WHERE singleton = 1"
             ).fetchone()[0]
-            == "kairyu-node-model-cache-index-v2"
+            == "kairyu-node-model-cache-index-v3"
         )
         entries_sql = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cache_entries'"
@@ -562,7 +777,7 @@ def test_sqlite_contract_uses_wal_full_sync_and_foreign_keys(tmp_path: Path):
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
         assert connection.execute("PRAGMA synchronous").fetchone()[0] == 2
         assert connection.execute("PRAGMA application_id").fetchone()[0] == 0x4B414943
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
         tables = {
             row[0]
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")

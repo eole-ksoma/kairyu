@@ -28,8 +28,8 @@ the cache agent must still validate or refill the tree before use.
 
 The database is bound at creation to:
 
-- schema identity `kairyu-node-model-cache-index-v2`;
-- SQLite application ID `KAIC` and user version 2; and
+- schema identity `kairyu-node-model-cache-index-v3`;
+- SQLite application ID `KAIC` and user version 3; and
 - one explicit node ID supplied by the node daemon or Downward API; and
 - the exact cache-root path containing the database.
 
@@ -45,15 +45,15 @@ FULL synchronous writes. Mutations use `BEGIN IMMEDIATE`, so concurrent cache
 processes serialize changes without lost pin or access updates. The schema and
 indexes are created transactionally.
 
-WP4.4 upgrades the original WP4.3 user-version-1 schema transactionally. It
-validates the legacy node/root binding and every row generation, rebuilds the
-entry and pin tables with signed-64-bit generation bounds, creates the bounded
-global revision from those generations, updates the schema identity, and
-commits user version 2 as one unit. An unrepresentable revision rolls the whole
-migration back. Database triggers advance the revision for every observable
-entry or pin mutation. Therefore even a version-1 connection that completed its
-version check immediately before migration cannot change migrated rows without
-advancing the revision; a newly opened version-1 writer rejects version 2.
+WP4.4 upgrades the original user-version-1 schema through version 2, rebuilding
+the entry/pin tables with signed-64-bit generation bounds and creating the
+global revision. WP4.6 then upgrades version 2 to version 3 by adding the
+dedicated recovery ID and database recovery guards. Both paths are one
+transaction, so a v1 database reaches v3 or rolls back unchanged. New v1/v2
+writers reject v3. A v2 connection that passed its version check before
+migration is still prevented by `BEFORE UPDATE/DELETE` guards from clearing or
+deleting a recovery-required row. Trigger presence and security-relevant guard
+definitions are checked whenever v3 opens.
 
 ## Entry contract
 
@@ -63,7 +63,8 @@ Each `manifest_digest` primary key binds immutable cache metadata:
 - model ID and model revision;
 - the exact `<cache-root>/artifacts/<digest>/tree` path;
 - total bytes and file count from the signed manifest;
-- verified state, its evidence source, and an optional failure reason;
+- verified state, its evidence source, an optional failure reason, and an
+  optional globally unique recovery ID;
 - verification and last-access Unix timestamps in nanoseconds; and
 - a monotonically increasing row generation.
 
@@ -79,11 +80,14 @@ publication. A later hit cannot downgrade `filled` evidence. Re-recording an
 identical digest advances last access; any model/path/size/file-count conflict
 for that digest is rejected rather than overwritten.
 
-`mark_unverified()` durably revokes the verified state with a bounded reason.
-An unverified row cannot be touched or pinned, and a structural
-`published_marker` hit cannot restore it. Only a new `filled` result that hashes
-every blob may restore verified state and clear the failure. WP4.6 will invoke
-this primitive as part of quarantine/audit/re-fetch orchestration.
+`mark_unverified()` durably revokes the verified state with a bounded generic
+reason. An unverified row cannot be touched or pinned, and a structural
+`published_marker` hit cannot restore it. A generic unverified row may be
+restored by a new `filled` result. WP4.6 instead uses `begin_recovery()`, whose
+dedicated recovery ID cannot be cleared by `record_verified()`. Only
+`complete_recovery()` may restore it, under the exact recovery ID, row
+generation, immutable identity, full-digest verification, digest lock, and
+successful audit. Recovery-required rows also cannot be deleted by eviction.
 
 Wall-clock regression cannot move `last_access_at_ns` backward. A row generation
 advances only when durable observable state changes, allowing later eviction or
@@ -146,8 +150,8 @@ WP4.4's projection and controller join are defined in
 
 - WP4.5 is implemented in `docs/design/node-model-cache-eviction-v1.md` with
   capacity watermarks, generation-fenced LRU deletion, and pin protection.
-- WP4.6: connect unverified marking to corruption detection, quarantine, audit,
-  and re-fetch before Runner start.
+- WP4.6 is implemented in
+  `docs/design/node-model-cache-corruption-recovery-v1.md`.
 - WP4.7: deployment/autoscale pre-staging and its pin lifecycle.
 
 The node daemon, service account, cache path, node ID injection, and live load
@@ -155,4 +159,4 @@ evidence remain deployment work. CPU tests cover concurrent constructors and
 writers, snapshot-consistent reads, transactional initialization,
 persistence/reopen, node/root identity conflicts, clock regression, pin
 composition, permission checks, post-publication index repair, and fail-closed
-corruption behavior.
+corruption/recovery behavior.

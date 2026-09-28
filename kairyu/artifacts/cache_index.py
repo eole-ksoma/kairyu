@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import os
 import re
+import secrets
 import sqlite3
 import stat
 import time
@@ -15,12 +16,15 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 _LEGACY_SCHEMA_VERSION = "kairyu-node-model-cache-index-v1"
-_SCHEMA_VERSION = "kairyu-node-model-cache-index-v2"
+_PREVIOUS_SCHEMA_VERSION = "kairyu-node-model-cache-index-v2"
+_SCHEMA_VERSION = "kairyu-node-model-cache-index-v3"
 _APPLICATION_ID = 0x4B414943  # "KAIC"
 _LEGACY_USER_VERSION = 1
-_USER_VERSION = 2
+_PREVIOUS_USER_VERSION = 2
+_USER_VERSION = 3
 _MAX_SIGNED_BIGINT = 2**63 - 1
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_RECOVERY_ID_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
 class NodeModelCacheIndexError(RuntimeError):
@@ -52,8 +56,8 @@ class NodeModelCacheRecord(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
 
-    schema_version: Literal["kairyu-node-model-cache-record-v1"] = (
-        "kairyu-node-model-cache-record-v1"
+    schema_version: Literal["kairyu-node-model-cache-record-v2"] = (
+        "kairyu-node-model-cache-record-v2"
     )
     node_id: str = Field(max_length=255)
     manifest_digest: str = Field(min_length=64, max_length=64)
@@ -65,6 +69,7 @@ class NodeModelCacheRecord(BaseModel):
     verified: bool
     verification_source: Literal["filled", "published_marker"]
     verification_failure: str | None = Field(default=None, max_length=1024)
+    recovery_id: str | None = Field(default=None, min_length=64, max_length=64)
     verified_at_ns: int = Field(ge=0, le=_MAX_SIGNED_BIGINT)
     last_access_at_ns: int = Field(ge=0, le=_MAX_SIGNED_BIGINT)
     pin_owners: tuple[str, ...] = Field(default=(), max_length=10_000)
@@ -83,6 +88,13 @@ class NodeModelCacheRecord(BaseModel):
     def validate_digest(cls, value: str) -> str:
         if not _SHA256_PATTERN.fullmatch(value):
             raise ValueError("manifest_digest must be a lowercase SHA-256 digest")
+        return value
+
+    @field_validator("recovery_id")
+    @classmethod
+    def validate_recovery_id(cls, value: str | None) -> str | None:
+        if value is not None and not _RECOVERY_ID_PATTERN.fullmatch(value):
+            raise ValueError("recovery_id must be a lowercase 256-bit identifier")
         return value
 
     @field_validator("artifact_path", mode="before")
@@ -128,6 +140,8 @@ class NodeModelCacheRecord(BaseModel):
     def validate_consistency(self) -> NodeModelCacheRecord:
         if self.verified == (self.verification_failure is not None):
             raise ValueError("verification failure must be present only for unverified residency")
+        if self.verified and self.recovery_id is not None:
+            raise ValueError("verified residency cannot have a recovery identifier")
         if self.pinned != bool(self.pin_owners):
             raise ValueError("pinned must match pin_owners")
         if self.last_access_at_ns < self.verified_at_ns:
@@ -140,8 +154,8 @@ class NodeModelCacheIndexSnapshot(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
 
-    schema_version: Literal["kairyu-node-model-cache-index-snapshot-v1"] = (
-        "kairyu-node-model-cache-index-snapshot-v1"
+    schema_version: Literal["kairyu-node-model-cache-index-snapshot-v2"] = (
+        "kairyu-node-model-cache-index-snapshot-v2"
     )
     node_id: str = Field(max_length=255)
     revision: int = Field(ge=1, le=_MAX_SIGNED_BIGINT)
@@ -283,10 +297,15 @@ class NodeModelCacheIndex:
                         total_bytes=total_bytes,
                         file_count=file_count,
                     )
-                    if not row["verified"] and verification_source != "filled":
-                        raise NodeModelCacheIndexUnverifiedError(
-                            "unverified residency requires a digest-verified refill"
-                        )
+                    if not row["verified"]:
+                        if row["recovery_id"] is not None:
+                            raise NodeModelCacheIndexUnverifiedError(
+                                "recovery-required residency needs fenced audit completion"
+                            )
+                        if verification_source != "filled":
+                            raise NodeModelCacheIndexUnverifiedError(
+                                "unverified residency requires a digest-verified refill"
+                            )
                     source = row["verification_source"]
                     verified_at = row["verified_at_ns"]
                     verification_failure = row["verification_failure"]
@@ -446,13 +465,17 @@ class NodeModelCacheIndex:
             with self._write_transaction() as connection:
                 row = connection.execute(
                     """
-                    SELECT verified, verification_failure FROM cache_entries
+                    SELECT verified, verification_failure, recovery_id FROM cache_entries
                     WHERE manifest_digest = ?
                     """,
                     (digest,),
                 ).fetchone()
                 if row is None:
                     raise NodeModelCacheIndexEntryNotFoundError("cache index entry does not exist")
+                if row["recovery_id"] is not None:
+                    raise NodeModelCacheIndexUnverifiedError(
+                        "recovery-required residency cannot be replaced by a generic failure"
+                    )
                 if row["verified"] or row["verification_failure"] != reason:
                     connection.execute(
                         """
@@ -466,6 +489,128 @@ class NodeModelCacheIndex:
                 return self._get_required(connection, digest)
         except sqlite3.Error as exc:
             raise NodeModelCacheIndexError("cannot mark cache residency unverified") from exc
+
+    def begin_recovery(
+        self,
+        manifest_digest: str,
+        *,
+        reason: str,
+    ) -> NodeModelCacheRecord:
+        """Create or resume one durable, globally unique corruption incident."""
+
+        digest = self._validate_digest(manifest_digest)
+        reason = self._validate_text(reason, name="recovery reason", max_length=900)
+        try:
+            with self._write_transaction() as connection:
+                row = connection.execute(
+                    "SELECT * FROM cache_entries WHERE manifest_digest = ?",
+                    (digest,),
+                ).fetchone()
+                if row is None:
+                    raise NodeModelCacheIndexEntryNotFoundError("cache index entry does not exist")
+                recovery_id = row["recovery_id"]
+                if recovery_id is None:
+                    recovery_id = secrets.token_hex(32)
+                    connection.execute(
+                        """
+                        UPDATE cache_entries
+                        SET verified = 0, verification_failure = ?, recovery_id = ?,
+                            generation = generation + 1
+                        WHERE manifest_digest = ?
+                        """,
+                        (reason, recovery_id, digest),
+                    )
+                return self._get_required(connection, digest)
+        except sqlite3.Error as exc:
+            raise NodeModelCacheIndexError("cannot begin cache recovery") from exc
+
+    def complete_recovery(
+        self,
+        *,
+        manifest_digest: str,
+        recovery_id: str,
+        expected_generation: int,
+        model_id: str,
+        model_revision: str,
+        artifact_path: Path,
+        total_bytes: int,
+        file_count: int,
+    ) -> NodeModelCacheRecord:
+        """CAS one audited, digest-verified replacement back to verified."""
+
+        digest = self._validate_digest(manifest_digest)
+        recovery_id = self._validate_recovery_id(recovery_id)
+        generation = self._validate_integer(
+            expected_generation,
+            name="expected_generation",
+            minimum=1,
+            maximum=_MAX_SIGNED_BIGINT,
+        )
+        model_id = self._validate_text(model_id, name="model_id", max_length=255)
+        model_revision = self._validate_text(
+            model_revision,
+            name="model_revision",
+            max_length=255,
+        )
+        artifact_path = self._validate_artifact_path(artifact_path, digest=digest)
+        total_bytes = self._validate_integer(
+            total_bytes,
+            name="total_bytes",
+            minimum=0,
+            maximum=_MAX_SIGNED_BIGINT,
+        )
+        file_count = self._validate_integer(
+            file_count,
+            name="file_count",
+            minimum=1,
+            maximum=100_000,
+        )
+        now = self._now_ns()
+        try:
+            with self._write_transaction() as connection:
+                row = connection.execute(
+                    "SELECT * FROM cache_entries WHERE manifest_digest = ?",
+                    (digest,),
+                ).fetchone()
+                if row is None:
+                    raise NodeModelCacheIndexEntryNotFoundError("cache index entry does not exist")
+                self._require_matching_identity(
+                    row,
+                    model_id=model_id,
+                    model_revision=model_revision,
+                    artifact_path=artifact_path,
+                    total_bytes=total_bytes,
+                    file_count=file_count,
+                )
+                if (
+                    row["verified"]
+                    or row["generation"] != generation
+                    or row["recovery_id"] != recovery_id
+                ):
+                    raise NodeModelCacheIndexUnverifiedError(
+                        "cache recovery fence no longer matches"
+                    )
+                connection.execute(
+                    """
+                    UPDATE cache_entries
+                    SET verified = 1, verification_source = 'filled',
+                        verification_failure = NULL, verified_at_ns = ?,
+                        recovery_id = NULL, last_access_at_ns = ?,
+                        generation = generation + 1
+                    WHERE manifest_digest = ? AND generation = ?
+                        AND verified = 0 AND recovery_id = ?
+                    """,
+                    (
+                        now,
+                        max(row["last_access_at_ns"], now),
+                        digest,
+                        generation,
+                        recovery_id,
+                    ),
+                )
+                return self._get_required(connection, digest)
+        except sqlite3.Error as exc:
+            raise NodeModelCacheIndexError("cannot complete cache recovery") from exc
 
     def get(self, manifest_digest: str) -> NodeModelCacheRecord | None:
         digest = self._validate_digest(manifest_digest)
@@ -566,6 +711,10 @@ class NodeModelCacheIndex:
                     raise NodeModelCacheIndexEvictionConflictError(
                         "cache residency generation changed before eviction"
                     )
+                if row["recovery_id"] is not None:
+                    raise NodeModelCacheIndexEvictionConflictError(
+                        "recovery-required residency cannot be evicted"
+                    )
                 pin = connection.execute(
                     "SELECT 1 FROM cache_pins WHERE manifest_digest = ? LIMIT 1",
                     (digest,),
@@ -578,6 +727,7 @@ class NodeModelCacheIndex:
                     """
                     DELETE FROM cache_entries
                     WHERE manifest_digest = ? AND generation = ?
+                      AND recovery_id IS NULL
                       AND NOT EXISTS (
                           SELECT 1 FROM cache_pins WHERE manifest_digest = ?
                       )
@@ -613,6 +763,7 @@ class NodeModelCacheIndex:
                     if user_version not in {
                         0,
                         _LEGACY_USER_VERSION,
+                        _PREVIOUS_USER_VERSION,
                         _USER_VERSION,
                     }:
                         raise NodeModelCacheIndexIdentityError(
@@ -626,6 +777,13 @@ class NodeModelCacheIndex:
                                 "legacy cache index has no application identity"
                             )
                         self._migrate_v1_to_v2(connection)
+                        self._migrate_v2_to_v3(connection)
+                    elif user_version == _PREVIOUS_USER_VERSION:
+                        if application_id != _APPLICATION_ID:
+                            raise NodeModelCacheIndexIdentityError(
+                                "previous cache index has no application identity"
+                            )
+                        self._migrate_v2_to_v3(connection)
                     else:
                         if application_id != _APPLICATION_ID:
                             raise NodeModelCacheIndexIdentityError(
@@ -640,7 +798,12 @@ class NodeModelCacheIndex:
                             connection,
                             if_not_exists=True,
                         )
+                        self._create_recovery_guard_triggers(
+                            connection,
+                            if_not_exists=True,
+                        )
                         self._require_revision_triggers(connection)
+                        self._require_recovery_guard_triggers(connection)
                     connection.execute(f"PRAGMA application_id = {_APPLICATION_ID}")
                     connection.execute(f"PRAGMA user_version = {_USER_VERSION}")
                     connection.commit()
@@ -703,7 +866,9 @@ class NodeModelCacheIndex:
         )
         self._require_index_revision(connection)
         self._create_revision_triggers(connection, if_not_exists=True)
+        self._create_recovery_guard_triggers(connection, if_not_exists=True)
         self._require_revision_triggers(connection)
+        self._require_recovery_guard_triggers(connection)
 
     def _migrate_v1_to_v2(self, connection: sqlite3.Connection) -> None:
         self._require_meta_binding(connection, schema_version=_LEGACY_SCHEMA_VERSION)
@@ -720,7 +885,9 @@ class NodeModelCacheIndex:
                     "legacy cache index revision cannot be represented safely"
                 )
             revision += generation
-        connection.execute(self._entries_table_statement("cache_entries_v2", if_not_exists=False))
+        connection.execute(
+            self._v2_entries_table_statement("cache_entries_v2", if_not_exists=False)
+        )
         connection.execute(
             """
             INSERT INTO cache_entries_v2 SELECT
@@ -764,12 +931,65 @@ class NodeModelCacheIndex:
             "INSERT INTO cache_index_revision (singleton, revision) VALUES (1, ?)",
             (revision,),
         )
+        self._create_v2_revision_triggers(connection)
+        connection.execute(
+            "UPDATE cache_index_meta SET schema_version = ? WHERE singleton = 1",
+            (_PREVIOUS_SCHEMA_VERSION,),
+        )
+        self._require_revision_triggers(connection)
+
+    def _migrate_v2_to_v3(self, connection: sqlite3.Connection) -> None:
+        self._require_meta_binding(connection, schema_version=_PREVIOUS_SCHEMA_VERSION)
+        self._require_index_revision(connection)
+        connection.execute(
+            """
+            ALTER TABLE cache_entries ADD COLUMN recovery_id TEXT
+                CHECK (recovery_id IS NULL OR length(recovery_id) = 64)
+            """
+        )
+        for trigger in (
+            "cache_entries_revision_insert",
+            "cache_entries_revision_update",
+            "cache_entries_revision_delete",
+            "cache_pins_revision_insert",
+            "cache_pins_revision_update",
+            "cache_pins_revision_delete",
+        ):
+            connection.execute(f"DROP TRIGGER {trigger}")
         self._create_revision_triggers(connection, if_not_exists=False)
+        self._create_recovery_guard_triggers(connection, if_not_exists=False)
         connection.execute(
             "UPDATE cache_index_meta SET schema_version = ? WHERE singleton = 1",
             (_SCHEMA_VERSION,),
         )
         self._require_revision_triggers(connection)
+        self._require_recovery_guard_triggers(connection)
+
+    @staticmethod
+    def _v2_entries_table_statement(name: str, *, if_not_exists: bool) -> str:
+        qualifier = " IF NOT EXISTS" if if_not_exists else ""
+        return f"""
+            CREATE TABLE{qualifier} {name} (
+                manifest_digest TEXT PRIMARY KEY,
+                model_id TEXT NOT NULL,
+                model_revision TEXT NOT NULL,
+                artifact_path TEXT NOT NULL,
+                total_bytes INTEGER NOT NULL CHECK (total_bytes >= 0),
+                file_count INTEGER NOT NULL CHECK (file_count >= 1),
+                verified INTEGER NOT NULL CHECK (verified IN (0, 1)),
+                verification_source TEXT NOT NULL CHECK (
+                    verification_source IN ('filled', 'published_marker')
+                ),
+                verification_failure TEXT,
+                verified_at_ns INTEGER NOT NULL CHECK (verified_at_ns >= 0),
+                last_access_at_ns INTEGER NOT NULL CHECK (
+                    last_access_at_ns >= verified_at_ns
+                ),
+                generation INTEGER NOT NULL CHECK (
+                    generation BETWEEN 1 AND {_MAX_SIGNED_BIGINT}
+                )
+            )
+        """
 
     @staticmethod
     def _entries_table_statement(name: str, *, if_not_exists: bool) -> str:
@@ -787,6 +1007,9 @@ class NodeModelCacheIndex:
                     verification_source IN ('filled', 'published_marker')
                 ),
                 verification_failure TEXT,
+                recovery_id TEXT CHECK (
+                    recovery_id IS NULL OR length(recovery_id) = 64
+                ),
                 verified_at_ns INTEGER NOT NULL CHECK (verified_at_ns >= 0),
                 last_access_at_ns INTEGER NOT NULL CHECK (
                     last_access_at_ns >= verified_at_ns
@@ -830,6 +1053,38 @@ class NodeModelCacheIndex:
         """
 
     @staticmethod
+    def _create_v2_revision_triggers(connection: sqlite3.Connection) -> None:
+        events = {
+            "cache_entries_revision_insert": "AFTER INSERT ON cache_entries",
+            "cache_entries_revision_update": (
+                "AFTER UPDATE OF last_access_at_ns, verification_source, verified, "
+                "verification_failure, verified_at_ns ON cache_entries"
+            ),
+            "cache_entries_revision_delete": "AFTER DELETE ON cache_entries",
+            "cache_pins_revision_insert": "AFTER INSERT ON cache_pins",
+            "cache_pins_revision_update": "AFTER UPDATE ON cache_pins",
+            "cache_pins_revision_delete": "AFTER DELETE ON cache_pins",
+        }
+        for name, event in events.items():
+            connection.execute(
+                f"""
+                CREATE TRIGGER {name}
+                {event}
+                BEGIN
+                    SELECT CASE
+                        WHEN NOT EXISTS (
+                            SELECT 1 FROM cache_index_revision
+                            WHERE singleton = 1 AND revision < {_MAX_SIGNED_BIGINT}
+                        )
+                        THEN RAISE(ABORT, 'cache index revision exhausted or absent')
+                    END;
+                    UPDATE cache_index_revision
+                    SET revision = revision + 1 WHERE singleton = 1;
+                END
+                """
+            )
+
+    @staticmethod
     def _create_revision_triggers(
         connection: sqlite3.Connection,
         *,
@@ -840,7 +1095,7 @@ class NodeModelCacheIndex:
             "cache_entries_revision_insert": "AFTER INSERT ON cache_entries",
             "cache_entries_revision_update": (
                 "AFTER UPDATE OF last_access_at_ns, verification_source, verified, "
-                "verification_failure, verified_at_ns ON cache_entries"
+                "verification_failure, recovery_id, verified_at_ns ON cache_entries"
             ),
             "cache_entries_revision_delete": "AFTER DELETE ON cache_entries",
             "cache_pins_revision_insert": "AFTER INSERT ON cache_pins",
@@ -864,6 +1119,71 @@ class NodeModelCacheIndex:
                     SET revision = revision + 1 WHERE singleton = 1;
                 END
                 """
+            )
+
+    @staticmethod
+    def _create_recovery_guard_triggers(
+        connection: sqlite3.Connection,
+        *,
+        if_not_exists: bool,
+    ) -> None:
+        qualifier = " IF NOT EXISTS" if if_not_exists else ""
+        connection.execute(
+            f"""
+            CREATE TRIGGER{qualifier} cache_recovery_update_guard
+            BEFORE UPDATE ON cache_entries
+            WHEN OLD.recovery_id IS NOT NULL AND NOT (
+                (
+                    NEW.recovery_id = OLD.recovery_id
+                    AND NEW.verified = 0
+                    AND NEW.verification_failure = OLD.verification_failure
+                )
+                OR (
+                    NEW.recovery_id IS NULL
+                    AND NEW.verified = 1
+                    AND NEW.verification_failure IS NULL
+                    AND NEW.generation = OLD.generation + 1
+                )
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'recovery-required cache row update rejected');
+            END
+            """
+        )
+        connection.execute(
+            f"""
+            CREATE TRIGGER{qualifier} cache_recovery_delete_guard
+            BEFORE DELETE ON cache_entries
+            WHEN OLD.recovery_id IS NOT NULL
+            BEGIN
+                SELECT RAISE(ABORT, 'recovery-required cache row delete rejected');
+            END
+            """
+        )
+
+    @staticmethod
+    def _require_recovery_guard_triggers(connection: sqlite3.Connection) -> None:
+        rows = connection.execute(
+            """
+            SELECT name, sql FROM sqlite_master
+            WHERE type = 'trigger' AND name IN (
+                'cache_recovery_update_guard', 'cache_recovery_delete_guard'
+            )
+            """
+        ).fetchall()
+        definitions = {row["name"]: row["sql"] or "" for row in rows}
+        update_sql = definitions.get("cache_recovery_update_guard", "")
+        delete_sql = definitions.get("cache_recovery_delete_guard", "")
+        if not (
+            "OLD.recovery_id IS NOT NULL" in update_sql
+            and "NEW.recovery_id IS NULL" in update_sql
+            and "NEW.generation = OLD.generation + 1" in update_sql
+            and "RAISE(ABORT" in update_sql
+            and "OLD.recovery_id IS NOT NULL" in delete_sql
+            and "RAISE(ABORT" in delete_sql
+        ):
+            raise NodeModelCacheIndexIdentityError(
+                "cache recovery guard triggers are absent or invalid"
             )
 
     @staticmethod
@@ -950,7 +1270,7 @@ class NodeModelCacheIndex:
             connection.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
             connection.execute("PRAGMA synchronous = FULL")
             if initialize:
-                mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+                mode = self._enable_wal_mode(connection)
                 if str(mode).lower() != "wal":
                     raise NodeModelCacheIndexError("cache index could not enable WAL mode")
             else:
@@ -978,6 +1298,21 @@ class NodeModelCacheIndex:
             yield connection
         finally:
             connection.close()
+
+    def _enable_wal_mode(self, connection: sqlite3.Connection) -> object:
+        """Enable WAL despite SQLite's non-waiting concurrent PRAGMA behavior."""
+
+        deadline_ns = time.monotonic_ns() + self._busy_timeout_ms * 1_000_000
+        while True:
+            try:
+                return connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower():
+                    raise
+                remaining_ns = deadline_ns - time.monotonic_ns()
+                if remaining_ns <= 0:
+                    raise
+                time.sleep(min(0.01, remaining_ns / 1_000_000_000))
 
     @contextlib.contextmanager
     def _write_transaction(self) -> Iterator[sqlite3.Connection]:
@@ -1052,6 +1387,7 @@ class NodeModelCacheIndex:
                 verified=bool(row["verified"]),
                 verification_source=row["verification_source"],
                 verification_failure=row["verification_failure"],
+                recovery_id=row["recovery_id"],
                 verified_at_ns=row["verified_at_ns"],
                 last_access_at_ns=row["last_access_at_ns"],
                 pin_owners=owners,
@@ -1136,6 +1472,12 @@ class NodeModelCacheIndex:
     def _validate_digest(value: str) -> str:
         if not _SHA256_PATTERN.fullmatch(value):
             raise ValueError("manifest_digest must be a lowercase SHA-256 digest")
+        return value
+
+    @staticmethod
+    def _validate_recovery_id(value: str) -> str:
+        if not isinstance(value, str) or not _RECOVERY_ID_PATTERN.fullmatch(value):
+            raise ValueError("recovery_id must be a lowercase 256-bit identifier")
         return value
 
     @staticmethod

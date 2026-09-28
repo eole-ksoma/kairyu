@@ -1,7 +1,7 @@
 # Node model cache v1
 
-Status: WP4.2 implemented as a node-local cache fill library and integrated
-with the WP4.3 durable index; daemon/Pod wiring remains open.
+Status: WP4.2 fill and WP4.6 Runner-start corruption recovery are implemented
+and integrated with the WP4.3 durable index; daemon/Pod wiring remains open.
 
 ## Purpose and authority boundary
 
@@ -114,11 +114,12 @@ descriptor. The cache service account is the trust boundary: no unrelated
 process may run with the same UID or receive write access to the root.
 
 Published-hit validation deliberately does not hash a 10-100 GB tree on every
-lookup. The initial publisher hashes all content. Detecting later same-size
-bit-rot, quarantining it, emitting an audit event, and re-fetching it are WP4.6.
-Until WP4.6 lands, an operator requiring re-verification must remove the
-disposable published entry out of band before retrying; the agent fails closed
-when it observes structural or size corruption and does not overwrite it.
+lookup. The initial publisher hashes all content. WP4.6 adds a separate
+Runner-start guard that hashes every resident blob, marks corruption
+unverified, atomically quarantines it, emits mandatory audit events, and
+performs a verified refill. The current startup remains denied after recovery
+and must pass a fresh guard call. The full contract is in
+`docs/design/node-model-cache-corruption-recovery-v1.md`.
 
 ## Result contract
 
@@ -153,11 +154,12 @@ revision.
 
 ## Deferred work
 
-- WP4.4: expose verified residency as scheduler/controller placement hints.
+- WP4.4 is implemented in
+  `docs/design/node-model-cache-placement-hints-v1.md`.
 - WP4.5 is implemented in `docs/design/node-model-cache-eviction-v1.md` with
   high/low watermarks, deterministic LRU, and generation/pin-fenced deletion.
-- WP4.6: same-size corruption detection, quarantine, audit, re-fetch, and
-  Runner-start refusal.
+- WP4.6 is implemented in
+  `docs/design/node-model-cache-corruption-recovery-v1.md`.
 - WP4.7: deployment/autoscale-driven pre-staging across the target node pool.
 
 Production acceptance still requires deployed 10-100 GB cold/hit/other-node

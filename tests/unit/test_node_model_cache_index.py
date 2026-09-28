@@ -56,6 +56,94 @@ def _record(
     )
 
 
+def _legacy_v1_index(
+    tmp_path: Path,
+    *,
+    generation: int = 1,
+    pinned: bool = False,
+) -> Path:
+    path = tmp_path / "cache/cache-index.sqlite3"
+    path.parent.mkdir(mode=0o700, parents=True)
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            PRAGMA application_id = 1262569795;
+            PRAGMA user_version = 1;
+            CREATE TABLE cache_index_meta (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                schema_version TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                cache_root TEXT NOT NULL,
+                created_at_ns INTEGER NOT NULL CHECK (created_at_ns >= 0)
+            );
+            CREATE TABLE cache_entries (
+                manifest_digest TEXT PRIMARY KEY,
+                model_id TEXT NOT NULL,
+                model_revision TEXT NOT NULL,
+                artifact_path TEXT NOT NULL,
+                total_bytes INTEGER NOT NULL CHECK (total_bytes >= 0),
+                file_count INTEGER NOT NULL CHECK (file_count >= 1),
+                verified INTEGER NOT NULL CHECK (verified IN (0, 1)),
+                verification_source TEXT NOT NULL CHECK (
+                    verification_source IN ('filled', 'published_marker')
+                ),
+                verification_failure TEXT,
+                verified_at_ns INTEGER NOT NULL CHECK (verified_at_ns >= 0),
+                last_access_at_ns INTEGER NOT NULL CHECK (
+                    last_access_at_ns >= verified_at_ns
+                ),
+                generation INTEGER NOT NULL CHECK (generation >= 1)
+            );
+            CREATE TABLE cache_pins (
+                manifest_digest TEXT NOT NULL REFERENCES cache_entries(
+                    manifest_digest
+                ) ON DELETE CASCADE,
+                owner TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                pinned_at_ns INTEGER NOT NULL CHECK (pinned_at_ns >= 0),
+                PRIMARY KEY (manifest_digest, owner)
+            );
+            CREATE INDEX cache_entries_lru
+                ON cache_entries(last_access_at_ns, manifest_digest);
+            CREATE INDEX cache_entries_model
+                ON cache_entries(model_id, model_revision, manifest_digest);
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO cache_index_meta (
+                singleton, schema_version, node_id, cache_root, created_at_ns
+            ) VALUES (1, ?, ?, ?, 100)
+            """,
+            ("kairyu-node-model-cache-index-v1", "node-a", str(path.parent)),
+        )
+        connection.execute(
+            """
+            INSERT INTO cache_entries (
+                manifest_digest, model_id, model_revision, artifact_path,
+                total_bytes, file_count, verified, verification_source,
+                verification_failure, verified_at_ns, last_access_at_ns, generation
+            ) VALUES (?, 'org/model', 'release-1', ?, 27, 2, 1, 'filled',
+                      NULL, 100, 100, ?)
+            """,
+            (
+                "a" * 64,
+                str(path.parent / "artifacts" / ("a" * 64) / "tree"),
+                generation,
+            ),
+        )
+        if pinned:
+            connection.execute(
+                """
+                INSERT INTO cache_pins (manifest_digest, owner, reason, pinned_at_ns)
+                VALUES (?, 'deployment/a', 'active', 100)
+                """,
+                ("a" * 64,),
+            )
+    path.chmod(0o600)
+    return path
+
+
 def test_record_verified_persists_node_model_bytes_and_access_time(tmp_path: Path):
     clock = MutableClock(100)
     index = _index(tmp_path, clock=clock)
@@ -77,6 +165,29 @@ def test_record_verified_persists_node_model_bytes_and_access_time(tmp_path: Pat
     assert created.pin_owners == ()
     assert created.pinned is False
     assert created.generation == 1
+
+
+def test_snapshot_revision_advances_only_with_observable_index_changes(tmp_path: Path):
+    clock = MutableClock(100)
+    index = _index(tmp_path, clock=clock)
+
+    empty = index.snapshot()
+    created = _record(index)
+    after_create = index.snapshot()
+    unchanged = index.touch("a" * 64)
+    after_unchanged = index.snapshot()
+    pinned = index.pin("a" * 64, owner="deployment/a", reason="active")
+    after_pin = index.snapshot()
+
+    assert empty.revision == 1
+    assert empty.records == ()
+    assert after_create.revision == 2
+    assert after_create.records == (created,)
+    assert unchanged.generation == created.generation
+    assert after_unchanged.revision == after_create.revision
+    assert after_pin.revision == 3
+    assert after_pin.records == (pinned,)
+    assert NodeModelCacheIndex(index.path, node_id="node-a").snapshot() == after_pin
 
 
 def test_identical_record_touches_without_downgrading_fill_evidence(tmp_path: Path):
@@ -287,6 +398,37 @@ def test_get_reads_entry_and_pins_from_one_generation_snapshot(
     assert pinned.pin_owners == ("deployment/a",)
 
 
+def test_snapshot_revision_and_records_are_read_from_one_sqlite_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    index = _index(tmp_path)
+    created = _record(index)
+    before = index.snapshot()
+    writer = NodeModelCacheIndex(index.path, node_id="node-a")
+    entry_selected = Event()
+    continue_read = Event()
+    original = index._record_from_row
+
+    def blocked_record(connection, row):
+        entry_selected.set()
+        assert continue_read.wait(timeout=5)
+        return original(connection, row)
+
+    monkeypatch.setattr(index, "_record_from_row", blocked_record)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        read = pool.submit(index.snapshot)
+        assert entry_selected.wait(timeout=5)
+        pinned = writer.pin("a" * 64, owner="deployment/a", reason="active")
+        continue_read.set()
+        snapshot = read.result(timeout=5)
+
+    assert snapshot.revision == before.revision
+    assert snapshot.records == (created,)
+    assert writer.snapshot().revision == before.revision + 1
+    assert pinned.pin_owners == ("deployment/a",)
+
+
 def test_schema_initialization_rolls_back_as_one_transaction(tmp_path: Path):
     class FailingClockIndex(NodeModelCacheIndex):
         def _now_ns(self) -> int:
@@ -321,6 +463,97 @@ def test_concurrent_constructors_share_one_complete_schema(tmp_path: Path):
     assert all(index.list_records() == () for index in indexes)
 
 
+def test_legacy_v1_index_migrates_transactionally_and_fences_old_writers(
+    tmp_path: Path,
+):
+    path = _legacy_v1_index(tmp_path, generation=2, pinned=True)
+
+    migrated = NodeModelCacheIndex(path, node_id="node-a")
+    snapshot = migrated.snapshot()
+
+    assert snapshot.revision == 3
+    assert snapshot.records[0].generation == 2
+    assert snapshot.records[0].pin_owners == ("deployment/a",)
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert (
+            connection.execute(
+                "SELECT schema_version FROM cache_index_meta WHERE singleton = 1"
+            ).fetchone()[0]
+            == "kairyu-node-model-cache-index-v2"
+        )
+        entries_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cache_entries'"
+        ).fetchone()[0]
+        assert "generation BETWEEN 1 AND 9223372036854775807" in entries_sql
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("UPDATE cache_entries SET generation = 9.223372036854776e18")
+
+
+def test_concurrent_legacy_v1_constructors_serialize_one_migration(tmp_path: Path):
+    path = _legacy_v1_index(tmp_path)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        migrated = tuple(
+            pool.map(
+                lambda _: NodeModelCacheIndex(path, node_id="node-a"),
+                range(16),
+            )
+        )
+
+    assert all(value.snapshot().records[0].manifest_digest == "a" * 64 for value in migrated)
+    assert {value.snapshot().revision for value in migrated} == {2}
+
+
+def test_legacy_revision_overflow_rolls_back_v2_migration(tmp_path: Path):
+    path = _legacy_v1_index(tmp_path, generation=2**63 - 1)
+
+    with pytest.raises(NodeModelCacheIndexIdentityError, match="represented safely"):
+        NodeModelCacheIndex(path, node_id="node-a")
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert (
+            connection.execute(
+                "SELECT schema_version FROM cache_index_meta WHERE singleton = 1"
+            ).fetchone()[0]
+            == "kairyu-node-model-cache-index-v1"
+        )
+        assert (
+            connection.execute(
+                "SELECT name FROM sqlite_master WHERE name = 'cache_index_revision'"
+            ).fetchone()
+            is None
+        )
+
+
+def test_prechecked_legacy_writer_cannot_bypass_v2_revision_trigger(tmp_path: Path):
+    path = _legacy_v1_index(tmp_path)
+    legacy_connection = sqlite3.connect(path, isolation_level=None)
+    try:
+        assert legacy_connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        migrated = NodeModelCacheIndex(path, node_id="node-a")
+        before = migrated.snapshot()
+
+        legacy_connection.execute("BEGIN IMMEDIATE")
+        legacy_connection.execute(
+            """
+            UPDATE cache_entries
+            SET last_access_at_ns = 200, generation = generation + 1
+            WHERE manifest_digest = ?
+            """,
+            ("a" * 64,),
+        )
+        legacy_connection.commit()
+
+        after = migrated.snapshot()
+        assert after.revision == before.revision + 1
+        assert after.records[0].generation == 2
+        assert after.records[0].last_access_at_ns == 200
+    finally:
+        legacy_connection.close()
+
+
 def test_sqlite_contract_uses_wal_full_sync_and_foreign_keys(tmp_path: Path):
     index = _index(tmp_path)
     _record(index)
@@ -329,12 +562,17 @@ def test_sqlite_contract_uses_wal_full_sync_and_foreign_keys(tmp_path: Path):
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
         assert connection.execute("PRAGMA synchronous").fetchone()[0] == 2
         assert connection.execute("PRAGMA application_id").fetchone()[0] == 0x4B414943
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
         tables = {
             row[0]
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
-    assert {"cache_index_meta", "cache_entries", "cache_pins"} <= tables
+    assert {
+        "cache_index_meta",
+        "cache_entries",
+        "cache_pins",
+        "cache_index_revision",
+    } <= tables
 
 
 def test_insecure_or_hardlinked_index_file_is_rejected(tmp_path: Path):

@@ -1,7 +1,8 @@
 # Node model cache index v1
 
 Status: WP4.3 implemented as a durable node-local SQLite index and integrated
-with the WP4.2 cache fill agent. Deployment daemon wiring remains open.
+with the WP4.2 cache fill agent. WP4.4 publishes its verified residency as
+bounded placement hints. Deployment daemon wiring remains open.
 
 ## Purpose and authority boundary
 
@@ -27,8 +28,8 @@ the cache agent must still validate or refill the tree before use.
 
 The database is bound at creation to:
 
-- schema identity `kairyu-node-model-cache-index-v1`;
-- SQLite application ID `KAIC` and user version 1; and
+- schema identity `kairyu-node-model-cache-index-v2`;
+- SQLite application ID `KAIC` and user version 2; and
 - one explicit node ID supplied by the node daemon or Downward API; and
 - the exact cache-root path containing the database.
 
@@ -44,6 +45,16 @@ FULL synchronous writes. Mutations use `BEGIN IMMEDIATE`, so concurrent cache
 processes serialize changes without lost pin or access updates. The schema and
 indexes are created transactionally.
 
+WP4.4 upgrades the original WP4.3 user-version-1 schema transactionally. It
+validates the legacy node/root binding and every row generation, rebuilds the
+entry and pin tables with signed-64-bit generation bounds, creates the bounded
+global revision from those generations, updates the schema identity, and
+commits user version 2 as one unit. An unrepresentable revision rolls the whole
+migration back. Database triggers advance the revision for every observable
+entry or pin mutation. Therefore even a version-1 connection that completed its
+version check immediately before migration cannot change migrated rows without
+advancing the revision; a newly opened version-1 writer rejects version 2.
+
 ## Entry contract
 
 Each `manifest_digest` primary key binds immutable cache metadata:
@@ -55,6 +66,11 @@ Each `manifest_digest` primary key binds immutable cache metadata:
 - verified state, its evidence source, and an optional failure reason;
 - verification and last-access Unix timestamps in nanoseconds; and
 - a monotonically increasing row generation.
+
+The database also holds a global revision that starts at one and advances once
+for each observable row or pin mutation. `snapshot()` reads that revision and
+all records in one SQLite snapshot, providing WP4.4 with a monotonic node-local
+publication source without mixing revisions.
 
 New v1 entries are created only from verified resident trees.
 `verification_source` is `filled` when this process downloaded and hashed every
@@ -123,10 +139,11 @@ the later eviction/reconciliation path removes it. Consumers therefore treat
 residency as a placement hint and must call the WP4.2 agent before mounting the
 artifact.
 
+WP4.4's projection and controller join are defined in
+`docs/design/node-model-cache-placement-hints-v1.md`.
+
 ## Deferred work
 
-- WP4.4: publish verified resident records as scheduler/controller placement
-  hints and measure startup benefit.
 - WP4.5: capacity watermarks, generation-fenced deletion, LRU selection, and
   active/rollback/pin protection.
 - WP4.6: connect unverified marking to corruption detection, quarantine, audit,

@@ -124,8 +124,9 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
   transfer into a private staging tree, per-blob SHA-256 verification, and
   atomic node-cache publication. WP4.3 adds a node-bound durable SQLite index
   for model revision, bytes, verification/access time, generation, and
-  owner-scoped pins. Deployment wiring, placement/eviction policy, corruption
-  quarantine, and live environment acceptance remain WP4.4+.
+  owner-scoped pins. WP4.4 adds bounded verified placement hints and exact WP3.6
+  controller joins without overriding health/quota gates. Deployment wiring, eviction,
+  corruption recovery, and live environment acceptance remain WP4.5+.
 - Qwen3.8-Flash-Next MTP speculative decoding stays off in `qwen3.8-flash-next-dp2-8gpu` until upstream fixes vllm#53912 (prefix caching + MTP output corruption on hybrid GDN); single-stream decode 104 vs 175 tok/s
 - DTO-D15 (2026-08-26) changed the served tiered-example config: verify.sh coding/generic gates and the digest re-pin are pending before the example status can be claimed green again
 - Human sign-off pending on M2–M4 design reviews
@@ -134,6 +135,12 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
+
+### 2026-09-28 — [progress] Verified model-cache placement hints
+- What: added monotonic node-index snapshots, verified-only TTL publications,
+  and an exact digest/revision join into WP3.6 cache-aware placement inputs.
+- Why: locality may improve startup only as a bounded hint below health/quota gates.
+- Refs: docs/design/node-model-cache-placement-hints-v1.md; kairyu/artifacts/placement_hint.py; tests/unit/test_node_model_cache_placement_hint.py
 
 ### 2026-09-26 — [progress] Durable node model-cache index
 - What: added a node-bound WAL/FULL SQLite residency index, immutable digest
@@ -191,10 +198,3 @@ in `.claude/rules/progress-log.md`).
   generations, complete decision fingerprints, and atomic revision/replica CAS.
 - Refs: docs/design/runner-state-v1.md; kairyu/runners/scale_actuator.py;
   kairyu/runners/scaling_log.py; tests/unit/test_runner_fenced_scale_actuator.py
-
-### 2026-09-17 — [progress] Kubernetes Runner scale actuator
-- What: added bounded Deployment/StatefulSet scale-subresource mutation, live
-  resourceVersion conflict detection, idempotent retries, and fail-closed response
-  validation, with a tested composition through the existing autoscaler leader gate.
-- Refs: docs/design/runner-state-v1.md; kairyu/runners/scale_actuator.py;
-  tests/unit/test_runner_scale_actuator.py

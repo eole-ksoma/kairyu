@@ -83,10 +83,12 @@ from kairyu.runners.postgres_leadership import PostgresRunnerLeaderLeaseStore
 from kairyu.runners.postgres_scaling_log import PostgresScalingDecisionLog
 from kairyu.runners.prewarm import (
     ModelCachePlacement,
+    ModelCachePlacementCandidate,
     ModelCachePlacementState,
     ScalingPrewarmAction,
     ScalingPrewarmPlan,
     ScalingPrewarmSnapshot,
+    build_cache_placement_snapshot,
     plan_cache_aware_scale_up,
 )
 from kairyu.runners.reconciler import (
@@ -177,6 +179,7 @@ __all__ = [
     "KubernetesScaleTarget",
     "KubernetesScalableKind",
     "ModelCachePlacement",
+    "ModelCachePlacementCandidate",
     "ModelCachePlacementState",
     "CACHE_PLACEMENT_BINDING_ANNOTATION",
     "SCALE_DECISION_GENERATION_ANNOTATION",
@@ -229,6 +232,7 @@ __all__ = [
     "ScalingPrewarmAction",
     "ScalingPrewarmPlan",
     "ScalingPrewarmSnapshot",
+    "build_cache_placement_snapshot",
     "KueueScalingAdmission",
     "ScalingQuotaAdmission",
     "ScalingQuotaConstraint",

@@ -14,9 +14,11 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-_SCHEMA_VERSION = "kairyu-node-model-cache-index-v1"
+_LEGACY_SCHEMA_VERSION = "kairyu-node-model-cache-index-v1"
+_SCHEMA_VERSION = "kairyu-node-model-cache-index-v2"
 _APPLICATION_ID = 0x4B414943  # "KAIC"
-_USER_VERSION = 1
+_LEGACY_USER_VERSION = 1
+_USER_VERSION = 2
 _MAX_SIGNED_BIGINT = 2**63 - 1
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
@@ -122,6 +124,47 @@ class NodeModelCacheRecord(BaseModel):
             raise ValueError("pinned must match pin_owners")
         if self.last_access_at_ns < self.verified_at_ns:
             raise ValueError("last access cannot precede verification")
+        return self
+
+
+class NodeModelCacheIndexSnapshot(BaseModel):
+    """One transactionally consistent cache-index publication source."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    schema_version: Literal["kairyu-node-model-cache-index-snapshot-v1"] = (
+        "kairyu-node-model-cache-index-snapshot-v1"
+    )
+    node_id: str = Field(max_length=255)
+    revision: int = Field(ge=1, le=_MAX_SIGNED_BIGINT)
+    records: tuple[NodeModelCacheRecord, ...] = Field(default=(), max_length=100_000)
+
+    @field_validator("node_id")
+    @classmethod
+    def validate_node_id(cls, value: str) -> str:
+        if not value.strip() or "\x00" in value:
+            raise ValueError("node_id must be a non-empty string without NUL")
+        return value
+
+    @field_validator("revision", mode="before")
+    @classmethod
+    def validate_revision(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("revision must be an integer")
+        return value
+
+    @model_validator(mode="after")
+    def validate_records(self) -> NodeModelCacheIndexSnapshot:
+        identities = tuple(
+            (record.model_id, record.model_revision, record.manifest_digest)
+            for record in self.records
+        )
+        if identities != tuple(sorted(identities)):
+            raise ValueError("cache records must use canonical identity order")
+        if len({record.manifest_digest for record in self.records}) != len(self.records):
+            raise ValueError("cache records must use unique manifest digests")
+        if any(record.node_id != self.node_id for record in self.records):
+            raise ValueError("cache records must belong to the snapshot node")
         return self
 
 
@@ -443,6 +486,32 @@ class NodeModelCacheIndex:
         except sqlite3.Error as exc:
             raise NodeModelCacheIndexError("cannot list cache residency") from exc
 
+    def snapshot(self) -> NodeModelCacheIndexSnapshot:
+        """Read the global revision and all records from one SQLite snapshot."""
+
+        try:
+            with self._read_transaction() as connection:
+                revision_row = connection.execute(
+                    "SELECT revision FROM cache_index_revision WHERE singleton = 1"
+                ).fetchone()
+                if revision_row is None:
+                    raise NodeModelCacheIndexIdentityError(
+                        "cache index revision metadata is absent"
+                    )
+                rows = connection.execute(
+                    """
+                    SELECT * FROM cache_entries
+                    ORDER BY model_id, model_revision, manifest_digest
+                    """
+                ).fetchall()
+                return NodeModelCacheIndexSnapshot(
+                    node_id=self._node_id,
+                    revision=revision_row["revision"],
+                    records=tuple(self._record_from_row(connection, row) for row in rows),
+                )
+        except sqlite3.Error as exc:
+            raise NodeModelCacheIndexError("cannot snapshot cache residency") from exc
+
     def _prepare_parent(self) -> None:
         try:
             self._path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -462,98 +531,321 @@ class NodeModelCacheIndex:
                         raise NodeModelCacheIndexIdentityError(
                             "SQLite file belongs to another application"
                         )
-                    if user_version not in {0, _USER_VERSION}:
+                    if user_version not in {
+                        0,
+                        _LEGACY_USER_VERSION,
+                        _USER_VERSION,
+                    }:
                         raise NodeModelCacheIndexIdentityError(
                             "cache index schema version is unsupported"
                         )
-                    schema_statements = (
-                        """
-                        CREATE TABLE IF NOT EXISTS cache_index_meta (
-                            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                            schema_version TEXT NOT NULL,
-                            node_id TEXT NOT NULL,
-                            cache_root TEXT NOT NULL,
-                            created_at_ns INTEGER NOT NULL CHECK (created_at_ns >= 0)
+                    if user_version == 0:
+                        self._create_current_schema(connection)
+                    elif user_version == _LEGACY_USER_VERSION:
+                        if application_id != _APPLICATION_ID:
+                            raise NodeModelCacheIndexIdentityError(
+                                "legacy cache index has no application identity"
+                            )
+                        self._migrate_v1_to_v2(connection)
+                    else:
+                        if application_id != _APPLICATION_ID:
+                            raise NodeModelCacheIndexIdentityError(
+                                "cache index has no application identity"
+                            )
+                        self._require_meta_binding(
+                            connection,
+                            schema_version=_SCHEMA_VERSION,
                         )
-                        """,
-                        """
-                        CREATE TABLE IF NOT EXISTS cache_entries (
-                            manifest_digest TEXT PRIMARY KEY,
-                            model_id TEXT NOT NULL,
-                            model_revision TEXT NOT NULL,
-                            artifact_path TEXT NOT NULL,
-                            total_bytes INTEGER NOT NULL CHECK (total_bytes >= 0),
-                            file_count INTEGER NOT NULL CHECK (file_count >= 1),
-                            verified INTEGER NOT NULL CHECK (verified IN (0, 1)),
-                            verification_source TEXT NOT NULL CHECK (
-                                verification_source IN ('filled', 'published_marker')
-                            ),
-                            verification_failure TEXT,
-                            verified_at_ns INTEGER NOT NULL CHECK (verified_at_ns >= 0),
-                            last_access_at_ns INTEGER NOT NULL CHECK (
-                                last_access_at_ns >= verified_at_ns
-                            ),
-                            generation INTEGER NOT NULL CHECK (generation >= 1)
+                        self._require_index_revision(connection)
+                        self._create_revision_triggers(
+                            connection,
+                            if_not_exists=True,
                         )
-                        """,
-                        """
-                        CREATE TABLE IF NOT EXISTS cache_pins (
-                            manifest_digest TEXT NOT NULL REFERENCES cache_entries(
-                                manifest_digest
-                            ) ON DELETE CASCADE,
-                            owner TEXT NOT NULL,
-                            reason TEXT NOT NULL,
-                            pinned_at_ns INTEGER NOT NULL CHECK (pinned_at_ns >= 0),
-                            PRIMARY KEY (manifest_digest, owner)
-                        )
-                        """,
-                        """
-                        CREATE INDEX IF NOT EXISTS cache_entries_lru
-                            ON cache_entries(last_access_at_ns, manifest_digest)
-                        """,
-                        """
-                        CREATE INDEX IF NOT EXISTS cache_entries_model
-                            ON cache_entries(model_id, model_revision, manifest_digest)
-                        """,
-                    )
-                    for statement in schema_statements:
-                        connection.execute(statement)
+                        self._require_revision_triggers(connection)
                     connection.execute(f"PRAGMA application_id = {_APPLICATION_ID}")
                     connection.execute(f"PRAGMA user_version = {_USER_VERSION}")
-                    meta = connection.execute(
-                        """
-                        SELECT schema_version, node_id, cache_root
-                        FROM cache_index_meta WHERE singleton = 1
-                        """
-                    ).fetchone()
-                    if meta is None:
-                        connection.execute(
-                            """
-                            INSERT INTO cache_index_meta (
-                                singleton, schema_version, node_id, cache_root, created_at_ns
-                            ) VALUES (1, ?, ?, ?, ?)
-                            """,
-                            (
-                                _SCHEMA_VERSION,
-                                self._node_id,
-                                str(self._cache_root),
-                                self._now_ns(),
-                            ),
-                        )
-                    elif (
-                        meta["schema_version"] != _SCHEMA_VERSION
-                        or meta["node_id"] != self._node_id
-                        or meta["cache_root"] != str(self._cache_root)
-                    ):
-                        raise NodeModelCacheIndexIdentityError(
-                            "cache index is bound to another schema, node, or cache root"
-                        )
                     connection.commit()
                 except Exception:
                     connection.rollback()
                     raise
         except sqlite3.Error as exc:
             raise NodeModelCacheIndexError("cannot initialize cache index") from exc
+
+    def _create_current_schema(self, connection: sqlite3.Connection) -> None:
+        schema_statements = (
+            """
+            CREATE TABLE IF NOT EXISTS cache_index_meta (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                schema_version TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                cache_root TEXT NOT NULL,
+                created_at_ns INTEGER NOT NULL CHECK (created_at_ns >= 0)
+            )
+            """,
+            self._entries_table_statement("cache_entries", if_not_exists=True),
+            self._pins_table_statement(
+                "cache_pins",
+                entries_table="cache_entries",
+                if_not_exists=True,
+            ),
+            """
+            CREATE INDEX IF NOT EXISTS cache_entries_lru
+                ON cache_entries(last_access_at_ns, manifest_digest)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS cache_entries_model
+                ON cache_entries(model_id, model_revision, manifest_digest)
+            """,
+            self._revision_table_statement(if_not_exists=True),
+        )
+        for statement in schema_statements:
+            connection.execute(statement)
+        meta = connection.execute(
+            "SELECT schema_version, node_id, cache_root FROM cache_index_meta WHERE singleton = 1"
+        ).fetchone()
+        if meta is None:
+            connection.execute(
+                """
+                INSERT INTO cache_index_meta (
+                    singleton, schema_version, node_id, cache_root, created_at_ns
+                ) VALUES (1, ?, ?, ?, ?)
+                """,
+                (
+                    _SCHEMA_VERSION,
+                    self._node_id,
+                    str(self._cache_root),
+                    self._now_ns(),
+                ),
+            )
+        else:
+            self._validate_meta_binding(meta, schema_version=_SCHEMA_VERSION)
+        connection.execute(
+            "INSERT OR IGNORE INTO cache_index_revision (singleton, revision) VALUES (1, 1)"
+        )
+        self._require_index_revision(connection)
+        self._create_revision_triggers(connection, if_not_exists=True)
+        self._require_revision_triggers(connection)
+
+    def _migrate_v1_to_v2(self, connection: sqlite3.Connection) -> None:
+        self._require_meta_binding(connection, schema_version=_LEGACY_SCHEMA_VERSION)
+        revision = 1
+        generations = connection.execute("SELECT generation FROM cache_entries").fetchall()
+        for row in generations:
+            generation = row["generation"]
+            if (
+                type(generation) is not int
+                or not 1 <= generation <= _MAX_SIGNED_BIGINT
+                or revision > _MAX_SIGNED_BIGINT - generation
+            ):
+                raise NodeModelCacheIndexIdentityError(
+                    "legacy cache index revision cannot be represented safely"
+                )
+            revision += generation
+        connection.execute(self._entries_table_statement("cache_entries_v2", if_not_exists=False))
+        connection.execute(
+            """
+            INSERT INTO cache_entries_v2 SELECT
+                manifest_digest, model_id, model_revision, artifact_path,
+                total_bytes, file_count, verified, verification_source,
+                verification_failure, verified_at_ns, last_access_at_ns, generation
+            FROM cache_entries
+            """
+        )
+        connection.execute(
+            self._pins_table_statement(
+                "cache_pins_v2",
+                entries_table="cache_entries_v2",
+                if_not_exists=False,
+            )
+        )
+        connection.execute(
+            """
+            INSERT INTO cache_pins_v2
+            SELECT manifest_digest, owner, reason, pinned_at_ns FROM cache_pins
+            """
+        )
+        connection.execute("DROP TABLE cache_pins")
+        connection.execute("DROP TABLE cache_entries")
+        connection.execute("ALTER TABLE cache_entries_v2 RENAME TO cache_entries")
+        connection.execute("ALTER TABLE cache_pins_v2 RENAME TO cache_pins")
+        connection.execute(
+            """
+            CREATE INDEX cache_entries_lru
+                ON cache_entries(last_access_at_ns, manifest_digest)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX cache_entries_model
+                ON cache_entries(model_id, model_revision, manifest_digest)
+            """
+        )
+        connection.execute(self._revision_table_statement(if_not_exists=False))
+        connection.execute(
+            "INSERT INTO cache_index_revision (singleton, revision) VALUES (1, ?)",
+            (revision,),
+        )
+        self._create_revision_triggers(connection, if_not_exists=False)
+        connection.execute(
+            "UPDATE cache_index_meta SET schema_version = ? WHERE singleton = 1",
+            (_SCHEMA_VERSION,),
+        )
+        self._require_revision_triggers(connection)
+
+    @staticmethod
+    def _entries_table_statement(name: str, *, if_not_exists: bool) -> str:
+        qualifier = " IF NOT EXISTS" if if_not_exists else ""
+        return f"""
+            CREATE TABLE{qualifier} {name} (
+                manifest_digest TEXT PRIMARY KEY,
+                model_id TEXT NOT NULL,
+                model_revision TEXT NOT NULL,
+                artifact_path TEXT NOT NULL,
+                total_bytes INTEGER NOT NULL CHECK (total_bytes >= 0),
+                file_count INTEGER NOT NULL CHECK (file_count >= 1),
+                verified INTEGER NOT NULL CHECK (verified IN (0, 1)),
+                verification_source TEXT NOT NULL CHECK (
+                    verification_source IN ('filled', 'published_marker')
+                ),
+                verification_failure TEXT,
+                verified_at_ns INTEGER NOT NULL CHECK (verified_at_ns >= 0),
+                last_access_at_ns INTEGER NOT NULL CHECK (
+                    last_access_at_ns >= verified_at_ns
+                ),
+                generation INTEGER NOT NULL CHECK (
+                    generation BETWEEN 1 AND {_MAX_SIGNED_BIGINT}
+                )
+            )
+        """
+
+    @staticmethod
+    def _pins_table_statement(
+        name: str,
+        *,
+        entries_table: str,
+        if_not_exists: bool,
+    ) -> str:
+        qualifier = " IF NOT EXISTS" if if_not_exists else ""
+        return f"""
+            CREATE TABLE{qualifier} {name} (
+                manifest_digest TEXT NOT NULL REFERENCES {entries_table}(
+                    manifest_digest
+                ) ON DELETE CASCADE,
+                owner TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                pinned_at_ns INTEGER NOT NULL CHECK (pinned_at_ns >= 0),
+                PRIMARY KEY (manifest_digest, owner)
+            )
+        """
+
+    @staticmethod
+    def _revision_table_statement(*, if_not_exists: bool) -> str:
+        qualifier = " IF NOT EXISTS" if if_not_exists else ""
+        return f"""
+            CREATE TABLE{qualifier} cache_index_revision (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                revision INTEGER NOT NULL CHECK (
+                    revision BETWEEN 1 AND {_MAX_SIGNED_BIGINT}
+                )
+            )
+        """
+
+    @staticmethod
+    def _create_revision_triggers(
+        connection: sqlite3.Connection,
+        *,
+        if_not_exists: bool,
+    ) -> None:
+        qualifier = " IF NOT EXISTS" if if_not_exists else ""
+        events = {
+            "cache_entries_revision_insert": "AFTER INSERT ON cache_entries",
+            "cache_entries_revision_update": (
+                "AFTER UPDATE OF last_access_at_ns, verification_source, verified, "
+                "verification_failure, verified_at_ns ON cache_entries"
+            ),
+            "cache_pins_revision_insert": "AFTER INSERT ON cache_pins",
+            "cache_pins_revision_update": "AFTER UPDATE ON cache_pins",
+            "cache_pins_revision_delete": "AFTER DELETE ON cache_pins",
+        }
+        for name, event in events.items():
+            connection.execute(
+                f"""
+                CREATE TRIGGER{qualifier} {name}
+                {event}
+                BEGIN
+                    SELECT CASE
+                        WHEN NOT EXISTS (
+                            SELECT 1 FROM cache_index_revision
+                            WHERE singleton = 1 AND revision < {_MAX_SIGNED_BIGINT}
+                        )
+                        THEN RAISE(ABORT, 'cache index revision exhausted or absent')
+                    END;
+                    UPDATE cache_index_revision
+                    SET revision = revision + 1 WHERE singleton = 1;
+                END
+                """
+            )
+
+    @staticmethod
+    def _require_revision_triggers(connection: sqlite3.Connection) -> None:
+        expected = {
+            "cache_entries_revision_insert",
+            "cache_entries_revision_update",
+            "cache_pins_revision_insert",
+            "cache_pins_revision_update",
+            "cache_pins_revision_delete",
+        }
+        present = {
+            row["name"]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+            ).fetchall()
+        }
+        if not expected <= present:
+            raise NodeModelCacheIndexIdentityError("cache index revision triggers are absent")
+
+    def _require_meta_binding(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        schema_version: str,
+    ) -> None:
+        meta = connection.execute(
+            "SELECT schema_version, node_id, cache_root FROM cache_index_meta WHERE singleton = 1"
+        ).fetchone()
+        if meta is None:
+            raise NodeModelCacheIndexIdentityError("cache index metadata is absent")
+        self._validate_meta_binding(meta, schema_version=schema_version)
+
+    def _validate_meta_binding(
+        self,
+        meta: sqlite3.Row,
+        *,
+        schema_version: str,
+    ) -> None:
+        if (
+            meta["schema_version"] != schema_version
+            or meta["node_id"] != self._node_id
+            or meta["cache_root"] != str(self._cache_root)
+        ):
+            raise NodeModelCacheIndexIdentityError(
+                "cache index is bound to another schema, node, or cache root"
+            )
+
+    @staticmethod
+    def _require_index_revision(connection: sqlite3.Connection) -> int:
+        row = connection.execute(
+            "SELECT revision FROM cache_index_revision WHERE singleton = 1"
+        ).fetchone()
+        if (
+            row is None
+            or type(row["revision"]) is not int
+            or not 1 <= row["revision"] <= _MAX_SIGNED_BIGINT
+        ):
+            raise NodeModelCacheIndexIdentityError(
+                "cache index revision metadata is absent or invalid"
+            )
+        return row["revision"]
 
     @contextlib.contextmanager
     def _connection(self, *, initialize: bool = False) -> Iterator[sqlite3.Connection]:

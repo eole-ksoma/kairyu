@@ -127,8 +127,9 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
   owner-scoped pins. WP4.4 adds bounded verified placement hints and exact WP3.6
   controller joins without overriding health/quota gates. WP4.5 adds watermarked,
   generation/pin-fenced LRU eviction. WP4.6 adds full-digest Runner-start
-  verification, quarantine/audit, verified refill, and fail-closed retry.
-  Pre-staging, deployment wiring, and live environment acceptance remain.
+  verification and fail-closed recovery. WP4.7 adds fenced pre-stage commands,
+  claim/CAS, verified fill/pin, release, and status projection. Deployment
+  wiring and live environment acceptance remain.
 - Qwen3.8-Flash-Next MTP speculative decoding stays off in `qwen3.8-flash-next-dp2-8gpu` until upstream fixes vllm#53912 (prefix caching + MTP output corruption on hybrid GDN); single-stream decode 104 vs 175 tok/s
 - DTO-D15 (2026-08-26) changed the served tiered-example config: verify.sh coding/generic gates and the digest re-pin are pending before the example status can be claimed green again
 - Human sign-off pending on M2–M4 design reviews
@@ -137,6 +138,12 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
+
+### 2026-09-28 — [progress] Fenced model pre-staging
+- What: added exact controller commands, node claim/CAS, verified fill/pin,
+  fresh fenced release, retry, and monotonic placement-state projection.
+- Refs: docs/design/node-model-cache-prestage-v1.md; kairyu/runners/prestage.py;
+  tests/unit/test_runner_prestage.py
 
 ### 2026-09-28 — [progress] Fail-closed model-cache corruption recovery
 - What: added full-digest startup verification, atomic quarantine, mandatory audit, verified refill, and generation-fenced retry.
@@ -188,10 +195,3 @@ in `.claude/rules/progress-log.md`).
   Deployment scale-down; finalizer installation remains deployment wiring.
 - Refs: docs/design/runner-state-v1.md; kairyu/runners/scaling_drain.py;
   kairyu/runners/scale_actuator.py; tests/unit/test_runner_scaling_drain.py
-
-### 2026-09-17 — [progress] Cache-aware staged Runner scale-out
-- What: split quota-admitted scale-out into durable placement-level cache intent
-  and ready-cache Runner-start stages, bound starts to model/flavor/deployment
-  placement identity, and added final cache/quota consistency reauthorization.
-- Refs: docs/design/runner-state-v1.md; kairyu/runners/prewarm.py;
-  kairyu/runners/scale_actuator.py; tests/unit/test_runner_prewarm.py

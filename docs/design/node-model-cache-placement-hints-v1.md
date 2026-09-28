@@ -84,6 +84,12 @@ using input order as conflict resolution.
 
 The adapter copies health, assignment, schedulability, flavor, profile, and
 compatibility fields from the controller candidate. It cannot upgrade them.
+For every fresh node publication, each placement also retains that source
+hint's `observed_at`, `valid_until`, and node-local `index_revision`, including an exact
+artifact miss. Missing, future, or expired publications retain no such physical
+evidence. WP4.7 uses the per-placement source time—not the later aggregation
+time—to distinguish a pre-fill stale miss from a post-fill confirmed miss, and
+checks the original expiry again at final scale authorization.
 The existing `plan_cache_aware_scale_up()` therefore excludes an unhealthy,
 assigned, unschedulable, or wrong-flavor candidate even when its cache state is
 `READY`. The controller must supply only approved profile/compatibility pairs;
@@ -152,8 +158,8 @@ production scheduler integration.
   successful eviction advances the node revision and removes the next hint.
 - WP4.6 is implemented in
   `docs/design/node-model-cache-corruption-recovery-v1.md`.
-- WP4.7: fenced pre-staging commands and transitions through absent, filling,
-  ready, and failed.
+- WP4.7 is implemented in `docs/design/node-model-cache-prestage-v1.md`; its
+  exact command records add `filling`, `ready`, and `failed` feedback.
 - Deployment: transport, durable global revision CAS, scheduler binding, RBAC,
   metrics, and live startup-p95 comparison against non-local placement.
 

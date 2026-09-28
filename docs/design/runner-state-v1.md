@@ -500,10 +500,10 @@ ready placement produces a `cache_prewarm` HOLD rather than a cold Runner; a
 mixed plan can start ready capacity while retaining its remaining cache-fill
 intent. In WP3.6 those placement IDs are durable desired-work evidence, not an
 executable cache-agent command. A production consumer must not dispatch them
-directly from a HOLD record: the Phase 4 node-cache agent must add its own
-leader/target/artifact fence, monotonic command generation, placement-level
-claim/CAS, idempotent replay, and completion record. It then publishes a later
-monotonic snapshot as placements move through `filling` to `ready`, and
+directly from a HOLD record. WP4.7 now converts them into commands carrying a
+leader/target/artifact fence and monotonic generation, then uses placement-level
+claim/CAS, idempotent replay, verified fill/pin, and a completion record. It
+publishes a later monotonic snapshot as placements move through `filling` to `ready`, and
 reconciliation creates a new scaling decision rather than editing the earlier
 record. This boundary prevents a stale HOLD decision from becoming an
 unfenced cache mutation before the cache-agent protocol exists.

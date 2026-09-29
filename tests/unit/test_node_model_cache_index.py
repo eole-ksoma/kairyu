@@ -232,6 +232,24 @@ def test_snapshot_revision_advances_only_with_observable_index_changes(tmp_path:
     assert NodeModelCacheIndex(index.path, node_id="node-a").snapshot() == after_pin
 
 
+def test_snapshot_record_filters_one_digest_at_the_same_global_revision(tmp_path: Path):
+    index = _index(tmp_path)
+    first = _record(index, digest="a" * 64)
+    _record(index, digest="b" * 64, model_revision="release-2")
+    pinned = index.pin("a" * 64, owner="deployment/a", reason="active")
+
+    complete = index.snapshot()
+    selected = index.snapshot_record("a" * 64)
+    missing = index.snapshot_record("c" * 64)
+
+    assert selected.node_id == complete.node_id
+    assert selected.revision == complete.revision
+    assert selected.records == (pinned,)
+    assert selected.records != (first,)
+    assert missing.revision == complete.revision
+    assert missing.records == ()
+
+
 def test_identical_record_touches_without_downgrading_fill_evidence(tmp_path: Path):
     clock = MutableClock(100)
     index = _index(tmp_path, clock=clock)

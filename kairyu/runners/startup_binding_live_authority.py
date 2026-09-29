@@ -14,7 +14,7 @@ from kairyu.runners.leadership import (
     LeaderFencedRunnerController,
     RunnerWriterAuthority,
 )
-from kairyu.runners.prestage import NodeModelPrestageRecord
+from kairyu.runners.prestage import NodeModelPrestageCommand, NodeModelPrestageRecord
 from kairyu.runners.prewarm import ModelCachePlacementState, ScalingPrewarmPlan
 from kairyu.runners.scaling_log import (
     ScalingDecisionAction,
@@ -133,6 +133,50 @@ class RunnerCachePlacementBindingPinEvidence(BaseModel):
         return value
 
 
+class RunnerCachePlacementBindingPrestageEvidence(BaseModel):
+    """Path- and failure-detail-free proof of one ready pre-stage lineage."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    schema_version: Literal["runner-cache-placement-binding-prestage-evidence-v1"] = (
+        "runner-cache-placement-binding-prestage-evidence-v1"
+    )
+    command: NodeModelPrestageCommand
+    state: Literal[ModelCachePlacementState.READY]
+    pin_record_generation: int = Field(ge=1, le=2**63 - 1)
+    updated_at: datetime
+
+    @field_validator("pin_record_generation", mode="before")
+    @classmethod
+    def validate_pin_record_generation(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("pin_record_generation must be an integer")
+        return value
+
+    @field_validator("updated_at")
+    @classmethod
+    def validate_updated_at(cls, value: datetime) -> datetime:
+        return _aware(value, name="prestage evidence updated_at")
+
+    @classmethod
+    def from_record(
+        cls,
+        record: NodeModelPrestageRecord,
+    ) -> RunnerCachePlacementBindingPrestageEvidence:
+        record = NodeModelPrestageRecord.model_validate(record.model_dump())
+        if (
+            record.state is not ModelCachePlacementState.READY
+            or record.pin_record_generation is None
+        ):
+            raise ValueError("prestage evidence requires a ready pinned record")
+        return cls(
+            command=record.command,
+            state=record.state,
+            pin_record_generation=record.pin_record_generation,
+            updated_at=record.updated_at,
+        )
+
+
 class RunnerCachePlacementBindingLiveState(BaseModel):
     """One independently refreshed scaling-controller authorization snapshot."""
 
@@ -144,7 +188,7 @@ class RunnerCachePlacementBindingLiveState(BaseModel):
     target: RunnerCachePlacementBindingTargetState
     quota_admission: ScalingQuotaAdmission
     prewarm_plan: ScalingPrewarmPlan
-    prestage_records: tuple[NodeModelPrestageRecord, ...] = Field(
+    prestage_records: tuple[RunnerCachePlacementBindingPrestageEvidence, ...] = Field(
         min_length=1,
         max_length=100_000,
     )
@@ -677,6 +721,7 @@ __all__ = [
     "RunnerCachePlacementBindingLiveState",
     "RunnerCachePlacementBindingLiveStateSource",
     "RunnerCachePlacementBindingPinEvidence",
+    "RunnerCachePlacementBindingPrestageEvidence",
     "RunnerCachePlacementBindingTargetState",
     "ScalingControllerPlacementBindingAuthority",
 ]

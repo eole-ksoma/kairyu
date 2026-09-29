@@ -185,8 +185,7 @@ class PostgresNodeModelPrestageStore:
     ) -> None:
         if psycopg is None:
             raise RuntimeError(
-                "PostgresNodeModelPrestageStore requires psycopg; "
-                "install the fleet dependency"
+                "PostgresNodeModelPrestageStore requires psycopg; install the fleet dependency"
             )
         self._store_id = _text(store_id, name="store_id")
         self._node_id = _text(node_id, name="node_id", max_length=253)
@@ -194,9 +193,7 @@ class PostgresNodeModelPrestageStore:
             raise ValueError("dsn must be a non-empty string without NUL")
         if type(max_placements) is not int or not 1 <= max_placements <= 100_000:
             raise ValueError("max_placements must be an integer in [1, 100000]")
-        if isinstance(connect_timeout_s, bool) or not isinstance(
-            connect_timeout_s, (int, float)
-        ):
+        if isinstance(connect_timeout_s, bool) or not isinstance(connect_timeout_s, (int, float)):
             raise ValueError("connect_timeout_s must be a number")
         timeout = float(connect_timeout_s)
         if not math.isfinite(timeout) or timeout <= 0:
@@ -227,8 +224,7 @@ class PostgresNodeModelPrestageStore:
         parameters = psycopg.conninfo.conninfo_to_dict(self._dsn)
         configured_options = parameters.pop("options", "")
         options = (
-            f"{configured_options} -c statement_timeout={timeout_ms} "
-            f"-c lock_timeout={timeout_ms}"
+            f"{configured_options} -c statement_timeout={timeout_ms} -c lock_timeout={timeout_ms}"
         ).strip()
         return psycopg.connect(
             psycopg.conninfo.make_conninfo(**parameters),
@@ -343,13 +339,8 @@ class PostgresNodeModelPrestageStore:
             with self._connection.cursor() as cursor:
                 cursor.execute("SET LOCAL search_path = public")
                 namespace_oid = self._validate_schema_objects_cursor(cursor)
-                if (
-                    expected_namespace_oid is not None
-                    and namespace_oid != expected_namespace_oid
-                ):
-                    raise RuntimeError(
-                        "Node model pre-stage PostgreSQL namespace identity changed"
-                    )
+                if expected_namespace_oid is not None and namespace_oid != expected_namespace_oid:
+                    raise RuntimeError("Node model pre-stage PostgreSQL namespace identity changed")
                 self._validate_registry_cursor(cursor)
                 return namespace_oid
 
@@ -648,9 +639,7 @@ class PostgresNodeModelPrestageStore:
                 with self._connection.cursor() as cursor:
                     self._validate_registry_cursor(cursor, for_update=True)
                     existing = self._select_record_cursor(cursor, command.placement_id)
-                    high_water = self._select_high_water_cursor(
-                        cursor, command.placement_id
-                    )
+                    high_water = self._select_high_water_cursor(cursor, command.placement_id)
                     cursor.execute(
                         """
                         SELECT count(*)
@@ -699,9 +688,7 @@ class PostgresNodeModelPrestageStore:
         claim_id: str,
         now: datetime,
     ) -> NodeModelPrestageRecord:
-        command = self._transitions.validate_command(
-            command, now=now, require_active=False
-        )
+        command = self._transitions.validate_command(command, now=now, require_active=False)
         return self._mutate(
             command,
             lambda existing, high_water, count: self._transitions.claim(
@@ -724,9 +711,7 @@ class PostgresNodeModelPrestageStore:
         pin_record_generation: int | None = None,
         now: datetime,
     ) -> NodeModelPrestageRecord:
-        command = self._transitions.validate_command(
-            command, now=now, require_active=False
-        )
+        command = self._transitions.validate_command(command, now=now, require_active=False)
         return self._mutate(
             command,
             lambda existing, _high_water, _count: self._transitions.complete(
@@ -747,9 +732,7 @@ class PostgresNodeModelPrestageStore:
         failure: str,
         now: datetime,
     ) -> NodeModelPrestageRecord:
-        command = self._transitions.validate_command(
-            command, now=now, require_active=False
-        )
+        command = self._transitions.validate_command(command, now=now, require_active=False)
         return self._mutate(
             command,
             lambda existing, _high_water, _count: self._transitions.fail(
@@ -767,9 +750,7 @@ class PostgresNodeModelPrestageStore:
         *,
         now: datetime,
     ) -> NodeModelPrestageRecord:
-        command = self._transitions.validate_command(
-            command, now=now, require_active=True
-        )
+        command = self._transitions.validate_command(command, now=now, require_active=True)
         with self._lock:
             self._require_open()
             self._ensure_connection()
@@ -778,9 +759,7 @@ class PostgresNodeModelPrestageStore:
                 with self._connection.cursor() as cursor:
                     self._validate_registry_cursor(cursor, for_update=True)
                     existing = self._select_record_cursor(cursor, command.placement_id)
-                    high_water = self._select_high_water_cursor(
-                        cursor, command.placement_id
-                    )
+                    high_water = self._select_high_water_cursor(cursor, command.placement_id)
                     record = self._transitions.release(
                         existing,
                         high_water=high_water,
@@ -836,9 +815,19 @@ class PostgresNodeModelPrestageStore:
                         (self._store_id,),
                     )
                     return tuple(
-                        self._record(row, node_id=self._node_id)
-                        for row in cursor.fetchall()
+                        self._record(row, node_id=self._node_id) for row in cursor.fetchall()
                     )
+
+    def get_record(self, placement_id: str) -> NodeModelPrestageRecord | None:
+        placement_id = _text(placement_id, name="placement_id")
+        with self._lock:
+            self._require_open()
+            self._ensure_connection()
+            assert self._connection is not None
+            with self._connection.transaction():
+                with self._connection.cursor() as cursor:
+                    self._validate_registry_cursor(cursor)
+                    return self._select_record_cursor(cursor, placement_id)
 
     def list_records_page(
         self,
@@ -847,9 +836,7 @@ class PostgresNodeModelPrestageStore:
         limit: int = 100,
     ) -> tuple[NodeModelPrestageRecord, ...]:
         if after_placement_id is not None:
-            after_placement_id = _text(
-                after_placement_id, name="after_placement_id"
-            )
+            after_placement_id = _text(after_placement_id, name="after_placement_id")
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise ValueError("limit must be an integer in [1, 1000]")
         with self._lock:
@@ -882,8 +869,7 @@ class PostgresNodeModelPrestageStore:
                             (self._store_id, after_placement_id, limit),
                         )
                     return tuple(
-                        self._record(row, node_id=self._node_id)
-                        for row in cursor.fetchall()
+                        self._record(row, node_id=self._node_id) for row in cursor.fetchall()
                     )
 
     def compact_absent_records(
@@ -917,8 +903,7 @@ class PostgresNodeModelPrestageStore:
                         (self._store_id, retired_before, limit),
                     )
                     records = tuple(
-                        self._record(row, node_id=self._node_id)
-                        for row in cursor.fetchall()
+                        self._record(row, node_id=self._node_id) for row in cursor.fetchall()
                     )
                     marks: list[NodeModelPrestageHighWaterMark] = []
                     for record in records:
@@ -926,9 +911,7 @@ class PostgresNodeModelPrestageStore:
                             record,
                             compacted_at=compacted_at,
                         )
-                        previous = self._select_high_water_cursor(
-                            cursor, mark.placement_id
-                        )
+                        previous = self._select_high_water_cursor(cursor, mark.placement_id)
                         if (
                             previous is not None
                             and previous.command_generation >= mark.command_generation
@@ -965,9 +948,7 @@ class PostgresNodeModelPrestageStore:
                         """,
                         (self._store_id,),
                     )
-                    return tuple(
-                        self._high_water_mark(row) for row in cursor.fetchall()
-                    )
+                    return tuple(self._high_water_mark(row) for row in cursor.fetchall())
 
     def check_ready(self) -> None:
         """Validate the live connection and this store's durable registry binding."""

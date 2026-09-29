@@ -9,6 +9,7 @@ import re
 import threading
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
+from itertools import islice
 from typing import Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -240,6 +241,9 @@ class NodeModelPrestageRecord(BaseModel):
 class NodeModelPrestageStore(Protocol):
     """Atomic placement claim/CAS contract for a durable production backend."""
 
+    @property
+    def node_id(self) -> str: ...
+
     def claim(
         self,
         command: NodeModelPrestageCommand,
@@ -274,6 +278,13 @@ class NodeModelPrestageStore(Protocol):
     ) -> NodeModelPrestageRecord: ...
 
     def list_records(self) -> tuple[NodeModelPrestageRecord, ...]: ...
+
+    def list_records_page(
+        self,
+        *,
+        after_placement_id: str | None = None,
+        limit: int = 100,
+    ) -> tuple[NodeModelPrestageRecord, ...]: ...
 
 
 def _copy_prestage_record(record: NodeModelPrestageRecord) -> NodeModelPrestageRecord:
@@ -529,6 +540,10 @@ class InMemoryNodeModelPrestageStore:
         self._records: dict[str, NodeModelPrestageRecord] = {}
         self._lock = threading.Lock()
 
+    @property
+    def node_id(self) -> str:
+        return self._transitions.node_id
+
     def claim(
         self,
         command: NodeModelPrestageCommand,
@@ -623,6 +638,27 @@ class InMemoryNodeModelPrestageStore:
                 _copy_prestage_record(self._records[key]) for key in sorted(self._records)
             )
 
+    def list_records_page(
+        self,
+        *,
+        after_placement_id: str | None = None,
+        limit: int = 100,
+    ) -> tuple[NodeModelPrestageRecord, ...]:
+        if after_placement_id is not None:
+            after_placement_id = _text(
+                after_placement_id, name="after_placement_id"
+            )
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("limit must be an integer in [1, 1000]")
+        with self._lock:
+            keys = (
+                key
+                for key in sorted(self._records)
+                if after_placement_id is None or key > after_placement_id
+            )
+            selected = tuple(islice(keys, limit))
+            return tuple(_copy_prestage_record(self._records[key]) for key in selected)
+
 
 class NodeModelPrestageExecutor:
     """Execute one fenced command through verified fill and owner-scoped pinning."""
@@ -641,10 +677,20 @@ class NodeModelPrestageExecutor:
             raise ValueError("cache index belongs to another node")
         if not isinstance(store, NodeModelPrestageStore):
             raise TypeError("store must implement NodeModelPrestageStore")
+        if store.node_id != self._node_id:
+            raise ValueError("pre-stage store belongs to another node")
         self._agent = agent
         self._index = index
         self._store = store
         self._clock = clock
+
+    @property
+    def node_id(self) -> str:
+        return self._node_id
+
+    @property
+    def store(self) -> NodeModelPrestageStore:
+        return self._store
 
     def execute(
         self,
@@ -660,6 +706,8 @@ class NodeModelPrestageExecutor:
         command = NodeModelPrestageCommand.model_validate(command.model_dump())
         if command.action != "ensure":
             raise NodeModelPrestageConflictError("executor requires an ensure command")
+        if command.node_id != self._node_id:
+            raise NodeModelPrestageConflictError("executor command targets another node")
         self._validate_artifact_binding(command, request=request)
         now = _aware(self._clock(), name="executor clock")
         claimed = self._store.claim(command, claim_id=claim_id, now=now)
@@ -700,6 +748,8 @@ class NodeModelPrestageExecutor:
         command = NodeModelPrestageCommand.model_validate(command.model_dump())
         if command.action != "release":
             raise NodeModelPrestageConflictError("release requires a fenced release command")
+        if command.node_id != self._node_id:
+            raise NodeModelPrestageConflictError("executor command targets another node")
         cached = self._index.get(command.manifest_digest)
         record = self._store.release(
             command,

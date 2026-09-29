@@ -169,29 +169,3 @@ in `.claude/rules/progress-log.md`).
   evidence without treating mutable filesystem paths as authority.
 - Refs: docs/design/node-model-cache-index-v1.md;
   kairyu/artifacts/cache_index.py; tests/unit/test_node_model_cache_index.py
-
-### 2026-09-26 — [progress] Verified node-local model cache fill
-- What: added digest-scoped file locking, HTTP Range/local blob sources,
-  resumable staging, strict size/SHA-256 verification, durable completion
-  metadata, and same-filesystem atomic publication for admitted artifacts.
-- Why: Runners must never observe a partial or unverified model tree, including
-  during concurrent fills and source interruption.
-- Refs: docs/design/node-model-cache-v1.md; kairyu/artifacts/node_cache.py;
-  tests/unit/test_node_model_cache.py
-
-### 2026-09-26 — [design] Signed model artifact identity and admission
-- What: added canonical immutable model/blob schemas, file-tree and manifest
-  digests, Ed25519 trust verification, bounded offline CLI validation, and a
-  file-backed GitOps model/environment/GPU admission primitive.
-- Why: cache and Runner work must consume a signed digest identity before any
-  mutable path, tag, or unverified artifact can enter the control plane.
-- Refs: docs/design/model-artifact-manifest-v1.md; kairyu/artifacts/manifest.py;
-  tests/unit/test_model_artifact_manifest.py
-
-### 2026-09-17 — [progress] Drain-authorized Runner scale-down
-- What: bound scale-down decisions to termination-authorized Runner/Pod evidence,
-  selected the exact highest StatefulSet ordinals, required a Pod UID deletion
-  hold, added final freshness/revision reauthorization, and rejected unsafe
-  Deployment scale-down; finalizer installation remains deployment wiring.
-- Refs: docs/design/runner-state-v1.md; kairyu/runners/scaling_drain.py;
-  kairyu/runners/scale_actuator.py; tests/unit/test_runner_scaling_drain.py

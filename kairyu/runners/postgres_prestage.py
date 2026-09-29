@@ -12,7 +12,10 @@ from typing import Literal, Self
 from kairyu.artifacts.node_cache import NodeModelCacheFillResult
 from kairyu.runners.prestage import (
     NodeModelPrestageCommand,
+    NodeModelPrestageHighWaterMark,
     NodeModelPrestageRecord,
+    _aware,
+    _copy_high_water_mark,
     _copy_prestage_record,
     _NodeModelPrestageTransitions,
     _text,
@@ -23,7 +26,7 @@ try:  # Optional deployment dependency.
 except ModuleNotFoundError:  # pragma: no cover - core-only installation.
     psycopg = None  # type: ignore[assignment]
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _SCHEMA_NAME = "public"
 _SCHEMA_LOCK = (1_261_587_810, 9)
 _EXPECTED_COLUMNS = {
@@ -44,6 +47,23 @@ _EXPECTED_COLUMNS = {
         ("state", "text", True),
         ("updated_at", "timestamp with time zone", True),
         ("record", "jsonb", True),
+        ("created_at", "timestamp with time zone", True),
+    ),
+    "node_model_prestage_high_water_marks": (
+        ("store_id", "text", True),
+        ("placement_id", "text", True),
+        ("command_id", "text", True),
+        ("command_generation", "bigint", True),
+        ("election_id", "text", True),
+        ("holder_id", "text", True),
+        ("fencing_token", "bigint", True),
+        ("target_id", "text", True),
+        ("target_revision", "bigint", True),
+        ("release_identity_digest", "text", True),
+        ("attempt", "bigint", True),
+        ("updated_at", "timestamp with time zone", True),
+        ("compacted_at", "timestamp with time zone", True),
+        ("mark", "jsonb", True),
         ("created_at", "timestamp with time zone", True),
     ),
 }
@@ -84,6 +104,20 @@ _EXPECTED_RECORD_CONSTRAINTS_WITHOUT_TARGET = {
     ),
     ("p", "PRIMARY KEY (store_id, placement_id)", 0, True, False, False),
 }
+_EXPECTED_HIGH_WATER_CONSTRAINTS_WITHOUT_TARGET = {
+    ("c", "CHECK ((placement_id <> ''::text))", 0, True, False, False),
+    ("c", "CHECK ((command_id <> ''::text))", 0, True, False, False),
+    ("c", "CHECK ((command_generation > 0))", 0, True, False, False),
+    ("c", "CHECK ((election_id <> ''::text))", 0, True, False, False),
+    ("c", "CHECK ((holder_id <> ''::text))", 0, True, False, False),
+    ("c", "CHECK ((fencing_token > 0))", 0, True, False, False),
+    ("c", "CHECK ((target_id <> ''::text))", 0, True, False, False),
+    ("c", "CHECK ((target_revision > 0))", 0, True, False, False),
+    ("c", "CHECK ((release_identity_digest <> ''::text))", 0, True, False, False),
+    ("c", "CHECK ((attempt >= 0))", 0, True, False, False),
+    ("c", "CHECK ((compacted_at >= updated_at))", 0, True, False, False),
+    ("p", "PRIMARY KEY (store_id, placement_id)", 0, True, False, False),
+}
 _SCHEMA_STATEMENTS = (
     """
     CREATE TABLE IF NOT EXISTS public.node_model_prestage_store_registry (
@@ -107,6 +141,27 @@ _SCHEMA_STATEMENTS = (
         state TEXT NOT NULL CHECK (state IN ('absent', 'filling', 'ready', 'failed')),
         updated_at TIMESTAMPTZ NOT NULL,
         record JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+        PRIMARY KEY (store_id, placement_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS public.node_model_prestage_high_water_marks (
+        store_id TEXT NOT NULL REFERENCES
+            public.node_model_prestage_store_registry(store_id) ON DELETE CASCADE,
+        placement_id TEXT NOT NULL CHECK (placement_id <> ''),
+        command_id TEXT NOT NULL CHECK (command_id <> ''),
+        command_generation BIGINT NOT NULL CHECK (command_generation > 0),
+        election_id TEXT NOT NULL CHECK (election_id <> ''),
+        holder_id TEXT NOT NULL CHECK (holder_id <> ''),
+        fencing_token BIGINT NOT NULL CHECK (fencing_token > 0),
+        target_id TEXT NOT NULL CHECK (target_id <> ''),
+        target_revision BIGINT NOT NULL CHECK (target_revision > 0),
+        release_identity_digest TEXT NOT NULL CHECK (release_identity_digest <> ''),
+        attempt BIGINT NOT NULL CHECK (attempt >= 0),
+        updated_at TIMESTAMPTZ NOT NULL,
+        compacted_at TIMESTAMPTZ NOT NULL CHECK (compacted_at >= updated_at),
+        mark JSONB NOT NULL,
         created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
         PRIMARY KEY (store_id, placement_id)
     )
@@ -258,6 +313,14 @@ class PostgresNodeModelPrestageStore:
                 namespace_oid = self._validate_schema_objects_cursor(cursor)
                 cursor.execute(
                     """
+                    UPDATE public.node_model_prestage_store_registry
+                    SET schema_version = %s
+                    WHERE store_id = %s AND schema_version = 1
+                    """,
+                    (_SCHEMA_VERSION, self._store_id),
+                )
+                cursor.execute(
+                    """
                     INSERT INTO public.node_model_prestage_store_registry (
                         store_id, schema_version, node_id, max_placements
                     ) VALUES (%s, %s, %s, %s)
@@ -315,39 +378,54 @@ class PostgresNodeModelPrestageStore:
     def _validate_schema_objects_cursor(cursor) -> int:
         cursor.execute(
             """
-            SELECT registry.oid, records.oid,
-                   registry.relnamespace, records.relnamespace,
-                   registry.relkind, records.relkind,
-                   registry.relpersistence, records.relpersistence
+            SELECT registry.oid, records.oid, high_water.oid,
+                   registry.relnamespace, records.relnamespace, high_water.relnamespace,
+                   registry.relkind, records.relkind, high_water.relkind,
+                   registry.relpersistence, records.relpersistence,
+                   high_water.relpersistence
             FROM pg_catalog.pg_class AS registry
             CROSS JOIN pg_catalog.pg_class AS records
+            CROSS JOIN pg_catalog.pg_class AS high_water
             WHERE registry.oid = pg_catalog.to_regclass(
                       'public.node_model_prestage_store_registry'
                   )
               AND records.oid = pg_catalog.to_regclass(
                       'public.node_model_prestage_records'
                   )
+              AND high_water.oid = pg_catalog.to_regclass(
+                      'public.node_model_prestage_high_water_marks'
+                  )
             """
         )
         objects = cursor.fetchone()
         if objects is None:
             raise RuntimeError("node model pre-stage schema is missing required tables")
-        registry_oid, records_oid, registry_namespace, records_namespace, *kinds = objects
+        (
+            registry_oid,
+            records_oid,
+            high_water_oid,
+            registry_namespace,
+            records_namespace,
+            high_water_namespace,
+            *kinds,
+        ) = objects
         cursor.execute("SELECT pg_catalog.to_regnamespace(%s)::oid", (_SCHEMA_NAME,))
         namespace_row = cursor.fetchone()
         if (
             registry_namespace != records_namespace
+            or registry_namespace != high_water_namespace
             or namespace_row is None
             or registry_namespace != namespace_row[0]
         ):
             raise RuntimeError("node model pre-stage tables must use the public namespace")
-        if kinds != ["r", "r", "p", "p"]:
+        if kinds != ["r", "r", "r", "p", "p", "p"]:
             raise RuntimeError(
                 "node model pre-stage schema objects must be permanent ordinary tables"
             )
         for table_name, table_oid in (
             ("node_model_prestage_store_registry", registry_oid),
             ("node_model_prestage_records", records_oid),
+            ("node_model_prestage_high_water_marks", high_water_oid),
         ):
             cursor.execute(
                 """
@@ -395,6 +473,21 @@ class PostgresNodeModelPrestageStore:
         }
         if constraints(records_oid) != expected_record_constraints:
             raise RuntimeError("node model pre-stage records have incompatible constraints")
+        expected_high_water_constraints = _EXPECTED_HIGH_WATER_CONSTRAINTS_WITHOUT_TARGET | {
+            (
+                "f",
+                "FOREIGN KEY (store_id) REFERENCES "
+                "node_model_prestage_store_registry(store_id) ON DELETE CASCADE",
+                registry_oid,
+                True,
+                False,
+                False,
+            )
+        }
+        if constraints(high_water_oid) != expected_high_water_constraints:
+            raise RuntimeError(
+                "node model pre-stage high-water marks have incompatible constraints"
+            )
         return registry_namespace
 
     @staticmethod
@@ -452,10 +545,100 @@ class PostgresNodeModelPrestageStore:
         row = cursor.fetchone()
         return None if row is None else self._record(row, node_id=self._node_id)
 
+    @staticmethod
+    def _high_water_select_columns() -> str:
+        return """
+            placement_id, command_id, command_generation, election_id, holder_id,
+            fencing_token, target_id, target_revision, release_identity_digest,
+            attempt, updated_at, compacted_at, mark
+        """
+
+    @staticmethod
+    def _high_water_mark(row: tuple) -> NodeModelPrestageHighWaterMark:
+        *metadata, payload = row
+        mark = NodeModelPrestageHighWaterMark.model_validate(payload)
+        expected = (
+            mark.placement_id,
+            mark.command_id,
+            mark.command_generation,
+            mark.election_id,
+            mark.holder_id,
+            mark.fencing_token,
+            mark.target_id,
+            mark.target_revision,
+            mark.release_identity_digest,
+            mark.attempt,
+            mark.updated_at,
+            mark.compacted_at,
+        )
+        if expected != tuple(metadata):
+            raise RuntimeError("stored node model pre-stage high-water metadata is inconsistent")
+        return mark
+
+    def _select_high_water_cursor(self, cursor, placement_id: str):
+        cursor.execute(
+            f"""
+            SELECT {self._high_water_select_columns()}
+            FROM public.node_model_prestage_high_water_marks
+            WHERE store_id = %s AND placement_id = %s
+            """,
+            (self._store_id, placement_id),
+        )
+        row = cursor.fetchone()
+        return None if row is None else self._high_water_mark(row)
+
+    def _upsert_high_water_cursor(
+        self,
+        cursor,
+        mark: NodeModelPrestageHighWaterMark,
+    ) -> None:
+        assert psycopg is not None
+        cursor.execute(
+            """
+            INSERT INTO public.node_model_prestage_high_water_marks (
+                store_id, placement_id, command_id, command_generation,
+                election_id, holder_id, fencing_token, target_id, target_revision,
+                release_identity_digest, attempt, updated_at, compacted_at, mark
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (store_id, placement_id) DO UPDATE SET
+                command_id = EXCLUDED.command_id,
+                command_generation = EXCLUDED.command_generation,
+                election_id = EXCLUDED.election_id,
+                holder_id = EXCLUDED.holder_id,
+                fencing_token = EXCLUDED.fencing_token,
+                target_id = EXCLUDED.target_id,
+                target_revision = EXCLUDED.target_revision,
+                release_identity_digest = EXCLUDED.release_identity_digest,
+                attempt = EXCLUDED.attempt,
+                updated_at = EXCLUDED.updated_at,
+                compacted_at = EXCLUDED.compacted_at,
+                mark = EXCLUDED.mark
+            """,
+            (
+                self._store_id,
+                mark.placement_id,
+                mark.command_id,
+                mark.command_generation,
+                mark.election_id,
+                mark.holder_id,
+                mark.fencing_token,
+                mark.target_id,
+                mark.target_revision,
+                mark.release_identity_digest,
+                mark.attempt,
+                mark.updated_at,
+                mark.compacted_at,
+                psycopg.types.json.Jsonb(mark.model_dump(mode="json")),
+            ),
+        )
+
     def _mutate(
         self,
         command: NodeModelPrestageCommand,
-        transition: Callable[[NodeModelPrestageRecord | None, int], NodeModelPrestageRecord],
+        transition: Callable[
+            [NodeModelPrestageRecord | None, NodeModelPrestageHighWaterMark | None, int],
+            NodeModelPrestageRecord,
+        ],
     ) -> NodeModelPrestageRecord:
         with self._lock:
             self._require_open()
@@ -465,6 +648,9 @@ class PostgresNodeModelPrestageStore:
                 with self._connection.cursor() as cursor:
                     self._validate_registry_cursor(cursor, for_update=True)
                     existing = self._select_record_cursor(cursor, command.placement_id)
+                    high_water = self._select_high_water_cursor(
+                        cursor, command.placement_id
+                    )
                     cursor.execute(
                         """
                         SELECT count(*)
@@ -475,7 +661,7 @@ class PostgresNodeModelPrestageStore:
                     )
                     count_row = cursor.fetchone()
                     assert count_row is not None
-                    record = transition(existing, count_row[0])
+                    record = transition(existing, high_water, count_row[0])
                     assert psycopg is not None
                     cursor.execute(
                         """
@@ -518,8 +704,9 @@ class PostgresNodeModelPrestageStore:
         )
         return self._mutate(
             command,
-            lambda existing, count: self._transitions.claim(
+            lambda existing, high_water, count: self._transitions.claim(
                 existing,
+                high_water=high_water,
                 record_count=count,
                 max_placements=self._max_placements,
                 command=command,
@@ -542,7 +729,7 @@ class PostgresNodeModelPrestageStore:
         )
         return self._mutate(
             command,
-            lambda existing, _count: self._transitions.complete(
+            lambda existing, _high_water, _count: self._transitions.complete(
                 existing,
                 command=command,
                 claim_id=claim_id,
@@ -565,7 +752,7 @@ class PostgresNodeModelPrestageStore:
         )
         return self._mutate(
             command,
-            lambda existing, _count: self._transitions.fail(
+            lambda existing, _high_water, _count: self._transitions.fail(
                 existing,
                 command=command,
                 claim_id=claim_id,
@@ -583,14 +770,53 @@ class PostgresNodeModelPrestageStore:
         command = self._transitions.validate_command(
             command, now=now, require_active=True
         )
-        return self._mutate(
-            command,
-            lambda existing, _count: self._transitions.release(
-                existing,
-                command=command,
-                now=now,
-            ),
-        )
+        with self._lock:
+            self._require_open()
+            self._ensure_connection()
+            assert self._connection is not None
+            with self._connection.transaction():
+                with self._connection.cursor() as cursor:
+                    self._validate_registry_cursor(cursor, for_update=True)
+                    existing = self._select_record_cursor(cursor, command.placement_id)
+                    high_water = self._select_high_water_cursor(
+                        cursor, command.placement_id
+                    )
+                    record = self._transitions.release(
+                        existing,
+                        high_water=high_water,
+                        command=command,
+                        now=now,
+                    )
+                    if existing is not None:
+                        assert psycopg is not None
+                        cursor.execute(
+                            """
+                            UPDATE public.node_model_prestage_records
+                            SET command_id = %s, command_generation = %s,
+                                fencing_token = %s, target_revision = %s,
+                                state = %s, updated_at = %s, record = %s
+                            WHERE store_id = %s AND placement_id = %s
+                            """,
+                            (
+                                record.command.command_id,
+                                record.command.command_generation,
+                                record.command.authority.fencing_token,
+                                record.command.target_revision,
+                                record.state.value,
+                                record.updated_at,
+                                psycopg.types.json.Jsonb(record.model_dump(mode="json")),
+                                self._store_id,
+                                record.command.placement_id,
+                            ),
+                        )
+                    else:
+                        assert high_water is not None
+                        mark = NodeModelPrestageHighWaterMark.from_absent_record(
+                            record,
+                            compacted_at=max(now, high_water.compacted_at),
+                        )
+                        self._upsert_high_water_cursor(cursor, mark)
+                    return _copy_prestage_record(record)
 
     def list_records(self) -> tuple[NodeModelPrestageRecord, ...]:
         with self._lock:
@@ -658,6 +884,89 @@ class PostgresNodeModelPrestageStore:
                     return tuple(
                         self._record(row, node_id=self._node_id)
                         for row in cursor.fetchall()
+                    )
+
+    def compact_absent_records(
+        self,
+        *,
+        retired_before: datetime,
+        compacted_at: datetime,
+        limit: int = 100,
+    ) -> tuple[NodeModelPrestageHighWaterMark, ...]:
+        retired_before = _aware(retired_before, name="retired_before")
+        compacted_at = _aware(compacted_at, name="compacted_at")
+        if compacted_at < retired_before:
+            raise ValueError("compacted_at cannot predate retired_before")
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("limit must be an integer in [1, 1000]")
+        with self._lock:
+            self._require_open()
+            self._ensure_connection()
+            assert self._connection is not None
+            with self._connection.transaction():
+                with self._connection.cursor() as cursor:
+                    self._validate_registry_cursor(cursor, for_update=True)
+                    cursor.execute(
+                        f"""
+                        SELECT {self._select_columns()}
+                        FROM public.node_model_prestage_records
+                        WHERE store_id = %s AND state = 'absent' AND updated_at <= %s
+                        ORDER BY updated_at, placement_id
+                        LIMIT %s
+                        """,
+                        (self._store_id, retired_before, limit),
+                    )
+                    records = tuple(
+                        self._record(row, node_id=self._node_id)
+                        for row in cursor.fetchall()
+                    )
+                    marks: list[NodeModelPrestageHighWaterMark] = []
+                    for record in records:
+                        mark = NodeModelPrestageHighWaterMark.from_absent_record(
+                            record,
+                            compacted_at=compacted_at,
+                        )
+                        previous = self._select_high_water_cursor(
+                            cursor, mark.placement_id
+                        )
+                        if (
+                            previous is not None
+                            and previous.command_generation >= mark.command_generation
+                        ):
+                            raise RuntimeError("pre-stage high-water mark would not advance")
+                        self._upsert_high_water_cursor(cursor, mark)
+                        cursor.execute(
+                            """
+                            DELETE FROM public.node_model_prestage_records
+                            WHERE store_id = %s AND placement_id = %s
+                              AND command_id = %s AND state = 'absent'
+                            """,
+                            (self._store_id, mark.placement_id, mark.command_id),
+                        )
+                        if cursor.rowcount != 1:
+                            raise RuntimeError("pre-stage compaction lost its locked record")
+                        marks.append(_copy_high_water_mark(mark))
+                    return tuple(marks)
+
+    def list_high_water_marks(self) -> tuple[NodeModelPrestageHighWaterMark, ...]:
+        with self._lock:
+            self._require_open()
+            self._ensure_connection()
+            assert self._connection is not None
+            with self._connection.transaction():
+                with self._connection.cursor() as cursor:
+                    self._validate_registry_cursor(cursor)
+                    cursor.execute(
+                        f"""
+                        SELECT {self._high_water_select_columns()}
+                        FROM public.node_model_prestage_high_water_marks
+                        WHERE store_id = %s
+                        ORDER BY placement_id
+                        """,
+                        (self._store_id,),
+                    )
+                    return tuple(
+                        self._high_water_mark(row) for row in cursor.fetchall()
                     )
 
     def check_ready(self) -> None:

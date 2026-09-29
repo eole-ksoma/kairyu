@@ -37,9 +37,12 @@ from kairyu.runners import (
     ModelCachePlacement,
     ModelCachePlacementCandidate,
     ModelCachePlacementState,
+    NodeModelPrestageCapacityError,
+    NodeModelPrestageCompactionStore,
     NodeModelPrestageConflictError,
     NodeModelPrestageExecutor,
     NodeModelPrestageExpiredError,
+    NodeModelPrestageStore,
     RunnerWriterAuthority,
     ScalingPrewarmSnapshot,
     apply_node_model_prestage_records,
@@ -48,6 +51,7 @@ from kairyu.runners import (
     build_node_model_prestage_release_command,
     plan_cache_aware_scale_up,
 )
+from kairyu.runners.prestage import _canonical_digest
 
 _NOW = datetime(2026, 9, 28, 3, 0, tzinfo=UTC)
 _DATA = {
@@ -663,6 +667,272 @@ def test_successor_requires_release_and_monotonic_generation() -> None:
             issued_at=_NOW + timedelta(seconds=1),
             ttl_seconds=60,
         )
+
+
+def test_compaction_reclaims_active_capacity_and_preserves_all_fences() -> None:
+    envelope, _, _ = _artifact()
+    original = _commands(envelope.manifest_digest)[0]
+    store = InMemoryNodeModelPrestageStore(
+        node_id="gpu-node-00",
+        max_placements=1,
+    )
+    store.claim(original, claim_id="a" * 64, now=_NOW + timedelta(seconds=1))
+    store.fail(
+        original,
+        claim_id="a" * 64,
+        failure="retire this placement",
+        now=_NOW + timedelta(seconds=2),
+    )
+    release = build_node_model_prestage_release_command(
+        original,
+        authority=_authority(token=5),
+        decision_id="scale-decision-18",
+        decision_fingerprint="e" * 64,
+        target_revision=9,
+        command_generation=21,
+        issued_at=_NOW + timedelta(seconds=3),
+        ttl_seconds=60,
+    )
+    absent = store.release(release, now=_NOW + timedelta(seconds=4))
+
+    other = _commands(
+        envelope.manifest_digest,
+        generation_start=30,
+    )[0].model_copy(update={"placement_id": "placement-other"})
+    other_payload = other.model_dump(mode="json", exclude={"command_id"})
+    other_payload["command_id"] = _canonical_digest(other_payload)
+    other = type(original).model_validate(other_payload)
+    with pytest.raises(NodeModelPrestageCapacityError):
+        store.claim(other, claim_id="b" * 64, now=_NOW + timedelta(seconds=5))
+
+    compacted = store.compact_absent_records(
+        retired_before=_NOW + timedelta(seconds=4),
+        compacted_at=_NOW + timedelta(seconds=6),
+    )
+
+    assert len(compacted) == 1
+    assert compacted[0].command_generation == 21
+    assert compacted[0].fencing_token == 5
+    assert compacted[0].target_revision == 9
+    assert store.list_records() == ()
+    assert store.list_high_water_marks() == compacted
+    assert store.release(release, now=_NOW + timedelta(seconds=7)) == absent
+    assert store.list_records() == ()
+    store.claim(other, claim_id="b" * 64, now=_NOW + timedelta(seconds=5))
+
+    stale_generation = _commands(
+        envelope.manifest_digest,
+        token=6,
+        generation_start=21,
+        target_revision=10,
+    )[0]
+    with pytest.raises(NodeModelPrestageConflictError, match="generation did not advance"):
+        store.claim(
+            stale_generation,
+            claim_id="c" * 64,
+            now=_NOW + timedelta(seconds=5),
+        )
+
+    changed_election_payload = stale_generation.model_dump(
+        mode="json", exclude={"command_id"}
+    )
+    changed_election_payload["command_generation"] = 22
+    changed_election_payload["authority"]["election_id"] = "other-election"
+    changed_election_payload["command_id"] = _canonical_digest(changed_election_payload)
+    changed_election = type(original).model_validate(changed_election_payload)
+    with pytest.raises(NodeModelPrestageConflictError, match="election identity changed"):
+        store.claim(
+            changed_election,
+            claim_id="c" * 64,
+            now=_NOW + timedelta(seconds=5),
+        )
+
+    changed_holder_payload = stale_generation.model_dump(
+        mode="json", exclude={"command_id"}
+    )
+    changed_holder_payload["command_generation"] = 22
+    changed_holder_payload["authority"]["fencing_token"] = 5
+    changed_holder_payload["authority"]["holder_id"] = "controller-b"
+    changed_holder_payload["command_id"] = _canonical_digest(changed_holder_payload)
+    changed_holder = type(original).model_validate(changed_holder_payload)
+    with pytest.raises(NodeModelPrestageConflictError, match="holder changed"):
+        store.claim(
+            changed_holder,
+            claim_id="c" * 64,
+            now=_NOW + timedelta(seconds=5),
+        )
+
+    store.compact_absent_records(
+        retired_before=_NOW + timedelta(seconds=10),
+        compacted_at=_NOW + timedelta(seconds=10),
+    )
+    stale_fence = _commands(
+        envelope.manifest_digest,
+        token=4,
+        generation_start=22,
+        target_revision=10,
+    )[0]
+    with pytest.raises(NodeModelPrestageConflictError, match="fencing token regressed"):
+        store.claim(stale_fence, claim_id="d" * 64, now=_NOW + timedelta(seconds=5))
+
+    stale_target = _commands(
+        envelope.manifest_digest,
+        token=6,
+        generation_start=22,
+        target_revision=8,
+    )[0]
+    with pytest.raises(NodeModelPrestageConflictError, match="target revision regressed"):
+        store.claim(stale_target, claim_id="e" * 64, now=_NOW + timedelta(seconds=5))
+
+
+def test_compaction_is_cutoff_limited_and_never_moves_live_records() -> None:
+    envelope, _, _ = _artifact()
+    first, second = _commands(envelope.manifest_digest, count=2)
+    store = InMemoryNodeModelPrestageStore(node_id="gpu-node-00")
+    for index, command in enumerate((first, second), start=1):
+        if command.node_id != "gpu-node-00":
+            payload = command.model_dump(mode="json", exclude={"command_id"})
+            payload["node_id"] = "gpu-node-00"
+            payload["command_id"] = _canonical_digest(payload)
+            command = type(command).model_validate(payload)
+        claim_id = str(index) * 64
+        store.claim(command, claim_id=claim_id, now=_NOW + timedelta(seconds=index))
+        store.fail(
+            command,
+            claim_id=claim_id,
+            failure="retired",
+            now=_NOW + timedelta(seconds=index + 2),
+        )
+        release = build_node_model_prestage_release_command(
+            command,
+            authority=_authority(token=5),
+            decision_id=f"retire-{index}",
+            decision_fingerprint=str(index) * 64,
+            target_revision=9,
+            command_generation=30 + index,
+            issued_at=_NOW + timedelta(seconds=index + 4),
+            ttl_seconds=60,
+        )
+        store.release(release, now=_NOW + timedelta(seconds=index + 5))
+
+    live = _commands(
+        envelope.manifest_digest,
+        generation_start=40,
+    )[0]
+    live_payload = live.model_dump(mode="json", exclude={"command_id"})
+    live_payload["placement_id"] = "placement-live"
+    live_payload["command_id"] = _canonical_digest(live_payload)
+    live = type(live).model_validate(live_payload)
+    store.claim(live, claim_id="f" * 64, now=_NOW + timedelta(seconds=1))
+
+    first_batch = store.compact_absent_records(
+        retired_before=_NOW + timedelta(seconds=20),
+        compacted_at=_NOW + timedelta(seconds=20),
+        limit=1,
+    )
+    second_batch = store.compact_absent_records(
+        retired_before=_NOW + timedelta(seconds=20),
+        compacted_at=_NOW + timedelta(seconds=20),
+        limit=1,
+    )
+
+    assert len(first_batch) == len(second_batch) == 1
+    assert {mark.placement_id for mark in first_batch + second_batch} == {
+        "placement-00",
+        "placement-01",
+    }
+    assert tuple(record.command.placement_id for record in store.list_records()) == (
+        "placement-live",
+    )
+    assert store.compact_absent_records(
+        retired_before=_NOW + timedelta(seconds=20),
+        compacted_at=_NOW + timedelta(seconds=20),
+    ) == ()
+
+    with pytest.raises(ValueError, match="cannot predate"):
+        store.compact_absent_records(
+            retired_before=_NOW + timedelta(seconds=20),
+            compacted_at=_NOW + timedelta(seconds=19),
+        )
+
+
+def test_compacted_mark_accepts_only_an_authorized_successor_lineage() -> None:
+    envelope, _, _ = _artifact()
+    original = _commands(envelope.manifest_digest)[0]
+    store = InMemoryNodeModelPrestageStore(node_id="gpu-node-00")
+    store.claim(original, claim_id="a" * 64, now=_NOW + timedelta(seconds=1))
+    store.fail(
+        original,
+        claim_id="a" * 64,
+        failure="retired",
+        now=_NOW + timedelta(seconds=2),
+    )
+    release = build_node_model_prestage_release_command(
+        original,
+        authority=_authority(token=5),
+        decision_id="retire-original",
+        decision_fingerprint="e" * 64,
+        target_revision=9,
+        command_generation=21,
+        issued_at=_NOW + timedelta(seconds=3),
+        ttl_seconds=60,
+    )
+    store.release(release, now=_NOW + timedelta(seconds=4))
+    store.compact_absent_records(
+        retired_before=_NOW + timedelta(seconds=4),
+        compacted_at=_NOW + timedelta(seconds=5),
+    )
+
+    forged_payload = release.model_dump(mode="json", exclude={"command_id"})
+    forged_payload["deployment_id"] = "production/other"
+    forged_payload["command_generation"] = 22
+    forged_payload["target_revision"] = 10
+    forged_payload["command_id"] = _canonical_digest(forged_payload)
+    forged = type(release).model_validate(forged_payload)
+    with pytest.raises(NodeModelPrestageConflictError, match="identity does not match"):
+        store.release(forged, now=_NOW + timedelta(seconds=6))
+
+    successor = _commands(
+        envelope.manifest_digest,
+        token=6,
+        generation_start=22,
+        target_revision=10,
+    )[0]
+    claimed = store.claim(
+        successor,
+        claim_id="b" * 64,
+        now=_NOW + timedelta(seconds=6),
+    )
+    assert claimed.command == successor
+    assert claimed.attempt == 1
+
+
+def test_compaction_extension_preserves_legacy_store_runtime_compatibility() -> None:
+    class LegacyStore:
+        node_id = "gpu-node-00"
+
+        def claim(self, *args, **kwargs):
+            raise NotImplementedError
+
+        def complete(self, *args, **kwargs):
+            raise NotImplementedError
+
+        def fail(self, *args, **kwargs):
+            raise NotImplementedError
+
+        def release(self, *args, **kwargs):
+            raise NotImplementedError
+
+        def list_records(self):
+            return ()
+
+        def list_records_page(self, *args, **kwargs):
+            return ()
+
+    legacy = LegacyStore()
+
+    assert isinstance(legacy, NodeModelPrestageStore)
+    assert not isinstance(legacy, NodeModelPrestageCompactionStore)
 
 
 def test_overlay_publishes_filling_ready_failed_and_preserves_released_residency(

@@ -2,9 +2,10 @@
 
 Status: WP4.7 implemented as fenced controller commands, placement-level
 claim/CAS, verified node execution, owner-scoped cache pins, status projection,
-and a shared durable PostgreSQL command store. Command transport and Kubernetes
-node binding remain deployment wiring; safe released-placement tombstone
-compaction remains a separate store-lifecycle task.
+and a shared durable PostgreSQL command store. The authenticated node HTTP API
+is implemented but not yet packaged or deployed with Kubernetes node binding.
+Safe released-placement tombstone compaction remains a separate store-lifecycle
+task.
 
 ## Purpose
 
@@ -105,6 +106,36 @@ generation, leader fence, and target revision, allowing an older lineage to be
 treated as a new placement. Safe compaction therefore remains deployment work
 and must retain an equivalent durable high-water mark before reclaiming a row.
 
+## Node agent HTTP boundary
+
+`create_node_model_cache_agent_app()` exposes only the bounded operations needed
+by a trusted controller:
+
+- `POST /v1/prestage/ensure` accepts one fenced command, claim digest, signed
+  manifest, and GitOps admission request;
+- `POST /v1/prestage/release` accepts one separately fenced release command;
+- `GET /v1/prestage/records` returns at most 100 node-scoped status projections
+  with a placement cursor; and
+- `/health` and `/readyz` provide low-disclosure liveness and an injected
+  backend readiness check.
+
+All `/v1` routes require one of the locally configured API keys as a bearer
+credential or `x-api-key`, compare credentials in constant time, enforce the
+app's fixed node identity before execution, bound request bytes and
+concurrent/queued work, and offload blocking cache/DB operations from the event
+loop. Status responses omit local artifact paths and durable failure details.
+Artifact trust roots are constructor inputs and cannot be supplied or replaced
+over the wire. Known command, capacity, admission, cache, and PostgreSQL errors
+use sanitized responses; backend-unavailable responses are retryable. Internal
+failure details stay in the durable failed record and operator logs. Readiness
+checks are coalesced and briefly cached so unauthenticated probes can consume at
+most one blocking worker at a time.
+
+Bearer authentication is the application floor, not the whole deployment
+security boundary. The DaemonSet must receive rotated credentials through the
+approved secret mechanism and be isolated by NetworkPolicy; production may add
+mTLS at the service mesh or sidecar without changing the command contract.
+
 ## Node execution and pins
 
 `NodeModelPrestageExecutor.execute()` validates the command against the GitOps
@@ -150,7 +181,8 @@ reauthorization can justify Runner creation.
 
 `private-ai-cloud-iac` must still provide:
 
-- authenticated controller-to-node command transport and per-node identity;
+- service discovery, rotated API credentials or mTLS, and NetworkPolicy for the
+  authenticated per-node HTTP API;
 - a node DaemonSet/service hosting the executor and WP4.2 cache agent;
 - reconciliation that replays desired ensure/release commands after restart;
 - bounded tombstone retention/compaction that durably preserves each retired
@@ -172,3 +204,7 @@ idempotent replay, failure/retry, fresh fenced release, preservation of other
 pin owners, and exact monotonic status projection. Real PostgreSQL tests add
 cross-instance claim races, completion/release replay, shared capacity, store
 configuration mismatch, and projected-metadata corruption detection.
+HTTP tests cover API-key protection, local-only trust roots, node binding,
+ensure/release replay, path/failure-detail redaction, readiness sanitization,
+bounded cursor pagination, error mappings, concurrent admission, and declared
+or chunked request-size bounds.

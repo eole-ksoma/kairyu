@@ -130,8 +130,10 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
   verification and fail-closed recovery. WP4.7 adds fenced pre-stage commands,
   claim/CAS, verified fill/pin, release, status projection, and a shared
   PostgreSQL store with cross-process linearizable capacity/fencing CAS.
-  Command transport, node-agent wiring, safe fencing-tombstone compaction, and
-  live environment acceptance remain.
+  An authenticated bounded node-agent HTTP API now exposes ensure/release and
+  durable status without accepting trust roots over the wire. DaemonSet/service
+  wiring, credential distribution, safe fencing-tombstone compaction, and live
+  environment acceptance remain.
 - Qwen3.8-Flash-Next MTP speculative decoding stays off in `qwen3.8-flash-next-dp2-8gpu` until upstream fixes vllm#53912 (prefix caching + MTP output corruption on hybrid GDN); single-stream decode 104 vs 175 tok/s
 - DTO-D15 (2026-08-26) changed the served tiered-example config: verify.sh coding/generic gates and the digest re-pin are pending before the example status can be claimed green again
 - Human sign-off pending on M2–M4 design reviews
@@ -140,6 +142,14 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
+
+### 2026-09-29 — [progress] Authenticated model cache-agent API
+- What: added API-key-protected, node-bound ensure/release/status endpoints with
+  local-only artifact trust roots, bounded request/concurrency admission,
+  readiness checks, and sanitized failure responses.
+- Refs: docs/design/node-model-cache-prestage-v1.md;
+  kairyu/runners/cache_agent_api.py;
+  tests/unit/test_node_model_cache_agent_api.py
 
 ### 2026-09-29 — [progress] Durable node pre-stage placement store
 - What: added a node-scoped PostgreSQL store with shared capacity locking,

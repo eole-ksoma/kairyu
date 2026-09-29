@@ -168,6 +168,7 @@ def test_cross_instance_claim_complete_release_and_replay(store_factory) -> None
     command = _command()
 
     assert isinstance(first, NodeModelPrestageStore)
+    assert first.check_ready() is None
     claimed = first.claim(command, claim_id="b" * 64, now=_NOW + timedelta(seconds=1))
     assert second.claim(
         command, claim_id="b" * 64, now=_NOW + timedelta(seconds=1)
@@ -252,6 +253,31 @@ def test_failed_exact_retry_and_shared_capacity(store_factory) -> None:
             claim_id="d" * 64,
             now=_NOW + timedelta(seconds=4),
         )
+
+
+def test_list_records_page_uses_stable_placement_cursor(store_factory) -> None:
+    create, _store_id = store_factory
+    first = create()
+    second = create()
+    for index in range(3):
+        command = _command(f"placement-{index:02d}", generation=20 + index)
+        first.claim(
+            command,
+            claim_id=str(index + 1) * 64,
+            now=_NOW + timedelta(seconds=1),
+        )
+
+    page = second.list_records_page(limit=2)
+    assert [record.command.placement_id for record in page] == [
+        "placement-00",
+        "placement-01",
+    ]
+    assert [
+        record.command.placement_id
+        for record in first.list_records_page(
+            after_placement_id="placement-01", limit=2
+        )
+    ] == ["placement-02"]
 
 
 def test_store_configuration_mismatch_fails_closed(store_factory) -> None:

@@ -176,6 +176,7 @@ class TenantLimiter:
         self._config = config
         self._now = now
         self._buckets: dict[str, _Bucket] = {}
+        self._async_submission_buckets: dict[str, _Bucket] = {}
         self._token_buckets: dict[str, _Bucket] = {}
         self._in_flight: dict[str, int] = {}
         self._reserved_tokens: dict[str, int] = {}
@@ -205,6 +206,19 @@ class TenantLimiter:
             self._token_buckets[tenant] = bucket
         return bucket
 
+    def admit_async_submission(self, tenant: str) -> bool:
+        """Rate-limit durable queue growth separately from inference RPM."""
+        bucket = self._async_submission_buckets.get(tenant)
+        if bucket is None:
+            limits = self._config.limits_for(tenant)
+            bucket = _Bucket(
+                limits.requests_per_minute,
+                self._now,
+                capacity=limits.request_burst,
+            )
+            self._async_submission_buckets[tenant] = bucket
+        return bucket.take(1.0, self._now())
+
     def acquire(self, tenant: str) -> TenantAdmission:
         """Acquire one downstream execution lease before shared admission."""
 
@@ -224,6 +238,50 @@ class TenantLimiter:
             return TenantAdmission.rejected(tenant, "request_quota")
         self._in_flight[tenant] = active + 1
         return TenantAdmission.acquired(tenant, self)
+
+    def acquire_reserved(
+        self,
+        tenant: str,
+        tokens: int,
+        *,
+        refundable_on_exact_usage: bool = True,
+    ) -> TenantAdmission:
+        """Atomically acquire request, in-flight, and token capacity."""
+        if type(tokens) is not int or tokens < 1:
+            raise ValueError("token reservation must be a positive integer")
+        now = self._now()
+        token_bucket = self._token_bucket(tenant)
+        token_bucket.take(0.0, now)
+        if tokens > token_bucket.capacity:
+            return TenantAdmission.rejected(tenant, "token_request_too_large")
+        if token_bucket.tokens + 1e-9 < tokens:
+            return TenantAdmission.rejected(
+                tenant,
+                "token_quota",
+                retry_after_s=(tokens - token_bucket.tokens) / token_bucket.rate,
+            )
+        limits = self._config.limits_for(tenant)
+        active = self._in_flight.get(tenant, 0)
+        if limits.max_in_flight is not None and active >= limits.max_in_flight:
+            return TenantAdmission.rejected(tenant, "in_flight", retry_after_s=1.0)
+        request_bucket = self._request_bucket(tenant)
+        request_bucket.take(0.0, now)
+        if request_bucket.tokens + 1e-9 < 1.0:
+            return TenantAdmission.rejected(
+                tenant,
+                "request_quota",
+                retry_after_s=(1.0 - request_bucket.tokens) / request_bucket.rate,
+            )
+        request_taken = request_bucket.take(1.0, now)
+        token_taken = token_bucket.take(float(tokens), now)
+        if not request_taken or not token_taken:  # defensive: synchronous checks above
+            raise RuntimeError("tenant quota changed during atomic reservation")
+        self._in_flight[tenant] = active + 1
+        self._reserved_tokens[tenant] = self._reserved_tokens.get(tenant, 0) + tokens
+        admission = TenantAdmission.acquired(tenant, self)
+        admission._reserved_tokens = tokens
+        admission._refundable_on_exact_usage = refundable_on_exact_usage
+        return admission
 
     def admit(self, tenant: str) -> bool:
         """Compatibility one-shot admission without holding an in-flight lease."""
@@ -331,6 +389,7 @@ class TenantAdmission:
     __slots__ = (
         "tenant",
         "reason",
+        "retry_after_s",
         "_limiter",
         "_released",
         "_reserved_tokens",
@@ -344,9 +403,11 @@ class TenantAdmission:
         tenant: str,
         reason: str,
         limiter: TenantLimiter | None,
+        retry_after_s: float | None = None,
     ) -> None:
         self.tenant = tenant
         self.reason = reason
+        self.retry_after_s = retry_after_s
         self._limiter = limiter
         self._released = False
         self._reserved_tokens = 0
@@ -363,8 +424,14 @@ class TenantAdmission:
         return cls(tenant, "quota_available", limiter)
 
     @classmethod
-    def rejected(cls, tenant: str, reason: str) -> TenantAdmission:
-        return cls(tenant, reason, None)
+    def rejected(
+        cls,
+        tenant: str,
+        reason: str,
+        *,
+        retry_after_s: float | None = None,
+    ) -> TenantAdmission:
+        return cls(tenant, reason, None, retry_after_s)
 
     @property
     def admitted(self) -> bool:
@@ -494,7 +561,54 @@ class TenantLimitMiddleware:
         state["tenant"] = tenant
         state["priority"] = self._config.limits_for(tenant).interactive_priority
         state["scheduling_class"] = "interactive"
-        if not path.startswith("/v1/"):
+        async_control_path = (
+            path == "/v1/async/chat/completions"
+            or path == "/v1/requests"
+            or path.startswith("/v1/requests/")
+        )
+        if path == "/v1/async/chat/completions":
+            admitted = self._limiter.admit_async_submission(tenant)
+            if self._metrics is not None:
+                self._metrics.record_tenant_admission(
+                    tenant,
+                    source="async_submit",
+                    admitted=admitted,
+                    reason="admitted" if admitted else "request_quota",
+                )
+                if admitted:
+                    self._metrics.record_tenant_release(
+                        tenant,
+                        source="async_submit",
+                    )
+            if not admitted:
+                body = json.dumps(
+                    {
+                        "error": {
+                            "message": (
+                                f"tenant {tenant!r} async submission limit exceeded"
+                            ),
+                            "type": "rate_limit_error",
+                            "code": "tenant_rate_limited",
+                        }
+                    }
+                ).encode()
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": 429,
+                        "headers": [
+                            (b"content-type", b"application/json"),
+                            (b"retry-after", b"1"),
+                        ],
+                    }
+                )
+                await send({"type": "http.response.body", "body": body})
+                return
+            await self.app(scope, receive, send)
+            return
+        if not path.startswith("/v1/") or async_control_path:
+            # Durable async control-plane calls are authenticated and scoped,
+            # but the worker owns the one inference admission charge.
             await self.app(scope, receive, send)  # identity only, no bucket
             return
         admission = self._limiter.acquire(tenant)

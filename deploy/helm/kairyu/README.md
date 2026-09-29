@@ -7,6 +7,19 @@ smoke configuration backed by the mock engine:
 helm install kairyu deploy/helm/kairyu
 ```
 
+Production and PoC releases should pin the image by digest. When `image.digest` is set,
+the chart renders `repository@digest` and ignores the tag for the Pod image reference:
+
+```console
+helm upgrade --install kairyu deploy/helm/kairyu \
+  --set-string image.repository=harbor.example.internal/ai/kairyu \
+  --set-string image.digest=sha256:<64-lowercase-hex-characters>
+```
+
+Set `workloadRole` to `gateway` or `replica` on split-role releases. The value is emitted
+as the standard `app.kubernetes.io/component` label so NetworkPolicy and monitoring can
+select roles without depending on a release name.
+
 The checked-in GPU overlay requests one NVIDIA GPU, selects the `pcie-gddr` node profile,
 uses the `nvidia` RuntimeClass, mounts model files read-only, and starts the real `kairyu`
 engine:
@@ -116,3 +129,27 @@ In both cases, the mounted storage must contain `/models/checkpoint` as seen fro
 container because the GPU DeploymentSpec sets `model_path: /models/checkpoint`. Both
 `hostPath` and `mountPath` must be absolute. The values schema rejects enabled storage
 with no source, both sources at once, relative paths, and unknown storage fields.
+
+## Rollout, shutdown, and monitoring
+
+The chart defaults to a long startup probe window for model loading, disables service
+account token mounting only when operators set `automountServiceAccountToken: false`,
+applies the runtime-default seccomp profile, drops Linux capabilities, and triggers a
+rollout whenever the embedded DeploymentSpec changes. The token default remains `true`
+for compatibility with `kubernetes_endpoints` discovery; static pools should disable it.
+
+For a one-Pod GPU release pinned to one node, use `strategyType: Recreate`; a rolling
+update cannot schedule a second Pod when only one GPU is allocated to that release.
+Enable `gracefulDrain.enabled` to POST `/admin/drain` before termination and wait for
+endpoint propagation. Keep `terminationGracePeriodSeconds` greater than the propagation
+delay by at least 10 seconds; the chart rejects a shorter grace period. The hook uses the
+Python runtime already present in both Kairyu images. For a
+deployment with `server.admin_keys_env`, set `gracefulDrain.auth.secretName` and
+`secretKey` to an existing Secret containing one admin key; the hook sends it as a Bearer
+token. The DeploymentSpec must set
+`server.admin_keys_env: KAIRYU_HELM_DRAIN_TOKEN` so the server reads the same injected
+value. Keyless trusted-mesh deployments leave `secretName` empty.
+
+Set `serviceMonitor.enabled: true` when the Prometheus Operator CRDs are installed. The
+chart then scrapes `/metrics` on the named Service port; use `serviceMonitor.labels` for
+the cluster's Prometheus selector (for example `release: kube-prometheus-stack`).

@@ -350,6 +350,43 @@ class BatchSection(BaseModel):
         return self
 
 
+class AsyncRequestsSection(BaseModel):
+    """Durable asynchronous Chat Completions worker configuration."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    dsn_env: str = Field(
+        default="KAIRYU_ASYNC_REQUEST_POSTGRES_DSN",
+        pattern=r"^[A-Za-z_][A-Za-z0-9_]*$",
+    )
+    store_id: str = Field(default="kairyu", min_length=1, max_length=128)
+    max_concurrency: int = Field(default=4, ge=1)
+    max_body_bytes: int = Field(default=8 * 1024 * 1024, ge=1)
+    max_records_per_tenant: int = Field(default=64, ge=1)
+    poll_interval_s: float = Field(default=0.5, ge=0.05)
+    lease_seconds: float = Field(default=30.0, ge=1.0)
+    request_retention_s: float | None = Field(
+        default=None,
+        ge=60.0,
+        le=315_360_000.0,
+    )
+    audit_retention_s: float | None = Field(
+        default=None,
+        ge=60.0,
+        le=315_360_000.0,
+    )
+    retention_batch_size: int = Field(default=500, ge=1, le=10_000)
+
+    @field_validator("store_id")
+    @classmethod
+    def _valid_store_id(cls, value: str) -> str:
+        if not value.strip() or "\x00" in value:
+            raise ValueError(
+                "async_requests.store_id must be a non-empty PostgreSQL identity"
+            )
+        return value
+
+
 class TenantLimitsSection(BaseModel):
     model_config = ConfigDict(
         frozen=True,
@@ -420,6 +457,7 @@ class DeploymentSpec(BaseModel):
     # separates public dispatch from deployment-owned internal resources.
     public_models: frozenset[str] | None = None
     batch: BatchSection | None = None
+    async_requests: AsyncRequestsSection | None = None
     tenants: TenantSection | None = None
     pricing: PriceSheet | None = None
 

@@ -44,11 +44,17 @@ _ANTHROPIC_INTERNAL_TOOL_STREAM_STATE_KEY = "kairyu_internal_anthropic_tool_stre
 
 # collapse per-object id path segments (file-…, batch_…, uuids, long hex/digits)
 # to {id} so a Prometheus path label cannot explode in cardinality (M1)
-_ID_SEGMENT = re.compile(r"^(file-|batch_|resp_|chatcmpl-|cmpl-|[0-9a-f-]{16,}|\d{6,})")
+_ID_SEGMENT = re.compile(
+    r"^(file-|batch_|req-|resp_|chatcmpl-|cmpl-|[0-9a-f-]{16,}|\d{6,})"
+)
 
 
 @lru_cache(maxsize=1024)
 def _template_path(path: str) -> str:
+    segments = path.split("/")
+    if len(segments) >= 4 and segments[1:3] == ["v1", "requests"]:
+        segments[3] = "{id}"
+        return "/".join(segments)
     return "/".join(
         "{id}" if _ID_SEGMENT.match(segment) else segment for segment in path.split("/")
     )
@@ -317,9 +323,16 @@ class ChatBodyLimitMiddleware:
         "/v1/messages/count_tokens",
     )
 
-    def __init__(self, app: _ASGIApp, *, limit: int) -> None:
+    def __init__(
+        self,
+        app: _ASGIApp,
+        *,
+        limit: int,
+        paths: Iterable[str] | None = None,
+    ) -> None:
         self.app = app
         self._limit = limit
+        self._paths = frozenset(self._PATHS if paths is None else paths)
 
     async def _reject(self, scope: dict, send: Callable) -> None:
         await _send_error(
@@ -338,7 +351,7 @@ class ChatBodyLimitMiddleware:
         if (
             scope["type"] != "http"
             or scope.get("method") != "POST"
-            or scope.get("path") not in self._PATHS
+            or scope.get("path") not in self._paths
         ):
             await self.app(scope, receive, send)
             return

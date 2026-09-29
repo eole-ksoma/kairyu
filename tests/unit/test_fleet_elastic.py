@@ -1359,11 +1359,18 @@ def test_helm_chart_renders():
         if document and document.get("kind") == "Deployment"
     )
     pod_spec = deployment["spec"]["template"]["spec"]
+    assert deployment["spec"]["selector"]["matchLabels"] == {"app": "kairyu"}
+    assert deployment["spec"]["template"]["metadata"]["labels"]["app"] == "kairyu"
+    assert pod_spec["automountServiceAccountToken"] is True
+    assert pod_spec["securityContext"]["seccompProfile"]["type"] == "RuntimeDefault"
     assert "nodeSelector" not in pod_spec
     assert "runtimeClassName" not in pod_spec
     assert "tolerations" not in pod_spec
     assert "affinity" not in pod_spec
     container = pod_spec["containers"][0]
+    assert container["securityContext"]["allowPrivilegeEscalation"] is False
+    assert container["securityContext"]["capabilities"]["drop"] == ["ALL"]
+    assert container["startupProbe"]["httpGet"]["path"] == "/health"
     assert all(
         variable["name"] != "KAIRYU_ATTENTION_BACKEND"
         for variable in container.get("env", [])
@@ -1602,6 +1609,207 @@ async def test_helm_shared_batch_store_uses_secret_dsn_and_immutable_pod_uid():
     assert ".Values.batchPostgres.dsnEnvName" in template
     assert "name: KAIRYU_BATCH_WORKER_ID" in template
     assert "fieldPath: metadata.uid" in template
+
+
+def test_helm_operability_defaults_and_schema_are_strict():
+    chart_dir = Path("deploy/helm/kairyu")
+    defaults = yaml.safe_load((chart_dir / "values.yaml").read_text())
+    schema = json.loads((chart_dir / "values.schema.json").read_text())
+    deployment = (chart_dir / "templates/deployment.yaml").read_text()
+
+    assert schema["additionalProperties"] is False
+    assert set(schema["properties"]) == set(defaults)
+    assert set(schema["required"]) == set(defaults)
+    assert defaults["image"]["digest"] == ""
+    assert schema["properties"]["image"]["properties"]["digest"]["pattern"] == (
+        "^$|^sha256:[a-f0-9]{64}$"
+    )
+    assert defaults["automountServiceAccountToken"] is True
+    assert defaults["podSecurityContext"] == {
+        "seccompProfile": {"type": "RuntimeDefault"}
+    }
+    seccomp_schema = schema["properties"]["podSecurityContext"]["properties"][
+        "seccompProfile"
+    ]
+    assert seccomp_schema["allOf"][0]["then"]["required"] == ["localhostProfile"]
+    assert seccomp_schema["allOf"][0]["else"] == {
+        "not": {"required": ["localhostProfile"]}
+    }
+    assert defaults["securityContext"]["allowPrivilegeEscalation"] is False
+    assert defaults["securityContext"]["capabilities"]["drop"] == ["ALL"]
+    assert defaults["probes"]["startup"]["failureThreshold"] == 90
+    assert defaults["gracefulDrain"] == {
+        "enabled": False,
+        "propagationSeconds": 10,
+        "auth": {"secretName": "", "secretKey": "admin-key"},
+    }
+    assert 'include "kairyu.image"' in deployment
+    assert "checksum/config" in deployment
+    assert "startupProbe:" in deployment
+    assert "http://127.0.0.1:8000/admin/drain" in deployment
+    assert "KAIRYU_HELM_DRAIN_TOKEN" in deployment
+    assert "urllib.request" in deployment
+    assert 'or "").strip()' in deployment
+    reserved_labels = schema["definitions"]["customLabelMap"]["propertyNames"][
+        "not"
+    ]["enum"]
+    assert "app.kubernetes.io/instance" in reserved_labels
+    assert "app" in reserved_labels
+    reserved_annotations = schema["definitions"]["podAnnotationMap"][
+        "propertyNames"
+    ]["not"]["enum"]
+    assert reserved_annotations == ["checksum/config"]
+
+
+@pytest.mark.helm
+def test_helm_chart_renders_digest_drain_and_service_monitor(tmp_path):
+    digest = "sha256:" + "a" * 64
+    override = tmp_path / "operability.yaml"
+    override.write_text(
+        yaml.safe_dump(
+            {
+                "image": {
+                    "repository": "harbor.private-ai.internal/turnkey-ai/kairyu",
+                    "digest": digest,
+                },
+                "workloadRole": "replica",
+                "strategyType": "Recreate",
+                "gracefulDrain": {"enabled": True},
+                "serviceMonitor": {
+                    "enabled": True,
+                    "labels": {"release": "kube-prometheus-stack"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    rendered = subprocess.run(
+        [
+            "helm",
+            "template",
+            "kairyu-replica",
+            "deploy/helm/kairyu",
+            "-f",
+            str(override),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    documents = [document for document in yaml.safe_load_all(rendered) if document]
+    deployment = next(document for document in documents if document["kind"] == "Deployment")
+    monitor = next(document for document in documents if document["kind"] == "ServiceMonitor")
+
+    assert deployment["spec"]["strategy"]["type"] == "Recreate"
+    assert deployment["spec"]["template"]["metadata"]["annotations"]["checksum/config"]
+    container = deployment["spec"]["template"]["spec"]["containers"][0]
+    assert container["image"] == f"harbor.private-ai.internal/turnkey-ai/kairyu@{digest}"
+    assert container["lifecycle"]["preStop"]["exec"]["command"][0] == "/bin/sh"
+    assert monitor["spec"]["endpoints"][0]["path"] == "/metrics"
+    assert monitor["metadata"]["labels"]["release"] == "kube-prometheus-stack"
+
+
+@pytest.mark.helm
+def test_helm_chart_renders_authenticated_graceful_drain(tmp_path):
+    override = tmp_path / "authenticated-drain.yaml"
+    override.write_text(
+        yaml.safe_dump(
+            {
+                "gracefulDrain": {
+                    "enabled": True,
+                    "auth": {
+                        "secretName": "kairyu-admin",
+                        "secretKey": "token",
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    rendered = subprocess.run(
+        [
+            "helm",
+            "template",
+            "kairyu",
+            "deploy/helm/kairyu",
+            "-f",
+            str(override),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    deployment = next(
+        document
+        for document in yaml.safe_load_all(rendered)
+        if document and document.get("kind") == "Deployment"
+    )
+    drain_env = next(
+        item
+        for item in deployment["spec"]["template"]["spec"]["containers"][0]["env"]
+        if item["name"] == "KAIRYU_HELM_DRAIN_TOKEN"
+    )
+    assert drain_env["valueFrom"]["secretKeyRef"] == {
+        "name": "kairyu-admin",
+        "key": "token",
+    }
+
+
+@pytest.mark.helm
+def test_helm_chart_rejects_insufficient_drain_grace(tmp_path):
+    invalid_values = tmp_path / "insufficient-drain-grace.yaml"
+    invalid_values.write_text(
+        yaml.safe_dump(
+            {
+                "terminationGracePeriodSeconds": 19,
+                "gracefulDrain": {
+                    "enabled": True,
+                    "propagationSeconds": 10,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            "helm",
+            "template",
+            "kairyu",
+            "deploy/helm/kairyu",
+            "-f",
+            str(invalid_values),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "gracefulDrain.propagationSeconds + 10" in result.stderr
+
+
+@pytest.mark.helm
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"podLabels": {"app.kubernetes.io/instance": "wrong"}},
+        {"podAnnotations": {"checksum/config": "disabled"}},
+    ],
+)
+def test_helm_schema_rejects_reserved_pod_metadata(tmp_path, override):
+    invalid_values = tmp_path / "reserved-pod-metadata.yaml"
+    invalid_values.write_text(yaml.safe_dump(override), encoding="utf-8")
+    result = subprocess.run(
+        [
+            "helm",
+            "template",
+            "kairyu",
+            "deploy/helm/kairyu",
+            "-f",
+            str(invalid_values),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
 
 
 @pytest.mark.helm

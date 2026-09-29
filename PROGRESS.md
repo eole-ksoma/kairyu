@@ -23,7 +23,7 @@ beat frontier APIs as measured by the committed harness (G6 gate P-C1).
 
 ## Current Status
 
-Snapshot date: 2026-08-17. Hardware context: all GPU evidence so far is on
+Snapshot date: 2026-09-15. Hardware context: all GPU evidence so far is on
 8× RTX PRO 6000 Blackwell (SM120), PCIe-only interconnect (P2P 30–37 GB/s);
 NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 `bench/results/` (see `index.json`); decisions and rationale in `docs/design/`.
@@ -75,7 +75,7 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 - Device-side sampling, penalties, spec verification, page-table caching; TP step headers sleep on Gloo while fixed-layout delta payloads use the bounded NCCL model group and rare controls remain Gloo objects; structured masks stay on CUDA with only selected IDs returned to the host matcher; deterministic n-gram/EAGLE-3/MTP drafts preserve T>0 and penalized sampling
 - Hardened gateway: auth, tenancy metering/invoicing, priority + SLO admission, batch API, embeddings/RAG, Responses API
 - Orchestration (Conductor/MoA) with streaming, usage accounting, trace v2; assistant history round-trips typed `reasoning_content` while assistant-only LiteLLM provider objects and nullable legacy function calls are ignored before rendering and other extras remain fail-closed; MoA keeps the original response contract distinct from untrusted candidate drafts, with configured completion delimiters and the multi-stage boundary withholding private synthesis reasoning; prefix-aware replica placement obeys the configured queue-depth overload valve; Codex CLI and IDE tool-calling work end-to-end, including AUTO models over /v1/responses (#530)
-- Fleet: 3-gateway HA with PostgreSQL BatchStore, KV-aware prefix routing, DRAM KV tiering, Helm chart + kind CI drill
+- Fleet: 3-gateway HA with PostgreSQL BatchStore, KV-aware prefix routing, DRAM KV tiering; Helm supports immutable images, split-role labels, safe rollout/drain, hardened Pods, and ServiceMonitor plus the kind CI drill
 - Checkout-only eval tooling retains explicit Core, Quantization, Structured Output, and Long Context suites with hash-chained quality history, config A/B comparisons, and quantization sweeps; Kairyu correctness and performance gates are owned by `verification/`, not evals
 - The tiered RTX PRO example (DTO-D13, 2026-08-22) puts a bounded Qwen non-thinking route judge in front of five profiles — four single-call direct routes (Qwen non-thinking, Qwen thinking-medium, DeepSeek non-thinking on the re-added `tier2-direct` pool, DeepSeek thinking at the L3 effort; official per-mode sampling fixed on the final unit, vendor-official caps 131072/393216) and the ensemble — selecting per request with fallback to the ensemble; the L2 DSL now has N named `profiles` + a judge with spec-defined `choices`, final-unit sampling overrides (caps min()'d with the caller), and route-aware serving gates. The ensemble (`primary`) profile is the dual-track policy-ensemble L2 DAG (DTO-D1..D12, amended by DTO-D14) over four Qwen3.8 TP1 vLLM workers (no MTP pending c16/c32 evidence) + the measured DeepSeek TP4/EP4 DSpark worker: a Qwen head streams the public opening from t=0 (semantic-TTFT gate ≤2× DeepSeek-direct, inherited); one thinking DeepSeek call writes 4 maximally different policies fanned out to 4 policy-bound Qwen answers in parallel while thinking DeepSeek critically refines a quick Qwen draft; thinking DeepSeek `synthesis` weighs the 5 candidates as peers and writes one better answer, and an inline Qwen thinking-medium (DTO-D14) `audit` (PASS/FAIL, ≤2 refinements, last attempt published on exhaustion) gates the streamed remainder (DTO-D10); a Qwen `image_description` stage runs on image requests only and feeds the text-only DeepSeek roles (DTO-D11); DeepSeek budgets halved to 8192/32768/65536 with a 65536 ceiling and Chat UI default for the Terminal-Bench 900 s turn envelope (DTO-D12). The sandbox executor stays deployed but unreferenced. Last green verify.sh runs 20260825T161729Z (coding) and 20260825T173343Z (generic) on the DTO-D8..D14 served config: coding TTFT rows all not_applicable (the judge routes every coding request to the ungated qwen_think_medium route), generic route-aware stage validation green. Composed L1 workers remain vLLM-backed until the native full-checkpoint gate closes
 - Replica-pool scale-out examples (FN-D9, 2026-09-01): Qwen3.8 TP1 x 8 and DeepSeek TP4+EP4 x 2 behind one public model each; `verify.sh serving` proves the even per-replica split from the pool placement log and `verify.sh tool-calling` proves OpenAI tool calls on every replica (see their MEASUREMENTS.md); two vision replica examples (FN-D9 amendment 2026-09-04: DeepSeek-V4-Flash-Vision-Exp TP4+EP4 x 2, Qwen3.8-Flash-Next-FP8 TP4 x 2 on a shared upstream-main SM120 overlay image, Chat UI reasoning-effort dropdown, `verify.sh vision`) are GPU-verified (2026-09-04: pins locked, serving/tool-calling/vision gates PASS, MEASUREMENTS.md written); the Qwen example serves without the recipe's MTP k=3 because prefix caching + MTP corrupts batched output on this vLLM revision (vllm#53912)
@@ -93,6 +93,17 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 - Frontier full-checkpoint 262K/1M correctness/performance evidence, DeepSeek EP4/EP8 topology lock, CUDA Graph pointer stability, MTP/DSpark selection, 30-minute soak, and failure recovery remain open
 - NVLink-profile gates blocked on H100/A100-class hardware; PCIe-switch chassis and ≥400 Gb/s RDMA NICs gate E4/E5
 - G6 remaining P-C gates still in progress
+- AsyncRequest v1 has a PostgreSQL-backed non-streaming Chat API, tenant-scoped
+  state/result/cancel routes, a lease-fenced worker, shared queue telemetry,
+  bounded request/audit retention, and multi-gateway CPU evidence. The current
+  retention-expanded Kind rerun remains pending on Docker registry access.
+- Runner State v1 includes Kubernetes observation/reconciliation, fenced
+  drain/termination, failure-domain backoff/quarantine, and a lease-fenced
+  single-writer gate with a PostgreSQL shared lease backend. WP3.1 adds bounded,
+  model-class scaling policy schemas. WP3.2 adds source-timestamped observation
+  windows and an append-only PostgreSQL decision log with stale-input safety.
+  Scale actuation, deployment wiring, durable Runner status, Kubernetes mutations,
+  and runtime instrumentation remain open.
 - Qwen3.8-Flash-Next MTP speculative decoding stays off in `qwen3.8-flash-next-dp2-8gpu` until upstream fixes vllm#53912 (prefix caching + MTP output corruption on hybrid GDN); single-stream decode 104 vs 175 tok/s
 - DTO-D15 (2026-08-26) changed the served tiered-example config: verify.sh coding/generic gates and the digest re-pin are pending before the example status can be claimed green again
 - Human sign-off pending on M2–M4 design reviews
@@ -101,6 +112,35 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
+
+### 2026-09-15 — [progress] Durable autoscaler observation and decision log
+- What: added bounded source-timestamped scaling windows, exact policy/input
+  decision records, stale-input scale-down rejection, and a shared PostgreSQL
+  append-only log with idempotency, fixed capacity, and strict schema checks.
+- Refs: docs/design/runner-state-v1.md; kairyu/runners/scaling_log.py;
+  kairyu/runners/postgres_scaling_log.py
+
+### 2026-09-15 — [design] Model-class scaling policy v1
+- What: added bounded min/max, buffer, timing, scale-to-zero approval,
+  multiplexing, and per-decision step contracts plus a versioned policy catalog.
+- Why: autoscaler decisions need immutable safety bounds before durable input logging.
+- Refs: docs/design/runner-state-v1.md; kairyu/runners/scaling.py
+
+### 2026-09-15 — [progress] Runner control-plane safety through WP2.6
+- What: added Kubernetes reconciliation, drain authorization, revision/node/GPU
+  backoff, and PostgreSQL lease-fenced single-writer gates for controller and
+  autoscaler work.
+- Refs: docs/design/runner-state-v1.md; kairyu/runners; tests/unit/test_runner_*.py
+
+### 2026-09-11 — [design] Runner State v1 and startup evidence
+- What: added immutable, versioned Runner status and startup phase schemas,
+  strict logical transition validation, pure status updates, and gap-free
+  image/model/compile/warmup reporting with bounded failure records.
+- Why: Pod phase alone cannot distinguish image pull, model load, warmup,
+  serving readiness, active work, or safe drain; controller and autoscaler
+  implementation now share one executable contract.
+- Refs: docs/design/runner-state-v1.md; kairyu/runners;
+  tests/unit/test_runner_lifecycle.py
 
 ### 2026-09-11 — [progress] V4.1 L1 selection and final GPU gates complete
 - What: select TP8/EP8, DSpark 5, 16K batching and NCCL; the 320-request matrix, default/explicit reasoning, tools, images, cancellation, normal restart and four long-context retrieval smokes pass. Best measured aggregate throughput is 326.82 tok/s at c32; near-1M retrieval completes in 203.02 s.
@@ -127,59 +167,13 @@ in `.claude/rules/progress-log.md`).
 - Why: the owner revised the initial two-replica request to one TP8 replica; the initial vLLM encoder maps high differently from the checkpoint, and content-only timing mismeasures all-reasoning output.
 - Refs: FN-D9 amendment in `docs/design/frontier-native-runtime.md`; `examples/deepseek-v4.1-flash-8gpu/`; implementation plan `2026-09-11-deepseek-v41-flash-example.md`.
 
-### 2026-09-04 — [amendment] FN-D9: vision examples GPU-verified; Qwen drops MTP k=3
-- What: both vision replica examples pinned (tree SHA, image ID `b47e2210`) and all gates
-  PASS — DeepSeek c64 689 tok/s, Qwen c32 548 tok/s, placement 32/32 at every row ≥c8,
-  tool-calling 6/6, vision 2/2. `qwen3.8-flash-next-dp2-8gpu` now serves without the
-  recipe's `--speculative-config mtp k=3` and with `--kv-cache-memory` pinned (a cold
-  torch.compile cache made vLLM's start-up profile shrink replica 0's KV cache to 741K
-  tokens vs 3.45M); `verify.sh vision` requires the answer to name the probe colour.
-- Why: with prefix caching + MTP, `vllm@27a94d1c` corrupts batched answers on the hybrid
-  GDN checkpoint (`ductduct…`; 13/274 at 2-12 concurrent, 0/1,508 with either off,
-  63.8% with `--no-async-scheduling`; upstream vllm#53912). Prefix caching is what
-  Kairyu's prefix-aware placement and multi-turn traffic use, so MTP is the one dropped.
-- Refs: FN-D9 amendment in `docs/design/frontier-native-runtime.md`; `examples/*/MEASUREMENTS.md`; supersedes the "MTP k=3" wording in the 2026-09-04 FN-D9 entry below
-
-### 2026-09-04 — [amendment] FN-D9: two vision replica-pool examples
-- What: `examples/deepseek-v4-flash-vision-exp-dp2-8gpu` (TP4+EP4 × 2, official recipe
-  + SM120 marlin, 1M ctx) and `examples/qwen3.8-flash-next-dp2-8gpu` (TP4 × 2, official
-  rtx_pro_6000_4x FP8 layout, MTP k=3, 256K ctx): one public text+image model each,
-  no-login Chat UI with a reasoning-effort dropdown in each model's official vocabulary,
-  `verify.sh vision` gate, shared upstream-main `27a94d1c` + FlashInfer `60b49158`
-  SM120 overlay image with a fail-closed image-ID pin.
-- Why: both checkpoints need upstream `main` (official tags predate the support PRs;
-  FlashInfer 0.6.18 breaks SM120 sparse-MLA on the first image); Qwen's template
-  rejects L3-normalized efforts, so an example-local alias restores them.
-- Refs: FN-D9 amendment 2026-09-04 (docs/design/frontier-native-runtime.md); tests/unit/test_replica_examplectl.py; GPU evidence pending
-
-### 2026-09-02 — [amendment] FN-D9: replica examples must serve OpenAI tool calls
-- What: DP2 DeepSeek drops the Kairyu-rendered /completions passthrough (forwards
-  no tools; DSML parse is whole-block only) for the Qwen-style legacy path: vLLM
-  renders with the checkpoint's deepseek_v4 encoder + `--tool-call-parser
-  deepseek_v4`, Kairyu forwards tools to /chat/completions and normalizes. Both
-  examples gain a fail-closed readiness tool probe + `verify.sh tool-calling`
-  and non-thinking default kwargs (Qwen gate caught empty `content` on plain chat).
-- Why: PR #584 review — SWE-bench Pro got `tool_calls: null` every turn (22/22
-  RepeatedFormatError). GPU-verified: both tool gates 6/6, both matrices
-  re-pinned, SWE-bench Pro smoke 3/3 (kairyu-bench `20260902T010540Z-3bf671e8`).
-- Refs: PR #584; FN-D9 amendment; examples/{qwen3.8-27b-dp8-8gpu,deepseek-v4-flash-0731-dp2-8gpu}/
-
-### 2026-09-02 — [amendment] FN-D9: replica placement gates reject material skew
-- What: both replica-pool examples now limit a replica to 1.25× the even share.
-  Behavior tests reject the 8-way `16,16,16,8,2,2,2,2` and 2-way `63,1`
-  skews while the retained exact-even distributions pass. The verification-only
-  config change does not require a GPU rerun.
-- Why: the former 2× bound admitted materially skewed distributions as passing.
-- Refs: PR #585; FN-D9; examples/{qwen3.8-27b-dp8-8gpu,deepseek-v4-flash-0731-dp2-8gpu}/
-
-### 2026-09-01 — [amendment] FN-D9: two replica-pool 8-GPU examples (no orchestration)
-- What: `examples/qwen3.8-27b-dp8-8gpu` (Qwen3.8 TP1 × 8) and
-  `examples/deepseek-v4-flash-0731-dp2-8gpu` (DeepSeek TP4+EP4 × 2) expose one
-  public model each; L2 is only the `ReplicaPool` (`prefix_index: true`,
-  `queue_depth_threshold: 0`) and `verify.sh serving` gates the per-replica
-  split from `placement_log_path`. Same run/verify UX; no product code changed.
-- Why: a plain scale-out serving path (one API over N identical L1 replicas)
-  next to the orchestrated tiered example. GPU-verified 2026-09-01: gates green,
-  exact 8x8 / 32x2 splits; Qwen 313.7 tok/s at c8 (8.0x c1), DeepSeek 471 tok/s
-  at c32 (1.95x one replica) — MEASUREMENTS.md runs 20260901T133331Z / 20260901T140112Z.
-- Refs: FN-D9 (docs/design/frontier-native-runtime.md); tests/unit/test_replica_examplectl.py
+### 2026-09-08 — [progress] AsyncRequest API and chat worker
+- What: added tenant-scoped async Chat submission/status/result/cancel, bounded
+  persisted bodies, fixed lease-renewing workers, shared chat validation and
+  admission/metering, cancellation abort, and DeploymentSpec/lifespan wiring.
+  Review hardening keeps status/list projections body-free, derives queue
+  priority from tenant policy, bounds per-tenant queue growth, defers transient
+  quota pressure without starving other tenants, shortens heartbeats at
+  deadlines, and defers PostgreSQL connect to lifespan.
+- Refs: m10 A38; kairyu/async_requests/worker.py;
+  kairyu/entrypoints/server/async_request_routes.py; async_requests deployment

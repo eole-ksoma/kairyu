@@ -366,6 +366,156 @@ tokens; a process-local submit signal only wakes the local poller. After an
 owner crash, inference may run again, but only the current fenced claimant may
 publish the terminal job and output.
 
+Durable asynchronous Chat Completions use a separate request state machine and
+PostgreSQL schema; they do not reuse Batch jobs or file objects:
+
+```yaml
+async_requests:
+  dsn_env: KAIRYU_ASYNC_REQUEST_POSTGRES_DSN
+  store_id: production
+  max_concurrency: 8
+  max_body_bytes: 8388608
+  max_records_per_tenant: 64
+  poll_interval_s: 0.5
+  lease_seconds: 30
+  # Disabled when omitted. Enable only after the rollout sequence below.
+  request_retention_s: 604800
+  audit_retention_s: 2592000
+  retention_batch_size: 500
+```
+
+`POST /v1/async/chat/completions` accepts the normal non-streaming Chat body.
+Optional `Idempotency-Key`, `X-Kairyu-Deadline-At` (timezone-aware ISO 8601),
+headers control durable submission. Queue ordering uses the authenticated
+tenant's trusted `batch_priority`; clients cannot raise their global queue
+position. A 202 receipt links to tenant-scoped status, result, and cancel
+routes under `/v1/requests/{id}`; list filtering uses `state` and `limit` query
+parameters. Receipt, list, and status projections omit persisted input and
+output bodies. Pending result reads return 202 with `Retry-After`, successful reads
+return the stored Chat Completion, and other terminal states return 409. The
+configured body cap applies even when the direct Chat body limit is disabled.
+Async control-plane calls are authenticated and tenant-scoped. Submission uses
+a separate per-tenant RPM bucket to bound durable queue growth, status polling
+does not drain inference quota, and the worker charges inference RPM once when
+execution starts.
+`max_records_per_tenant` is a hard durable allocation: idempotent replays remain
+available at the limit, while new records return 429 until retained terminal
+records cross the configured request TTL and the external retention job removes
+them. At that point the idempotency guarantee for the deleted request also ends;
+reusing its key creates a new request and may execute inference again.
+At the default 8 MiB input cap this bounds persisted input to roughly 512 MiB
+per tenant; size the PostgreSQL volume/quota for the configured tenant count,
+results, indexes, and audit history.
+
+Set `KAIRYU_ASYNC_REQUEST_WORKER_ID` to the immutable gateway Pod UID when it is
+available. Workers renew database-clock leases while waiting or executing, use
+fencing for terminal publication, and run only publicly served direct Chat
+models in v1. Local cancellation aborts generation immediately; another
+gateway observes cancellation no later than its next heartbeat. AUTO
+orchestration, Responses inputs, and Redis wake-up hints remain separate later
+extensions.
+
+AsyncRequest retention is deliberately not run by every gateway. Configure it
+in the DeploymentSpec and invoke the bounded external job from one Kubernetes
+CronJob or an equivalent scheduler. Omitted request and audit TTLs disable their
+respective deletion paths; omitting both makes the job a complete no-op. A
+request TTL removes only `succeeded`, `failed`, `cancelled`, and `expired`
+records. Before the request row is deleted, its body-free claim audit is moved
+in bounded chunks to the audit archive. The audit TTL is measured from the
+original event timestamp across both active and archived audit rows, so moving
+an event never restarts its retention period. Audit retention may be longer
+than request retention. If `audit_retention_s` is omitted, the audit archive is
+unbounded and must be capacity-planned separately.
+
+Deletion is eventual within the scheduler interval, not an exact-time erasure
+guarantee. Each transaction uses the PostgreSQL clock, locks terminal parents
+before their audit rows, skips work owned by another purger, and rechecks state
+and cutoff at deletion. Per-event transition and attempt counters survive both
+request and audit deletion; only the current state gauge is decremented. Neither
+request bodies, results, owners, request IDs, nor the DSN are written to normal
+retention-job output.
+
+Existing deployments must use this order because older binaries reject unknown
+DeploymentSpec keys:
+
+1. Deploy the new binary to every gateway while leaving all retention fields
+   omitted, and verify every old Pod has drained.
+2. Complete the existing `sharded-v2` telemetry migration for every store.
+3. Build the retention indexes online and activate the store marker:
+
+   ```bash
+   python scripts/async_request_retention.py deployment.yaml \
+     --mode prepare --apply
+   ```
+
+4. Add `request_retention_s`, `audit_retention_s`, and optionally
+   `retention_batch_size` to the DeploymentSpec. Preview one capped batch:
+
+   ```bash
+   python scripts/async_request_retention.py deployment.yaml --mode purge
+   ```
+
+   Preview opens a repeatable-read, database-enforced read-only transaction and
+   reports what the next bounded batch would delete or archive. It never creates
+   or repairs schema objects. `--mode prepare` without `--apply`, and purge when
+   both TTLs are omitted, return before opening a database connection.
+
+5. Apply bounded batches after reviewing the structured preview:
+
+   ```bash
+   python scripts/async_request_retention.py deployment.yaml \
+     --mode purge --apply --max-batches 100
+   ```
+
+Run the scheduled command with `concurrencyPolicy: Forbid`, a finite job
+deadline, `restartPolicy: Never`, and a dedicated Secret/service account. Its
+database role needs only connection plus the documented AsyncRequest retention
+tables and index preparation privileges; do not reuse a superuser credential.
+The job exits non-zero after a partial-run error and reports only aggregate
+counts plus a post-batch hint that eligible work remains. The hint includes rows
+temporarily locked by another purger, but concurrent commits immediately after
+the observation may change it. A later CronJob run safely resumes the backlog.
+
+PostgreSQL connect, statement, lock, idle-transaction, and TCP keepalive waits
+are bounded; worker shutdown also has a bounded drain before forced task
+cancellation. Successful result JSON encoding is offloaded from the gateway
+event loop.
+
+Temporary tenant request, token, or in-flight pressure returns the request to
+the queue behind a durable tenant cooldown rather than making it terminal or
+occupying a worker slot. This allows another tenant to claim work immediately.
+A request whose token bound can never fit the tenant burst fails terminally as
+a configuration/request mismatch.
+
+Execution is at-least-once across lease takeover. Fencing prevents stale result
+publication, but usage metering is not yet exactly-once; a takeover after an old
+worker records usage can duplicate accounting. A future ledger schema should
+use the request ID as an idempotency key.
+
+The first deployment gate is CPU-only and reuses the disposable F1c kind
+topology (three independently restartable gateways and one shared PostgreSQL):
+
+```bash
+bash scripts/kind_async_request_gate.sh
+```
+
+It runs the existing F1c shared-store gate before checking cross-gateway
+idempotency and reads, remote cancellation, deadline expiry, a concurrent
+768 KiB submit and responsiveness probe, lease-fenced takeover after killing
+the active owner, and persistence plus new work after a PostgreSQL process
+restart. The registered live smoke entrypoint is
+`verification/fleet/resilience/async_request_gateway_smoke.py`. Use
+`--keep-cluster` only for inspection; the default collects the
+report, claim audit, Kubernetes state/events, and service logs before bounded
+cluster cleanup. Evidence is written below
+`bench/results/async-request-kind-live/`, which is an ignored local directory.
+
+This is the per-slice functional gate. Multi-tenant fairness is exercised when
+the tenant-policy slice is integrated; GPU model correctness, peak/soak load,
+and performance acceptance remain end-of-plan integration gates. This ordering
+finds distributed lifecycle defects early without repeatedly paying for GPU
+runs while the control plane is still changing.
+
 The formal F5b GPU check is
 `verification/fleet/resilience/noisy_neighbor_gpu_bench.py --assert-gate`.
 It compares 10x offered noisy traffic against bracketed compliant-neighbor
@@ -706,7 +856,38 @@ is not C7/F1b acceptance evidence.
   `kairyu_scheduler_queue_high_watermark` series by model and
   interactive/batch class. Tenant-enabled gateways additionally expose
   `kairyu_tenant_admission_total` by bounded tenant/source/decision/reason and
-  `kairyu_tenant_in_flight_requests`. Scrape every gateway and replica.
+  `kairyu_tenant_in_flight_requests`. AsyncRequest gateways expose shared-store
+  `kairyu_async_request_queue_depth`,
+  `kairyu_async_request_oldest_queued_age_seconds`, lifecycle state,
+  transition, attempt, and snapshot-health series. Queue, state, transition,
+  and attempt values are shared PostgreSQL-backed snapshots: de-duplicate those
+  series across gateway targets with `max without(instance, pod)` rather than
+  `sum`. Snapshot health is gateway-local and must not use `max`; alert per
+  target, or when `min without(instance, pod)
+  (kairyu_async_request_metrics_snapshot_success) == 0`. During a failed
+  refresh the shared series retain that gateway's last good snapshot. Scrape
+  every gateway and replica.
+
+  A new empty AsyncRequest store activates sharded telemetry automatically.
+  For a pre-existing registry, deploy the compatible code first; the first v2
+  Pod atomically advances all registry rows so already-running v1 Pods can
+  drain, while a v1 Pod restart fails closed instead of replacing shared
+  trigger functions. Telemetry reports snapshot health `0` until the one-time
+  backfill. Drain AsyncRequest writers for every store, then run the following
+  once per store:
+
+  ```bash
+  python scripts/async_request_metrics_migration.py \
+    --store-id "$STORE_ID" --mode backfill \
+    --maintenance-window-confirmed
+  ```
+
+  The DSN is read from `KAIRYU_ASYNC_REQUEST_POSTGRES_DSN`. During a mixed
+  rollout an existing legacy trigger remains available to running old Pods while the
+  new, separately named trigger writes 64 sharded counters. After every store
+  is backfilled and all old Pods are gone, run the same command with
+  `--mode finalize-legacy` to remove the legacy single-row writer. Neither
+  operation runs automatically during normal Pod startup.
 - With a versioned `pricing:` section, `/admin/usage.csv` snapshots the local
   immutable ledger and exports tenant charges for a `[start_ts,end_ts)` period.
   The CSV carries source SHA-256, price-sheet version, Decimal unit rates,

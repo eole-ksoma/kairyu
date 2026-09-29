@@ -47,6 +47,8 @@ def test_runtime_payload_is_revision_independent_and_nonroot_cache_safe() -> Non
     assert _DOCKERFILE.index(final) > _DOCKERFILE.index('CMD ["/etc/kairyu/config.yaml"]')
     assert _DOCKERFILE.index("ARG KAIRYU_VCS_REF") > _DOCKERFILE.index(final)
     assert _DOCKERFILE.count("ARG KAIRYU_VCS_REF") == 1
+    assert 'LABEL org.opencontainers.image.revision="${KAIRYU_VCS_REF}"' in _DOCKERFILE
+    assert 'ENV KAIRYU_VCS_REF="${KAIRYU_VCS_REF}"' in _DOCKERFILE
     assert "FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer" in _DOCKERFILE
 
 

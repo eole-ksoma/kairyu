@@ -1,17 +1,42 @@
+{{- if and .Values.gracefulDrain.enabled (lt (int .Values.terminationGracePeriodSeconds) (add (int .Values.gracefulDrain.propagationSeconds) 10)) }}
+{{- fail "terminationGracePeriodSeconds must be at least gracefulDrain.propagationSeconds + 10 when graceful drain is enabled" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "kairyu.fullname" . }}
+  labels:
+    {{- include "kairyu.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: {{ .Values.strategyType }}
   selector:
     matchLabels:
-      app: {{ include "kairyu.fullname" . }}
+      {{- include "kairyu.selectorLabels" . | nindent 6 }}
   template:
     metadata:
       labels:
-        app: {{ include "kairyu.fullname" . }}
+        {{- include "kairyu.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
+      automountServiceAccountToken: {{ .Values.automountServiceAccountToken }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -29,9 +54,13 @@ spec:
       {{- end }}
       containers:
         - name: kairyu
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: {{ include "kairyu.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          {{- if or .Values.attentionBackend .Values.batchPostgres.enabled }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if or .Values.attentionBackend .Values.batchPostgres.enabled (and .Values.gracefulDrain.enabled .Values.gracefulDrain.auth.secretName) }}
           env:
           {{- with .Values.attentionBackend }}
             - name: KAIRYU_ATTENTION_BACKEND
@@ -48,17 +77,58 @@ spec:
                 fieldRef:
                   fieldPath: metadata.uid
           {{- end }}
+          {{- if and .Values.gracefulDrain.enabled .Values.gracefulDrain.auth.secretName }}
+            - name: KAIRYU_HELM_DRAIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.gracefulDrain.auth.secretName | quote }}
+                  key: {{ .Values.gracefulDrain.auth.secretKey | quote }}
+          {{- end }}
           {{- end }}
           ports:
-            - containerPort: 8000
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
           readinessProbe:
             httpGet:
               path: /readyz
-              port: 8000
+              port: http
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
           livenessProbe:
             httpGet:
               path: /health
-              port: 8000
+              port: http
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          {{- if .Values.gracefulDrain.enabled }}
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - >-
+                    python -c 'import os, urllib.request;
+                    token = (os.environ.get("KAIRYU_HELM_DRAIN_TOKEN") or "").strip();
+                    headers = {"Authorization": "Bearer " + token} if token else {};
+                    request = urllib.request.Request(
+                    "http://127.0.0.1:8000/admin/drain",
+                    headers=headers, method="POST");
+                    urllib.request.urlopen(request, timeout=5).read()';
+                    status=$?;
+                    sleep {{ .Values.gracefulDrain.propagationSeconds }};
+                    exit "$status"
+          {{- end }}
           volumeMounts:
             - name: config
               mountPath: /etc/kairyu

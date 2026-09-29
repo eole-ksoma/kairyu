@@ -13,6 +13,15 @@ data:
       host: 0.0.0.0
       port: 8000
       max_concurrency: 128
+    engines:
+      async-smoke:
+        backend: mock
+        options:
+          latency_s: 5.0
+      async-failover-smoke:
+        backend: mock
+        options:
+          latency_s: 30.0
     pools:
       f1a:
         discovery:
@@ -29,7 +38,7 @@ data:
         placement_log_path: /evidence/placements.jsonl
     # This dynamic mock pool has no local tokenizer metadata. Preserve the
     # formal gate's historical framing through an explicit model policy.
-    legacy_chat_models: [f1a]
+    legacy_chat_models: [f1a, async-smoke, async-failover-smoke]
     batch:
       store: postgres
       store_id: kairyu-f1c
@@ -37,6 +46,17 @@ data:
       poll_interval_s: 0.1
       lease_seconds: 3
       max_concurrency: 1
+    async_requests:
+      dsn_env: KAIRYU_ASYNC_REQUEST_POSTGRES_DSN
+      store_id: kairyu-f1c-async
+      max_concurrency: 1
+      max_body_bytes: 1048576
+      max_records_per_tenant: 64
+      poll_interval_s: 0.1
+      lease_seconds: 3
+      request_retention_s: 60
+      audit_retention_s: 86400
+      retention_batch_size: 2
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -87,6 +107,15 @@ spec:
                   name: f1c-postgres
                   key: dsn
             - name: KAIRYU_BATCH_WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: KAIRYU_ASYNC_REQUEST_POSTGRES_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: f1c-postgres
+                  key: dsn
+            - name: KAIRYU_ASYNC_REQUEST_WORKER_ID
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.uid
@@ -210,6 +239,15 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.uid
+            - name: KAIRYU_ASYNC_REQUEST_POSTGRES_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: f1c-postgres
+                  key: dsn
+            - name: KAIRYU_ASYNC_REQUEST_WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
             - name: KAIRYU_GATEWAY_ID
               value: b
           ports:
@@ -327,6 +365,15 @@ spec:
                   name: f1c-postgres
                   key: dsn
             - name: KAIRYU_BATCH_WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: KAIRYU_ASYNC_REQUEST_POSTGRES_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: f1c-postgres
+                  key: dsn
+            - name: KAIRYU_ASYNC_REQUEST_WORKER_ID
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.uid

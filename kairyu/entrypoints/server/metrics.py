@@ -8,6 +8,10 @@ passive (m5 D4).
 
 from __future__ import annotations
 
+import logging
+import math
+import threading
+import time
 from collections.abc import Iterator
 
 from prometheus_client import (
@@ -20,7 +24,14 @@ from prometheus_client import (
 )
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily, Metric
 
+from kairyu.async_requests.models import AsyncRequestState
+from kairyu.async_requests.store import (
+    ASYNC_REQUEST_TRANSITION_EVENTS,
+    RequestQueueMetricsSnapshot,
+)
 from kairyu.orchestration.replica import ReplicaPool
+
+logger = logging.getLogger("kairyu.server.metrics")
 
 _PREPLACEMENT_ENDPOINTS = frozenset(
     {"chat", "completions", "responses", "messages", "route", "batch"}
@@ -34,6 +45,174 @@ _PREPLACEMENT_PHASES = frozenset(
         "admission",
     }
 )
+
+
+class _AsyncRequestStoreCollector:
+    """Fail-open cached view over shared durable request stores.
+
+    Blocking backends perform their first warmup in the metrics worker thread,
+    after application startup, then refresh in the background at a bounded
+    frequency. The ASGI event loop never performs the store query.
+    """
+
+    _REFRESH_INTERVAL_S = 1.0
+
+    def __init__(self) -> None:
+        self._stores: dict[str, object] = {}
+        self._last_good: dict[str, RequestQueueMetricsSnapshot] = {}
+        self._snapshot_ok: dict[str, bool] = {}
+        self._last_refresh_started: dict[str, float] = {}
+        self._refreshing: set[str] = set()
+        self._attempted: set[str] = set()
+        self._lock = threading.RLock()
+
+    def add(self, store: object) -> None:
+        snapshot = getattr(store, "metrics_snapshot", None)
+        store_id = getattr(store, "store_id", None)
+        if callable(snapshot) and isinstance(store_id, str) and store_id:
+            with self._lock:
+                self._stores[store_id] = store
+                self._snapshot_ok.setdefault(store_id, False)
+
+    def _refresh(self, store_id: str, store: object) -> None:
+        try:
+            snapshot = self._validate(store.metrics_snapshot())
+        except Exception:
+            logger.warning(
+                "async request metrics snapshot failed for store %r",
+                store_id,
+                exc_info=True,
+            )
+            with self._lock:
+                self._snapshot_ok[store_id] = False
+        else:
+            with self._lock:
+                self._last_good[store_id] = snapshot
+                self._snapshot_ok[store_id] = True
+        finally:
+            with self._lock:
+                self._refreshing.discard(store_id)
+
+    def _schedule_refresh(
+        self,
+        store_id: str,
+        store: object,
+        *,
+        force: bool = False,
+    ) -> None:
+        now = time.monotonic()
+        with self._lock:
+            last_started = self._last_refresh_started.get(store_id, float("-inf"))
+            if store_id in self._refreshing or (
+                not force and now - last_started < self._REFRESH_INTERVAL_S
+            ):
+                return
+            self._refreshing.add(store_id)
+            self._attempted.add(store_id)
+            self._last_refresh_started[store_id] = now
+        threading.Thread(
+            target=self._refresh,
+            args=(store_id, store),
+            name=f"kairyu-async-metrics-{store_id}",
+            daemon=True,
+        ).start()
+
+    @staticmethod
+    def _empty_snapshot() -> RequestQueueMetricsSnapshot:
+        return RequestQueueMetricsSnapshot(
+            state_counts={state: 0 for state in AsyncRequestState},
+            oldest_queued_age_seconds=0.0,
+            transition_counts={
+                event: 0 for event in ASYNC_REQUEST_TRANSITION_EVENTS
+            },
+        )
+
+    @staticmethod
+    def _validate(snapshot: object) -> RequestQueueMetricsSnapshot:
+        if not isinstance(snapshot, RequestQueueMetricsSnapshot):
+            raise TypeError("async request metrics source returned an invalid snapshot")
+        counts = tuple(snapshot.state_counts.get(state, 0) for state in AsyncRequestState)
+        transitions = tuple(
+            snapshot.transition_counts.get(event, 0)
+            for event in ASYNC_REQUEST_TRANSITION_EVENTS
+        )
+        if any(type(value) is not int or value < 0 for value in (*counts, *transitions)):
+            raise ValueError("async request metric counts must be non-negative integers")
+        age = snapshot.oldest_queued_age_seconds
+        if not isinstance(age, (int, float)) or not math.isfinite(age) or age < 0:
+            raise ValueError("async request oldest queue age must be finite and non-negative")
+        return snapshot
+
+    def collect(self) -> Iterator[Metric]:
+        states = GaugeMetricFamily(
+            "kairyu_async_request_state",
+            "Shared durable requests by bounded lifecycle state",
+            labels=["store", "state"],
+        )
+        depth = GaugeMetricFamily(
+            "kairyu_async_request_queue_depth",
+            "Current non-expired queued requests in the shared durable store",
+            labels=["store"],
+        )
+        oldest = GaugeMetricFamily(
+            "kairyu_async_request_oldest_queued_age_seconds",
+            "Age of the oldest non-expired queued request, or zero when empty",
+            labels=["store"],
+        )
+        transitions = CounterMetricFamily(
+            "kairyu_async_request_transitions",
+            "Durable lifecycle transition events by bounded event",
+            labels=["store", "event"],
+        )
+        attempts = CounterMetricFamily(
+            "kairyu_async_request_attempts",
+            "Durable execution attempts, including lease reclaims",
+            labels=["store"],
+        )
+        success = GaugeMetricFamily(
+            "kairyu_async_request_metrics_snapshot_success",
+            "Whether the current shared-store metrics snapshot succeeded",
+            labels=["store"],
+        )
+        with self._lock:
+            stores = tuple(self._stores.items())
+        for store_id, store in stores:
+            if bool(getattr(store, "metrics_snapshot_nonblocking", False)):
+                self._refresh(store_id, store)
+            else:
+                with self._lock:
+                    first_refresh = store_id not in self._attempted
+                    if first_refresh:
+                        self._attempted.add(store_id)
+                        self._refreshing.add(store_id)
+                        self._last_refresh_started[store_id] = time.monotonic()
+                if first_refresh:
+                    self._refresh(store_id, store)
+                else:
+                    self._schedule_refresh(store_id, store)
+            with self._lock:
+                snapshot_ok = self._snapshot_ok.get(store_id, False)
+                snapshot = self._last_good.get(store_id, self._empty_snapshot())
+            for state in AsyncRequestState:
+                states.add_metric(
+                    [store_id, state.value],
+                    snapshot.state_counts.get(state, 0),
+                )
+            depth.add_metric([store_id], snapshot.queue_depth)
+            oldest.add_metric([store_id], snapshot.oldest_queued_age_seconds)
+            for event in ASYNC_REQUEST_TRANSITION_EVENTS:
+                transitions.add_metric(
+                    [store_id, event],
+                    snapshot.transition_counts.get(event, 0),
+                )
+            attempts.add_metric([store_id], snapshot.attempts_total)
+            success.add_metric([store_id], 1.0 if snapshot_ok else 0.0)
+        yield states
+        yield depth
+        yield oldest
+        yield transitions
+        yield attempts
+        yield success
 
 
 class _PoolCollector:
@@ -472,11 +651,13 @@ class ServerMetrics:
         self._cuda_graph_collector = _CudaGraphCollector()
         self._tenant_limiter_collector = _TenantLimiterCollector()
         self._slo_admission_collector = _SLOAdmissionCollector()
+        self._async_request_store_collector = _AsyncRequestStoreCollector()
         self.registry.register(self._pool_collector)
         self.registry.register(self._scheduler_collector)
         self.registry.register(self._cuda_graph_collector)
         self.registry.register(self._tenant_limiter_collector)
         self.registry.register(self._slo_admission_collector)
+        self.registry.register(self._async_request_store_collector)
 
     def track_pool(self, name: str, pool: ReplicaPool) -> None:
         self._pool_collector.add(name, pool)
@@ -492,6 +673,9 @@ class ServerMetrics:
 
     def track_slo_admission(self, controller: object) -> None:
         self._slo_admission_collector.set(controller)
+
+    def track_async_request_store(self, store: object) -> None:
+        self._async_request_store_collector.add(store)
 
     def set_admission_depth(self, *, active: int, waiting: int) -> None:
         self.admission_active_requests.set(active)

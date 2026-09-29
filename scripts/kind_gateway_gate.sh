@@ -8,7 +8,7 @@ usage: scripts/kind_gateway_gate.sh [--keep-cluster]
 
 Environment overrides:
   KIND, KUBECTL, DOCKER, UV, GIT, TAR, TIMEOUT, CURL
-  F1C_CLUSTER_NAME, F1C_RESULTS_DIR
+  F1C_CLUSTER_NAME, F1C_RESULTS_DIR, F1C_REFUSE_EXISTING_CLUSTER
 
 This is the one binding CPU-only F1c integration test. It intentionally does not rerun
 F1a churn, F1b rollout, a GPU workload, or a latency threshold.
@@ -54,6 +54,9 @@ MANIFEST_DIR=deploy/kind/f1c
 GATEWAY_URL=http://127.0.0.1:18082
 NAMESPACE=kairyu-f1c
 REPLICA_COUNT=12
+REFUSE_EXISTING_CLUSTER=${F1C_REFUSE_EXISTING_CLUSTER:-0}
+GATE_LOCK_HELD=${F1C_GATE_LOCK_HELD:-0}
+GATE_LOCK_DIR=/tmp/kairyu-f1c-kind-gate.lock
 
 GATEWAY_IMAGE=kairyu:dev
 MOCK_IMAGE=kairyu-f1a-mock:dev
@@ -85,53 +88,23 @@ if [[ ! "$CLUSTER_NAME" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
   echo "F1C_CLUSTER_NAME must be a valid DNS label" >&2
   exit 1
 fi
+if [[ "$REFUSE_EXISTING_CLUSTER" != 0 && "$REFUSE_EXISTING_CLUSTER" != 1 ]]; then
+  echo "F1C_REFUSE_EXISTING_CLUSTER must be 0 or 1" >&2
+  exit 1
+fi
+if [[ "$GATE_LOCK_HELD" != 0 && "$GATE_LOCK_HELD" != 1 ]]; then
+  echo "F1C_GATE_LOCK_HELD must be 0 or 1" >&2
+  exit 1
+fi
 if [[ ! -f "$KIND_CONFIG" || ! -f "${MANIFEST_DIR}/kustomization.yaml" ]]; then
   echo "committed F1c kind inputs are incomplete" >&2
   exit 1
 fi
 
-mkdir -p "$RESULTS_DIR"
-known_results=(
-  manifest.json
-  verifier.json
-  traffic.jsonl
-  gateway-pods.jsonl
-  replica-pods.jsonl
-  postgres-pods.jsonl
-  gateway-cri-image.json
-  mock-cri-image.json
-  postgres-cri-image.json
-  postgres-docker-image.json
-  store-identities.jsonl
-  batch-http.jsonl
-  batch-lifecycle.jsonl
-  batch-claims.jsonl
-  lb-decisions.jsonl
-  placements-a.jsonl
-  placements-b.jsonl
-  placements-c.jsonl
-  batch-output-a.jsonl
-  batch-output-b.jsonl
-  batch-output-c.jsonl
-  rendered-manifest.yaml
-  kubernetes-final.txt
-  live-applied.yaml
-  events.txt
-  runtime-images.txt
-  postgres.log
-  lb.log
-  gateway-a.log
-  gateway-b.log
-  gateway-c.log
-  failure.txt
-)
-for result_name in "${known_results[@]}"; do
-  rm -f -- "${RESULTS_DIR}/${result_name}"
-done
-
 CLUSTER_CREATED=0
 CLUSTER_MAY_EXIST=0
 SOURCE_ARCHIVE_DIR=
+GATE_LOCK_OWNED=0
 
 collect_evidence() {
   if ((CLUSTER_CREATED == 0)); then
@@ -184,7 +157,13 @@ cleanup() {
         echo "refusing to remove unexpected source path ${SOURCE_ARCHIVE_DIR}" >&2
         cleanup_failed=1
         ;;
-    esac
+      esac
+  fi
+  if ((GATE_LOCK_OWNED == 1)); then
+    if ! rmdir -- "$GATE_LOCK_DIR"; then
+      echo "failed to release F1c gate lock ${GATE_LOCK_DIR}" >&2
+      cleanup_failed=1
+    fi
   fi
   if ((status == 0 && cleanup_failed != 0)); then
     status=1
@@ -192,6 +171,56 @@ cleanup() {
   exit "$status"
 }
 trap cleanup EXIT
+
+if ((GATE_LOCK_HELD == 0)); then
+  if ! mkdir -- "$GATE_LOCK_DIR"; then
+    echo "another F1c/AsyncRequest kind gate owns ${GATE_LOCK_DIR}" >&2
+    exit 1
+  fi
+  GATE_LOCK_OWNED=1
+elif [[ ! -d "$GATE_LOCK_DIR" ]]; then
+  echo "external F1c gate lock is not present: ${GATE_LOCK_DIR}" >&2
+  exit 1
+fi
+
+mkdir -p "$RESULTS_DIR"
+known_results=(
+  manifest.json
+  verifier.json
+  traffic.jsonl
+  gateway-pods.jsonl
+  replica-pods.jsonl
+  postgres-pods.jsonl
+  gateway-cri-image.json
+  mock-cri-image.json
+  postgres-cri-image.json
+  postgres-docker-image.json
+  store-identities.jsonl
+  batch-http.jsonl
+  batch-lifecycle.jsonl
+  batch-claims.jsonl
+  lb-decisions.jsonl
+  placements-a.jsonl
+  placements-b.jsonl
+  placements-c.jsonl
+  batch-output-a.jsonl
+  batch-output-b.jsonl
+  batch-output-c.jsonl
+  rendered-manifest.yaml
+  kubernetes-final.txt
+  live-applied.yaml
+  events.txt
+  runtime-images.txt
+  postgres.log
+  lb.log
+  gateway-a.log
+  gateway-b.log
+  gateway-c.log
+  failure.txt
+)
+for result_name in "${known_results[@]}"; do
+  rm -f -- "${RESULTS_DIR}/${result_name}"
+done
 
 SOURCE_COMMIT=$("$GIT" rev-parse HEAD)
 source_inputs=(
@@ -283,15 +312,18 @@ for digest in \
   fi
 done
 
-mapfile -t existing_clusters < <("$KIND" get clusters)
-for existing in "${existing_clusters[@]}"; do
+while IFS= read -r existing; do
   if [[ "$existing" == "$CLUSTER_NAME" ]]; then
+    if ((REFUSE_EXISTING_CLUSTER == 1)); then
+      echo "kind cluster ${CLUSTER_NAME} already exists" >&2
+      exit 1
+    fi
     CLUSTER_MAY_EXIST=1
     run_bounded 120s "$KIND" delete cluster --name "$CLUSTER_NAME"
     CLUSTER_MAY_EXIST=0
     break
   fi
-done
+done < <("$KIND" get clusters)
 
 CLUSTER_MAY_EXIST=1
 "$KIND" create cluster \
@@ -302,7 +334,10 @@ CLUSTER_CREATED=1
 "$KIND" load docker-image \
   "$GATEWAY_IMAGE" "$MOCK_IMAGE" "$POSTGRES_LOAD_IMAGE" \
   --name "$CLUSTER_NAME"
-mapfile -t kind_nodes < <("$KIND" get nodes --name "$CLUSTER_NAME")
+kind_nodes=()
+while IFS= read -r kind_node; do
+  kind_nodes+=("$kind_node")
+done < <("$KIND" get nodes --name "$CLUSTER_NAME")
 if ((${#kind_nodes[@]} != 1)); then
   echo "expected one F1c kind node, found ${#kind_nodes[@]}" >&2
   exit 1

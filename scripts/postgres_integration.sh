@@ -9,6 +9,15 @@ PASSWORD="kairyu-test"
 DATABASE="kairyu_test"
 READY_ATTEMPTS=${KAIRYU_TEST_POSTGRES_READY_ATTEMPTS:-60}
 
+if command -v uv >/dev/null 2>&1; then
+  PYTHON_RUN=(uv run --frozen)
+elif command -v poetry >/dev/null 2>&1; then
+  PYTHON_RUN=(poetry run)
+else
+  echo "PostgreSQL integration requires uv or poetry" >&2
+  exit 2
+fi
+
 if [[ ! "$READY_ATTEMPTS" =~ ^[1-9][0-9]*$ ]]; then
   echo "KAIRYU_TEST_POSTGRES_READY_ATTEMPTS must be a positive integer" >&2
   exit 2
@@ -26,7 +35,7 @@ cleanup() {
 trap cleanup EXIT
 
 cd "$REPO_ROOT"
-uv run --frozen python scripts/test_prerequisites.py \
+"${PYTHON_RUN[@]}" python scripts/test_prerequisites.py \
   --require-executable docker \
   --require-module psycopg
 
@@ -43,7 +52,7 @@ port=${binding##*:}
 export KAIRYU_TEST_POSTGRES_DSN="postgresql://postgres:${PASSWORD}@127.0.0.1:${port}/${DATABASE}"
 
 postgres_ready() {
-  uv run --frozen python -c \
+  "${PYTHON_RUN[@]}" python -c \
     'import os, psycopg; connection = psycopg.connect(os.environ["KAIRYU_TEST_POSTGRES_DSN"], connect_timeout=2); assert connection.execute("SELECT 1").fetchone() == (1,); connection.close()' \
     >/dev/null 2>&1
 }
@@ -65,5 +74,10 @@ if [[ "$ready" != true ]]; then
   exit 1
 fi
 
-uv run --frozen pytest --fail-on-skip \
-  -m postgres tests/unit/test_postgres_batch_store.py -v --no-cov
+"${PYTHON_RUN[@]}" pytest --fail-on-skip \
+  -m postgres \
+  tests/unit/test_postgres_batch_store.py \
+  tests/unit/test_postgres_runner_leadership.py \
+  tests/unit/test_postgres_runner_scaling_log.py \
+  tests/unit/test_postgres_request_store.py \
+  -v --no-cov

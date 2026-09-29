@@ -1,8 +1,12 @@
 """/health, /readyz, /metrics (goal G3 gate C6)."""
 
+import asyncio
+import threading
+
 import httpx
 import pytest
 
+from kairyu.async_requests import AsyncRequestState
 from kairyu.deploy.prober import HealthProber
 from kairyu.engine.backend import GenerationRequest
 from kairyu.engine.mock import MockBackend
@@ -46,6 +50,34 @@ async def test_health_and_readyz_ok():
     assert health.json() == {"status": "ok"}
     assert ready.status_code == 200
     assert ready.json() == {"status": "ready"}
+
+
+async def test_blocked_metrics_render_does_not_block_health() -> None:
+    app = create_legacy_app(engines={"m": MockBackend()})
+    render_started = threading.Event()
+    release_render = threading.Event()
+    original_render = app.state.metrics.render
+
+    def blocking_render():
+        render_started.set()
+        assert release_render.wait(2)
+        return original_render()
+
+    app.state.metrics.render = blocking_render
+    watchdog = threading.Timer(1, release_render.set)
+    watchdog.start()
+    try:
+        async with _client(app) as client:
+            metrics_task = asyncio.create_task(client.get("/metrics"))
+            assert await asyncio.to_thread(render_started.wait, 0.5)
+            assert not release_render.is_set()
+            health = await asyncio.wait_for(client.get("/health"), timeout=0.5)
+            assert health.status_code == 200
+            release_render.set()
+            assert (await metrics_task).status_code == 200
+    finally:
+        release_render.set()
+        watchdog.cancel()
 
 
 async def test_readyz_503_when_pool_has_no_healthy_replica():
@@ -195,6 +227,69 @@ def test_preplacement_phase_metrics_are_bounded_and_rendered():
         metrics.record_preplacement_phase("attacker-model", "admission", 1)
     with pytest.raises(ValueError, match="invalid preplacement phase"):
         metrics.record_preplacement_phase("chat", "attacker-phase", 1)
+
+
+def test_async_store_metrics_fail_open_and_retain_last_good_snapshot() -> None:
+    from kairyu.async_requests import RequestQueueMetricsSnapshot
+
+    class _Store:
+        store_id = "durable"
+        metrics_snapshot_nonblocking = True
+
+        def __init__(self) -> None:
+            self.fail = False
+
+        def metrics_snapshot(self):
+            if self.fail:
+                raise RuntimeError("database unavailable")
+            return RequestQueueMetricsSnapshot(
+                state_counts={AsyncRequestState.QUEUED: 3},
+                oldest_queued_age_seconds=12.5,
+                transition_counts={"claim": 7, "reclaim": 2},
+            )
+
+    store = _Store()
+    metrics = ServerMetrics()
+    metrics.track_async_request_store(store)
+    healthy = metrics.render()[0].decode()
+    store.fail = True
+    degraded = metrics.render()[0].decode()
+
+    assert 'kairyu_async_request_queue_depth{store="durable"} 3.0' in healthy
+    assert 'kairyu_async_request_oldest_queued_age_seconds{store="durable"} 12.5' in healthy
+    assert 'kairyu_async_request_attempts_total{store="durable"} 9.0' in healthy
+    assert 'kairyu_async_request_metrics_snapshot_success{store="durable"} 1.0' in healthy
+    assert 'kairyu_async_request_queue_depth{store="durable"} 3.0' in degraded
+    assert 'kairyu_async_request_metrics_snapshot_success{store="durable"} 0.0' in degraded
+
+
+def test_blocking_async_store_warms_only_on_first_render() -> None:
+    from kairyu.async_requests import RequestQueueMetricsSnapshot
+
+    class _Store:
+        store_id = "durable"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def metrics_snapshot(self):
+            self.calls += 1
+            return RequestQueueMetricsSnapshot(
+                state_counts={AsyncRequestState.QUEUED: 2},
+                oldest_queued_age_seconds=4.0,
+                transition_counts={},
+            )
+
+    store = _Store()
+    metrics = ServerMetrics()
+    metrics.track_async_request_store(store)
+    assert store.calls == 0
+
+    rendered = metrics.render()[0].decode()
+
+    assert store.calls == 1
+    assert 'kairyu_async_request_queue_depth{store="durable"} 2.0' in rendered
+    assert 'kairyu_async_request_metrics_snapshot_success{store="durable"} 1.0' in rendered
 
 
 def test_metrics_exposes_live_cuda_graph_eager_fallback_counter() -> None:

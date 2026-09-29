@@ -57,6 +57,11 @@ SHA-256 to the child process as `KAIRYU_CORRECTNESS_*` environment variables.
 Gate-specific artifacts retain their existing schemas and default
 `bench/results/` paths; the standardized execution envelope is additive.
 
+The CPU-only durable-request deployment gate is registered as
+`verification/fleet/resilience/async_request_gateway_smoke.py` and is normally
+run through `scripts/kind_async_request_gate.sh`, which provisions its F1c kind
+topology before invoking the entrypoint.
+
 
 Every registered entrypoint must have a module docstring, a non-executing
 `--help`, an exact registry record, and documentation that names its path.

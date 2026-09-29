@@ -1435,6 +1435,159 @@ batch:
         build_app_from_spec(spec)
 
 
+def test_async_request_config_and_validation():
+    spec = load_deployment_spec(
+        """
+engines:
+  m: { backend: mock }
+async_requests:
+  dsn_env: TEST_ASYNC_DSN
+  store_id: fleet-requests
+  max_concurrency: 3
+  max_body_bytes: 123456
+  max_records_per_tenant: 4321
+  poll_interval_s: 0.1
+  lease_seconds: 5
+  request_retention_s: 86400
+  audit_retention_s: 604800
+  retention_batch_size: 750
+""",
+        resolve_credentials=False,
+    )
+
+    assert spec.async_requests is not None
+    assert spec.async_requests.dsn_env == "TEST_ASYNC_DSN"
+    assert spec.async_requests.store_id == "fleet-requests"
+    assert spec.async_requests.max_concurrency == 3
+    assert spec.async_requests.max_body_bytes == 123456
+    assert spec.async_requests.max_records_per_tenant == 4321
+    assert spec.async_requests.poll_interval_s == 0.1
+    assert spec.async_requests.lease_seconds == 5
+    assert spec.async_requests.request_retention_s == 86400
+    assert spec.async_requests.audit_retention_s == 604800
+    assert spec.async_requests.retention_batch_size == 750
+
+    for invalid, message in (
+        ("dsn_env: invalid-name", "dsn_env"),
+        ("store_id: '   '", "store_id must be a non-empty PostgreSQL identity"),
+        ("unknown: value", "extra_forbidden"),
+        ("request_retention_s: 0", "request_retention_s"),
+        ("audit_retention_s: .nan", "audit_retention_s"),
+        ("retention_batch_size: 10001", "retention_batch_size"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            load_deployment_spec(
+                f"""
+engines:
+  m: {{ backend: mock }}
+async_requests:
+  {invalid}
+""",
+                resolve_credentials=False,
+            )
+
+
+def test_async_request_dsn_fails_before_owned_backends_are_built(monkeypatch):
+    monkeypatch.delenv("TEST_ASYNC_DSN", raising=False)
+    spec = load_deployment_spec(
+        """
+engines:
+  m: { backend: mock }
+async_requests:
+  dsn_env: TEST_ASYNC_DSN
+"""
+    )
+
+    def unexpected_backend(*args, **kwargs):
+        raise AssertionError("backend construction must not run before request preflight")
+
+    monkeypatch.setattr(builder_module, "create_backend", unexpected_backend)
+    with pytest.raises(ValueError, match="TEST_ASYNC_DSN.*is not set"):
+        build_app_from_spec(spec)
+
+
+async def test_builder_wires_async_request_routes_worker_and_store_lifespan(
+    monkeypatch,
+):
+    from kairyu.async_requests import postgres_store as request_store_module
+    from kairyu.async_requests.store import InMemoryRequestStore
+
+    stores = []
+
+    class FakePostgresRequestStore(InMemoryRequestStore):
+        def __init__(
+            self,
+            dsn: str,
+            *,
+            store_id: str,
+            eager_connect: bool = True,
+            max_records_per_owner: int = 64,
+        ) -> None:
+            super().__init__(
+                store_id=store_id,
+                max_records_per_owner=max_records_per_owner,
+            )
+            self.dsn = dsn
+            self.eager_connect = eager_connect
+            self.started = False
+            self.closed = False
+            stores.append(self)
+
+        async def startup(self) -> None:
+            self.started = True
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setenv("TEST_ASYNC_DSN", "postgresql://request-store")
+    monkeypatch.setattr(
+        request_store_module,
+        "PostgresRequestStore",
+        FakePostgresRequestStore,
+    )
+    spec = load_deployment_spec(
+        """
+engines:
+  m: { backend: mock }
+legacy_chat_models: [m]
+async_requests:
+  dsn_env: TEST_ASYNC_DSN
+  store_id: fleet-requests
+  max_concurrency: 1
+  max_body_bytes: 256
+  poll_interval_s: 0.05
+  lease_seconds: 1
+"""
+    )
+    app = build_app_from_spec(spec)
+
+    assert app.state.async_request_store is stores[0]
+    assert app.state.async_request_worker._store is stores[0]
+    assert stores[0].eager_connect is False
+    assert stores[0].started is False
+    async with app.router.lifespan_context(app):
+        assert stores[0].started is True
+        async with _client(app) as client:
+            submitted = await client.post(
+                "/v1/async/chat/completions",
+                json=_chat_body("durable", model="m"),
+            )
+            oversized = await client.post(
+                "/v1/async/chat/completions",
+                json=_chat_body("x" * 512, model="m"),
+            )
+            assert oversized.status_code == 413
+            request_id = submitted.json()["request"]["id"]
+            async with asyncio.timeout(1):
+                while True:
+                    status = await client.get(f"/v1/requests/{request_id}")
+                    if status.json()["state"] == "succeeded":
+                        break
+                    await asyncio.sleep(0.01)
+
+    assert stores[0].closed is True
+
+
 async def test_tenant_auth_uses_the_preflight_key_snapshots(monkeypatch):
     monkeypatch.setenv("KAIRYU_DEPLOYMENT_KEYS", "key-a,key-b")
     monkeypatch.setenv("KAIRYU_DEPLOYMENT_ADMIN_KEYS", "admin-a,admin-b")

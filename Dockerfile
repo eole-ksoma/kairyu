@@ -18,6 +18,7 @@ RUN set -eu; \
     esac
 COPY kairyu ./kairyu
 COPY scripts/prefetch_embedding_model.py ./scripts/prefetch_embedding_model.py
+COPY scripts/async_request_retention.py ./scripts/async_request_retention.py
 RUN set -eu; \
     case "$KAIRYU_EMBEDDINGS:$KAIRYU_VISION" in \
       0:0) uv sync --frozen --no-dev --extra fleet --extra otel ;; \

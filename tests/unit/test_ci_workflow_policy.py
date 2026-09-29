@@ -213,7 +213,7 @@ esac
     )
 
 
-def test_f1c_pull_requests_always_run_the_real_gateway_gate() -> None:
+def test_f1c_pull_requests_always_run_the_real_gateway_and_async_request_gates() -> None:
     workflow, text = _load_workflow("f1c-gateway.yml")
     pull_request = workflow["on"]["pull_request"]
     jobs = workflow["jobs"]
@@ -227,9 +227,12 @@ def test_f1c_pull_requests_always_run_the_real_gateway_gate() -> None:
     assert "github.event.pull_request.labels" not in text
     step = _named_step(
         jobs["gateway"],
-        "Run the F1c Kubernetes integration test",
+        "Run the F1c and AsyncRequest Kubernetes integration tests",
     )
-    assert step["run"] == "bash scripts/kind_gateway_gate.sh"
+    assert step["run"] == "bash scripts/kind_async_request_gate.sh"
+    assert "kind_gateway_gate.sh" in Path("scripts/kind_async_request_gate.sh").read_text(
+        encoding="utf-8"
+    )
 
 
 def test_f2a_pull_requests_measure_and_replay_fresh_formal_evidence() -> None:
@@ -444,7 +447,9 @@ def test_postgres_integration_uses_one_local_reproducible_script() -> None:
     assert 'docker exec "$CONTAINER" pg_isready' not in script
     assert 'docker logs "$CONTAINER" >&2 || true' in script
     assert "--fail-on-skip" in script
-    assert "-m postgres tests/unit/test_postgres_batch_store.py" in script
+    assert "-m postgres" in script
+    assert "tests/unit/test_postgres_batch_store.py" in script
+    assert "tests/unit/test_postgres_request_store.py" in script
 
 
 def _postgres_integration_fake_env(

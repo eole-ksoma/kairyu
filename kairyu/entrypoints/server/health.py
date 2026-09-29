@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import Iterable, Mapping
 
@@ -812,5 +813,5 @@ def add_health_routes(
 
         @app.get("/metrics")
         async def metrics_endpoint() -> Response:
-            body, content_type = metrics.render()
+            body, content_type = await asyncio.to_thread(metrics.render)
             return Response(content=body, media_type=content_type)

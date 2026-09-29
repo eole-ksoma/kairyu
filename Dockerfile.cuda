@@ -100,3 +100,4 @@ CMD ["/etc/kairyu/config.yaml"]
 FROM runtime-payload AS base
 ARG KAIRYU_VCS_REF
 LABEL org.opencontainers.image.revision="${KAIRYU_VCS_REF}"
+ENV KAIRYU_VCS_REF="${KAIRYU_VCS_REF}"

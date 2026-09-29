@@ -713,6 +713,7 @@ def test_root_docker_context_is_an_explicit_source_allowlist():
         "!uv.lock",
         "!kairyu/**",
         "!scripts/prefetch_embedding_model.py",
+        "!scripts/async_request_retention.py",
         "!deploy/compose/Dockerfile.webui-browser",
         "!deploy/compose/webui-browser/package.json",
         "!deploy/compose/webui-browser/package-lock.json",

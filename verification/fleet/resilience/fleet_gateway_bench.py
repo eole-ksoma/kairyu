@@ -53,6 +53,7 @@ _HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _IMAGE_DIGEST = re.compile(r"^(?:[^@\s]+@)?sha256:[0-9a-f]{64}$")
 _RUNTIME_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+_CROSS_PROCESS_CLOCK_SKEW_NS = 5_000_000
 
 RAW_ARTIFACTS = (
     "traffic.jsonl",
@@ -87,6 +88,32 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def wall_clock_envelope_contains(
+    outer_started_ns: object,
+    inner_started_ns: object,
+    inner_finished_ns: object,
+    outer_finished_ns: object,
+    *,
+    tolerance_ns: int = _CROSS_PROCESS_CLOCK_SKEW_NS,
+) -> bool:
+    """Compare host/container wall clocks with one explicit narrow tolerance."""
+    values = (
+        outer_started_ns,
+        inner_started_ns,
+        inner_finished_ns,
+        outer_finished_ns,
+    )
+    return (
+        type(tolerance_ns) is int
+        and tolerance_ns >= 0
+        and all(type(value) is int for value in values)
+        and outer_started_ns <= outer_finished_ns
+        and inner_started_ns <= inner_finished_ns
+        and outer_started_ns - tolerance_ns <= inner_started_ns
+        and inner_finished_ns <= outer_finished_ns + tolerance_ns
+    )
 
 
 def _safe_artifact_path(root: Path, name: object) -> Path:
@@ -1990,14 +2017,12 @@ def verify_evidence(results_dir: str | Path) -> dict[str, Any]:
                     )
                 )
             )
-            and type(row.get("started_unix_ns")) is int
-            and type(row.get("ended_unix_ns")) is int
-            and type(decision.get("started_ns")) is int
-            and type(decision.get("finished_ns")) is int
-            and row["started_unix_ns"]
-            <= decision["started_ns"]
-            <= decision["finished_ns"]
-            <= row["ended_unix_ns"]
+            and wall_clock_envelope_contains(
+                row.get("started_unix_ns"),
+                decision.get("started_ns"),
+                decision.get("finished_ns"),
+                row.get("ended_unix_ns"),
+            )
             and decision.get("candidate_gateway_ids")
             == list(rendezvous_order(row["session"], GATEWAY_IDS))
             and attempts_are_exact(row, decision)

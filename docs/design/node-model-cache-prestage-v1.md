@@ -1,9 +1,10 @@
 # Node model cache pre-stage v1
 
 Status: WP4.7 implemented as fenced controller commands, placement-level
-claim/CAS, verified node execution, owner-scoped cache pins, and status
-projection. Command transport, a shared durable command-store backend, and
-Kubernetes node binding remain deployment wiring.
+claim/CAS, verified node execution, owner-scoped cache pins, status projection,
+and a shared durable PostgreSQL command store. Command transport and Kubernetes
+node binding remain deployment wiring; safe released-placement tombstone
+compaction remains a separate store-lifecycle task.
 
 ## Purpose
 
@@ -80,6 +81,30 @@ specification for tests and development. Production must provide the same
 linearizable operations over a shared durable store. Its CAS must persist the
 full JSON record, not only state strings or generations.
 
+`PostgresNodeModelPrestageStore` is that production adapter. One registry row
+binds a stable store ID to exactly one node ID, schema version, and placement
+capacity. Every mutation locks that row with `FOR UPDATE`, validates the full
+stored record against projected placement, command, generation, fencing,
+revision, state, and time columns, applies the same pure transition functions
+used by the in-memory specification, and atomically upserts the full JSONB
+record. The registry lock serializes capacity checks and placement CAS across
+processes; exact replays remain idempotent. Tables are schema-qualified,
+permanent ordinary `public` tables with strict column and constraint checks.
+Reconnect rejects a replaced namespace or incompatible store configuration.
+
+This first durable version deliberately takes one lock per node-scoped store,
+favoring linearizable fencing and bounded capacity over parallel placement
+mutation throughput. Deployments should allocate a distinct stable store ID per
+node. A later sharded design may replace the coarse lock only if it preserves
+the same transition and capacity semantics.
+
+Released `absent` records remain durable fencing tombstones and count against
+`max_placements`. The store fails closed at that bound. They must not be deleted
+merely because their command expired: doing so would discard the last accepted
+generation, leader fence, and target revision, allowing an older lineage to be
+treated as a new placement. Safe compaction therefore remains deployment work
+and must retain an equivalent durable high-water mark before reclaiming a row.
+
 ## Node execution and pins
 
 `NodeModelPrestageExecutor.execute()` validates the command against the GitOps
@@ -126,21 +151,24 @@ reauthorization can justify Runner creation.
 `private-ai-cloud-iac` must still provide:
 
 - authenticated controller-to-node command transport and per-node identity;
-- a shared durable `NodeModelPrestageStore` implementation with atomic
-  generation/fencing CAS and retention;
 - a node DaemonSet/service hosting the executor and WP4.2 cache agent;
 - reconciliation that replays desired ensure/release commands after restart;
+- bounded tombstone retention/compaction that durably preserves each retired
+  placement's generation, leader fence, and target-revision high-water marks;
 - scheduler/affinity enforcement for the placement binding;
 - metrics and audit export for command latency, bytes, attempts, failures, and
   pin reconciliation; and
 - live node-pool acceptance with real S3, NVMe, Kueue, and Runner startup.
 
-Until that wiring exists, the in-memory store is not production authority and
-the feature must remain disabled for production autoscaling.
+Until that wiring exists, the PostgreSQL store is durable authority but no
+production node agent consumes its work; the feature must remain disabled for
+production autoscaling.
 
 ## CPU verification
 
 Tests cover deterministic command hashing, exact generation allocation,
 admission and node binding, claim concurrency, expiry, verified fill and pin,
 idempotent replay, failure/retry, fresh fenced release, preservation of other
-pin owners, and exact monotonic status projection.
+pin owners, and exact monotonic status projection. Real PostgreSQL tests add
+cross-instance claim races, completion/release replay, shared capacity, store
+configuration mismatch, and projected-metadata corruption detection.

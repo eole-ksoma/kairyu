@@ -77,6 +77,7 @@ fi
 "${PYTHON_RUN[@]}" pytest --fail-on-skip \
   -m postgres \
   tests/unit/test_postgres_batch_store.py \
+  tests/unit/test_postgres_node_model_prestage.py \
   tests/unit/test_postgres_runner_leadership.py \
   tests/unit/test_postgres_runner_scaling_log.py \
   tests/unit/test_postgres_request_store.py \

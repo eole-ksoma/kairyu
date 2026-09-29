@@ -198,6 +198,15 @@ from kairyu.runners.startup_admission import (
     RunnerCachePlacementAdmissionPlan,
     RunnerCachePlacementAdmissionStore,
 )
+from kairyu.runners.startup_admission_api import (
+    KubernetesAdmissionRequest,
+    KubernetesAdmissionReview,
+    KubernetesAdmissionUserInfo,
+    KubernetesGroupVersionKind,
+    KubernetesGroupVersionResource,
+    RunnerCachePlacementAdmissionHealth,
+    create_runner_cache_placement_admission_app,
+)
 from kairyu.runners.startup_attestation import (
     DEFAULT_RUNNER_CLOCK_SKEW_TOLERANCE,
     RunnerCacheStartupAttestationError,
@@ -311,6 +320,13 @@ __all__ = [
     "RunnerCachePlacementAdmissionError",
     "RunnerCachePlacementAdmissionPlan",
     "RunnerCachePlacementAdmissionStore",
+    "KubernetesAdmissionRequest",
+    "KubernetesAdmissionReview",
+    "KubernetesAdmissionUserInfo",
+    "KubernetesGroupVersionKind",
+    "KubernetesGroupVersionResource",
+    "RunnerCachePlacementAdmissionHealth",
+    "create_runner_cache_placement_admission_app",
     "RUNNER_CACHE_STARTUP_BINDING_ANNOTATION",
     "RUNNER_CACHE_STARTUP_BINDING_ID_ANNOTATION",
     "RUNNER_CACHE_STARTUP_BINDING_LABEL",

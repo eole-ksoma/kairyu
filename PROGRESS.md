@@ -149,8 +149,12 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
   and release-identity high-water marks without consuming active placement
   capacity. D3.6 adds a shared PostgreSQL admission plan/claim store with
   cross-replica linearizable allocation, retry-safe rollback protection, and
-  replay-window plan rotation. Production AdmissionReview/webhook wiring,
-  scheduled compaction, and live environment acceptance remain.
+  replay-window plan rotation. D3.7 adds a strict AdmissionReview v1 HTTP
+  boundary with UID-bound decisions, Pod identity checks, bounded input and
+  concurrency, sanitized fail-closed errors, and deterministic JSON Patch
+  mutation. Executable webhook runtime/configuration, Kubernetes TLS and
+  admission resources, scheduled compaction, and live environment acceptance
+  remain.
 - Qwen3.8-Flash-Next MTP speculative decoding stays off in `qwen3.8-flash-next-dp2-8gpu` until upstream fixes vllm#53912 (prefix caching + MTP output corruption on hybrid GDN); single-stream decode 104 vs 175 tok/s
 - DTO-D15 (2026-08-26) changed the served tiered-example config: verify.sh coding/generic gates and the digest re-pin are pending before the example status can be claimed green again
 - Human sign-off pending on M2–M4 design reviews
@@ -159,6 +163,19 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
+
+### 2026-09-29 — [progress] Kubernetes placement admission transport
+- What: added the D3.7 AdmissionReview v1 HTTP boundary for Pod CREATE,
+  including strict JSON/schema limits, request-to-Pod identity checks,
+  server-clock observation, UID-bound allow/deny responses, deterministic RFC
+  6902 patches, replay handling, readiness, concurrency bounds, and sanitized
+  failure responses.
+- Why: the D3.4 controller and D3.6 shared store need a protocol-correct,
+  fail-closed API-server boundary before production webhook runtime and IaC can
+  safely consume them.
+- Refs: docs/design/node-model-cache-prestage-v1.md;
+  kairyu/runners/startup_admission_api.py;
+  tests/unit/test_runner_startup_admission_api.py
 
 ### 2026-09-29 — [progress] Shared incremental placement admission state
 - What: added a strict PostgreSQL plan/claim store for D3.4 with cross-replica

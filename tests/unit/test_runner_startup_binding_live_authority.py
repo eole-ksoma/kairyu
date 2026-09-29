@@ -16,8 +16,11 @@ from kairyu.artifacts import (
     NodeModelCacheResidentHint,
 )
 from kairyu.runners import (
+    ComposedRunnerCachePlacementBindingLiveStateSource,
     InMemoryRunnerLeaderLeaseStore,
     LeaderFencedRunnerController,
+    RunnerCachePlacementBindingAuthorizationDeniedError,
+    RunnerCachePlacementBindingCacheState,
     RunnerCachePlacementBindingLiveState,
     RunnerCachePlacementBindingPinEvidence,
     RunnerCachePlacementBindingTargetState,
@@ -392,6 +395,70 @@ class _Source:
         self.ready_calls.append((deadline_monotonic, backend_timeout_s))
 
 
+class _ComponentReaders:
+    def __init__(self, state: RunnerCachePlacementBindingLiveState) -> None:
+        self.state = state
+        self.current_values = [state.binding, state.binding]
+        self.calls: list[tuple[str, float, float]] = []
+        self.read_hook = None
+        self.ready_calls = 0
+
+    def _record(self, name, deadline_monotonic, backend_timeout_s):
+        self.calls.append((name, deadline_monotonic, backend_timeout_s))
+        if self.read_hook is not None:
+            self.read_hook(name)
+
+    def read_current(self, _candidate, *, deadline_monotonic: float, backend_timeout_s: float):
+        self._record("current", deadline_monotonic, backend_timeout_s)
+        return self.current_values.pop(0)
+
+    def read_decision(self, _binding, *, deadline_monotonic: float, backend_timeout_s: float):
+        self._record("decision", deadline_monotonic, backend_timeout_s)
+        return self.state.decision
+
+    def read_target(
+        self,
+        _binding,
+        _decision,
+        *,
+        deadline_monotonic: float,
+        backend_timeout_s: float,
+    ):
+        self._record("target", deadline_monotonic, backend_timeout_s)
+        return self.state.target
+
+    def read_quota(
+        self,
+        _binding,
+        _decision,
+        *,
+        deadline_monotonic: float,
+        backend_timeout_s: float,
+    ):
+        self._record("quota", deadline_monotonic, backend_timeout_s)
+        return self.state.quota_admission
+
+    def read_cache(
+        self,
+        _binding,
+        _decision,
+        *,
+        deadline_monotonic: float,
+        backend_timeout_s: float,
+    ):
+        self._record("cache", deadline_monotonic, backend_timeout_s)
+        return RunnerCachePlacementBindingCacheState(
+            prewarm_plan=self.state.prewarm_plan,
+            prestage_records=self.state.prestage_records,
+            placement_hints=self.state.placement_hints,
+            pin_evidence=self.state.pin_evidence,
+        )
+
+    def readiness(self, *, deadline_monotonic: float, backend_timeout_s: float) -> None:
+        self.ready_calls += 1
+        self._record("ready", deadline_monotonic, backend_timeout_s)
+
+
 def _live_state(
     decision: ScalingDecisionRecord,
     binding: RunnerCacheStartupBinding,
@@ -480,6 +547,24 @@ def _payload(binding: RunnerCacheStartupBinding):
         "nonce": NONCE,
         "binding": binding.model_dump(mode="json"),
     }
+
+
+def _binding_with_deployment(
+    binding: RunnerCacheStartupBinding, deployment_id: str
+) -> RunnerCacheStartupBinding:
+    payload = binding.model_dump(mode="json", exclude={"binding_id"})
+    payload["deployment_id"] = deployment_id
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode()
+    return RunnerCacheStartupBinding(
+        binding_id=hashlib.sha256(encoded).hexdigest(),
+        **payload,
+    )
 
 
 @pytest.mark.asyncio
@@ -647,6 +732,121 @@ def test_live_controller_authority_checks_deadline_after_final_validation() -> N
 
     with pytest.raises(TimeoutError, match="deadline"):
         authority.reauthorize(
+            binding,
+            deadline_monotonic=20.0,
+            backend_timeout_s=1.0,
+        )
+
+
+def test_composed_live_source_reads_all_backends_and_fences_current_binding() -> None:
+    _authority_value, source, binding, _decision_value, _leader_clock, _store = _authority()
+    readers = _ComponentReaders(source.state)
+    composed = ComposedRunnerCachePlacementBindingLiveStateSource(
+        current=readers,
+        decisions=readers,
+        targets=readers,
+        quotas=readers,
+        cache=readers,
+        monotonic_clock=lambda: 10.0,
+        wall_clock=lambda: LIVE,
+    )
+
+    assert (
+        composed.read(
+            binding,
+            deadline_monotonic=20.0,
+            backend_timeout_s=1.0,
+        )
+        == source.state
+    )
+    assert [name for name, _deadline, _timeout in readers.calls] == [
+        "current",
+        "decision",
+        "target",
+        "quota",
+        "cache",
+        "current",
+    ]
+    assert all(timeout == 1.0 for _name, _deadline, timeout in readers.calls)
+
+    composed.readiness(deadline_monotonic=20.0, backend_timeout_s=1.0)
+    assert readers.ready_calls == 1
+
+
+def test_composed_live_source_denies_binding_replacement_during_reads() -> None:
+    _authority_value, source, binding, _decision_value, _leader_clock, _store = _authority()
+    readers = _ComponentReaders(source.state)
+    readers.current_values[-1] = _binding_with_deployment(binding, "model-serving/other")
+    composed = ComposedRunnerCachePlacementBindingLiveStateSource(
+        current=readers,
+        decisions=readers,
+        targets=readers,
+        quotas=readers,
+        cache=readers,
+        monotonic_clock=lambda: 10.0,
+        wall_clock=lambda: LIVE,
+    )
+
+    with pytest.raises(
+        RunnerCachePlacementBindingAuthorizationDeniedError,
+        match="changed",
+    ):
+        composed.read(
+            binding,
+            deadline_monotonic=20.0,
+            backend_timeout_s=1.0,
+        )
+
+
+def test_composed_live_source_stops_when_shared_deadline_expires() -> None:
+    _authority_value, source, binding, _decision_value, _leader_clock, _store = _authority()
+    monotonic = [10.0]
+    readers = _ComponentReaders(source.state)
+
+    def expire_after_target(name: str) -> None:
+        if name == "target":
+            monotonic[0] = 20.0
+
+    readers.read_hook = expire_after_target
+    composed = ComposedRunnerCachePlacementBindingLiveStateSource(
+        current=readers,
+        decisions=readers,
+        targets=readers,
+        quotas=readers,
+        cache=readers,
+        monotonic_clock=lambda: monotonic[0],
+        wall_clock=lambda: LIVE,
+    )
+
+    with pytest.raises(TimeoutError, match="deadline"):
+        composed.read(
+            binding,
+            deadline_monotonic=20.0,
+            backend_timeout_s=15.0,
+        )
+    assert [name for name, _deadline, _timeout in readers.calls] == [
+        "current",
+        "decision",
+        "target",
+    ]
+
+
+def test_composed_live_source_checks_deadline_after_snapshot_validation() -> None:
+    _authority_value, source, binding, _decision_value, _leader_clock, _store = _authority()
+    readers = _ComponentReaders(source.state)
+    moments = iter((*([10.0] * 13), 20.0))
+    composed = ComposedRunnerCachePlacementBindingLiveStateSource(
+        current=readers,
+        decisions=readers,
+        targets=readers,
+        quotas=readers,
+        cache=readers,
+        monotonic_clock=lambda: next(moments),
+        wall_clock=lambda: LIVE,
+    )
+
+    with pytest.raises(TimeoutError, match="deadline"):
+        composed.read(
             binding,
             deadline_monotonic=20.0,
             backend_timeout_s=1.0,

@@ -152,7 +152,12 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
   replay-window plan rotation. D3.7 adds a strict AdmissionReview v1 HTTP
   boundary with UID-bound decisions, Pod identity checks, bounded input and
   concurrency, sanitized fail-closed errors, and deterministic JSON Patch
-  mutation. Executable webhook runtime/configuration, Kubernetes TLS and
+  mutation. D3.8 adds a TLS-serving runtime/CLI which assembles the D3.6 store
+  and D3.7 app, validates bounded secret/config files, and performs
+  authenticated nonce-bound final binding reauthorization without redirects or
+  environment proxies. Plaintext authority URLs are rejected; request and
+  response bytes plus secret-file permissions are bounded before use. The
+  scaling-authority endpoint, Kubernetes TLS and
   admission resources, scheduled compaction, and live environment acceptance
   remain.
 - Qwen3.8-Flash-Next MTP speculative decoding stays off in `qwen3.8-flash-next-dp2-8gpu` until upstream fixes vllm#53912 (prefix caching + MTP output corruption on hybrid GDN); single-stream decode 104 vs 175 tok/s
@@ -163,6 +168,19 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
+
+### 2026-09-29 — [progress] Executable placement webhook runtime
+- What: added `kairyu placement-admission serve` with versioned strict config,
+  TLS certificate/key handling, D3.6 PostgreSQL store assembly, bounded
+  concurrency/readiness, and an authenticated HTTPS binding-authority client
+  using fresh nonce echo, full binding validation, bounded strict JSON, and
+  no redirects or environment proxy inheritance.
+- Why: the protocol-correct D3.7 app needs a production process boundary, and
+  admission must re-check live scaling authority rather than treating a stored
+  plan as permanent authorization.
+- Refs: docs/design/node-model-cache-prestage-v1.md;
+  kairyu/runners/startup_admission_runtime.py;
+  tests/unit/test_runner_startup_admission_runtime.py
 
 ### 2026-09-29 — [progress] Kubernetes placement admission transport
 - What: added the D3.7 AdmissionReview v1 HTTP boundary for Pod CREATE,

@@ -24,6 +24,7 @@ from kairyu.runners.startup_admission import (
     RunnerCachePlacementAdmissionConflictError,
     RunnerCachePlacementAdmissionController,
     RunnerCachePlacementAdmissionError,
+    RunnerCachePlacementAdmissionTimeoutError,
 )
 from kairyu.runners.startup_scheduling import RunnerCacheSchedulingError
 
@@ -366,6 +367,7 @@ def create_runner_cache_placement_admission_app(
     active_request_limit: int = 16,
     total_request_limit: int = 64,
     queue_wait_timeout_s: float = 0.5,
+    request_timeout_s: float = 4.0,
 ) -> FastAPI:
     """Build the fail-closed AdmissionReview v1 transport for Pod CREATE."""
 
@@ -391,6 +393,13 @@ def create_runner_cache_placement_admission_app(
         or queue_wait_timeout_s <= 0
     ):
         raise ValueError("queue_wait_timeout_s must be finite and positive")
+    if (
+        isinstance(request_timeout_s, bool)
+        or not isinstance(request_timeout_s, (int, float))
+        or not math.isfinite(float(request_timeout_s))
+        or not 0 < request_timeout_s <= 30
+    ):
+        raise ValueError("request_timeout_s must be finite and in (0, 30]")
 
     app = FastAPI(
         title="kairyu-runner-cache-placement-admission",
@@ -453,6 +462,7 @@ def create_runner_cache_placement_admission_app(
 
     @app.post(_ADMIT_PATH)
     async def admit(request: Request) -> JSONResponse:
+        deadline_monotonic = time.monotonic() + request_timeout_s
         if request.headers.get("content-type", "").partition(";")[0].lower() != (
             "application/json"
         ):
@@ -481,6 +491,7 @@ def create_runner_cache_placement_admission_app(
                 admission_uid=admission_request.uid,
                 request_username=admission_request.user_info.username,
                 observed_at=observed_at,
+                deadline_monotonic=deadline_monotonic,
             )
             patch = _json_patch(admission_request.object, admitted)
             return JSONResponse(
@@ -490,6 +501,12 @@ def create_runner_cache_placement_admission_app(
                     allowed=True,
                     patch=patch,
                 ),
+            )
+        except RunnerCachePlacementAdmissionTimeoutError:
+            return _deny(
+                admission_request.uid,
+                code=503,
+                message="cache placement admission exceeded its internal deadline",
             )
         except RunnerCachePlacementAdmissionConflictError:
             return _deny(

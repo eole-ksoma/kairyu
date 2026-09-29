@@ -25,6 +25,7 @@ from kairyu.runners import (
     RunnerCachePlacementAdmissionController,
     RunnerCachePlacementAdmissionError,
     RunnerCachePlacementAdmissionPlan,
+    RunnerCachePlacementAdmissionTimeoutError,
     RunnerCacheSchedulingError,
     RunnerCacheStartupBinding,
     RunnerCacheStartupPlacement,
@@ -668,3 +669,47 @@ def test_controller_fails_closed_on_expired_or_changed_authority() -> None:
             request_username="system:serviceaccount:kairyu:statefulset-controller",
             observed_at=binding.valid_until,
         )
+
+
+@pytest.mark.parametrize("expires", ["reauthorize", "claim"])
+def test_controller_deadline_prevents_or_releases_late_claim(expires: str) -> None:
+    binding = _binding()
+    monotonic = [0.0]
+
+    class DeadlineStore(InMemoryRunnerCachePlacementAdmissionStore):
+        def claim(self, **kwargs):
+            allocation = super().claim(**kwargs)
+            if expires == "claim":
+                monotonic[0] = 5.0
+            return allocation
+
+    store = DeadlineStore()
+    store.register(_plan(binding))
+
+    def reauthorize(candidate: RunnerCacheStartupBinding) -> RunnerCacheStartupBinding:
+        if expires == "reauthorize":
+            monotonic[0] = 5.0
+        return candidate
+
+    controller = RunnerCachePlacementAdmissionController(
+        store,
+        reauthorize=reauthorize,
+        monotonic_clock=lambda: monotonic[0],
+    )
+    with pytest.raises(RunnerCachePlacementAdmissionTimeoutError, match="deadline"):
+        controller.admit(
+            _pod(),
+            admission_uid="admission-late",
+            request_username="system:serviceaccount:kairyu:statefulset-controller",
+            observed_at=NOW + timedelta(seconds=2),
+            deadline_monotonic=4.0,
+        )
+
+    allocation = store.claim(
+        target_id=TARGET,
+        binding_id=binding.binding_id,
+        pod_key="model-serving/qwen-8",
+        admission_uid="admission-next",
+        claimed_at=NOW + timedelta(seconds=3),
+    )
+    assert allocation.claim.placement_id == "placement-0-a"

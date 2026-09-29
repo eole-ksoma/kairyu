@@ -379,7 +379,7 @@ protected even if one request later fails mutation. A claim is retained after
 an allowed response because the webhook cannot prove that later admission
 stages persisted the Pod. A claimed plan cannot be replaced—even when
 exhausted—until its binding expiry plus a configured replay safety window. The
-window must exceed the admission request/response timeout. Thus old placement
+window must exceed the outer API-server webhook timeout. Thus old placement
 nodes stay reserved until no prior allowed response can plausibly persist; an
 unclaimed plan may rotate immediately after binding expiry.
 
@@ -409,6 +409,16 @@ replaced or corrupted PostgreSQL namespace. The initial implementation uses one
 coarse lock per admission store, prioritizing cross-replica correctness over
 parallel target throughput.
 
+An admission replica can fail after the claim transaction commits but before its
+rollback runs. Such an unprotected orphan remains reserved: reclaiming it by age
+alone is unsafe because the API server may already have persisted the admitted
+Pod. Recovery is therefore fail-closed and durable rather than eager. The next
+plan registration reclaims all claims only after the old binding expiry plus the
+replay safety window, using the PostgreSQL clock. Tests cover both early
+replacement rejection and successful reuse after this boundary. This bounded
+capacity reservation is the safe crash-recovery contract until a future
+Kubernetes-observed claim reconciler can prove Pod absence.
+
 The D3.7 HTTP boundary accepts only strict `admission.k8s.io/v1` JSON for a
 core/v1 Pod CREATE at `/v1/admit`. It binds the response UID to the request,
 checks the request and embedded Pod name/namespace identities, rejects
@@ -437,6 +447,16 @@ mode `0640` or stricter. The process validates these permissions from the open
 file descriptor, serves one Uvicorn worker with the configured certificate/key,
 opens the D3.6 store, and requires both PostgreSQL and the authority to pass
 readiness before serving.
+
+Each admission receives an internal monotonic deadline from the runtime config.
+The controller checks it before and after every blocking resolve,
+reauthorization, and claim boundary. It never starts a claim after expiry; if a
+new claim returns after expiry, it releases that claim before the request is
+denied. Deployments must keep this deadline below the API-server webhook
+timeout and reserve enough outer budget for queueing, a late-claim release, and
+response delivery. This cooperative deadline does not interrupt a database
+statement in flight; the PostgreSQL statement/lock timeout remains the hard
+bound for each database operation.
 
 Final binding reauthorization is an authenticated HTTPS POST to the configured
 scaling-authority HTTPS origin; no plaintext opt-in exists. The request includes

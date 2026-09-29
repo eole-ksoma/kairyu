@@ -21,6 +21,7 @@ from kairyu.runners import (
     InMemoryRunnerCachePlacementAdmissionStore,
     RunnerCachePlacementAdmissionController,
     RunnerCachePlacementAdmissionPlan,
+    RunnerCachePlacementAdmissionTimeoutError,
     RunnerCacheStartupBinding,
     RunnerCacheStartupPlacement,
     create_runner_cache_placement_admission_app,
@@ -454,6 +455,12 @@ class _ExplodingController(RunnerCachePlacementAdmissionController):
         raise RuntimeError("postgresql host and password must stay private")
 
 
+class _TimeoutController(RunnerCachePlacementAdmissionController):
+    def admit(self, *args, **kwargs):
+        del args, kwargs
+        raise RunnerCachePlacementAdmissionTimeoutError("private deadline detail")
+
+
 @pytest.mark.asyncio
 async def test_unexpected_backend_failure_is_a_sanitized_uid_bound_denial() -> None:
     store = InMemoryRunnerCachePlacementAdmissionStore()
@@ -481,6 +488,29 @@ async def test_unexpected_backend_failure_is_a_sanitized_uid_bound_denial() -> N
 
 
 @pytest.mark.asyncio
+async def test_internal_deadline_is_a_sanitized_uid_bound_denial() -> None:
+    store = InMemoryRunnerCachePlacementAdmissionStore()
+    controller = _TimeoutController(store, reauthorize=lambda candidate: candidate)
+    app = create_runner_cache_placement_admission_app(
+        controller=controller,
+        readiness_check=lambda: None,
+        clock=lambda: NOW,
+    )
+
+    async with _client(app) as client:
+        response = await client.post("/v1/admit", json=_review())
+
+    decision = response.json()["response"]
+    assert decision["uid"] == "admission-a"
+    assert decision["allowed"] is False
+    assert decision["status"] == {
+        "code": 503,
+        "message": "cache placement admission exceeded its internal deadline",
+    }
+    assert "private" not in response.text
+
+
+@pytest.mark.asyncio
 async def test_health_and_readiness_disclose_no_backend_detail() -> None:
     app, _controller = _app(ready=False)
 
@@ -502,6 +532,7 @@ async def test_health_and_readiness_disclose_no_backend_detail() -> None:
         {"active_request_limit": 0},
         {"active_request_limit": 2, "total_request_limit": 1},
         {"queue_wait_timeout_s": float("nan")},
+        {"request_timeout_s": 0},
     ],
 )
 def test_app_configuration_is_validated(kwargs: dict[str, Any]) -> None:

@@ -287,6 +287,10 @@ class RunnerStatus(BaseModel):
     observed_at: datetime
     node_name: str | None = Field(default=None, max_length=253)
     pod_uid: str | None = Field(default=None, max_length=255)
+    cache_startup_binding_id: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     gpu_uuids: tuple[str, ...] = Field(default=(), max_length=64)
     active_requests: int = Field(default=0, ge=0)
     runtime_observed_at: datetime | None = None

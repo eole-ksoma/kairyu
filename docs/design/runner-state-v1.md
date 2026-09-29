@@ -533,9 +533,15 @@ ID. The actuator tests that annotation in the atomic JSON Patch and requires it
 unchanged in the response. The deployment scheduler/admission integration owns
 that binding and must constrain new Pods to the selected cache topology; a
 missing or mismatched binding fails before scale-out. Its concrete scheduler,
-DaemonSet, PVC/local-storage, affinity, RBAC, Kueue, and binding-attestation
-wiring belongs to private-ai-cloud-iac and is a deployment gate before enabling
-production autoscaling.
+DaemonSet, PVC/local-storage, affinity, RBAC, Kueue, and binding wiring belongs
+to private-ai-cloud-iac and is a deployment gate before enabling production
+autoscaling. D3.1-D3.3 now provide the library-side exact binding, atomic
+scale-from-zero Pod-template constraint, inherited-binding observation, and
+Runner-owned full-digest startup proof. Cache-bound Runners remain `WARMING`
+and routing-ineligible until the proof matches the actual Pod UID/node and every
+bound decision/artifact/generation identity. Incremental scale-up still requires
+a per-Pod scheduling mechanism because changing a shared template would roll
+existing replicas.
 
 WP4.4 now supplies the library-side producer for this input. A node publishes a
 short-lived, verified-only, path-free hint from its WP4.3 index, and

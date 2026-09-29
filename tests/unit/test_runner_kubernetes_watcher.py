@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+import hashlib
+import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -14,15 +16,68 @@ from kairyu.runners import (
     MODEL_ID_ANNOTATION,
     MODEL_REVISION_ANNOTATION,
     RELEASE_ID_ANNOTATION,
+    RUNNER_CACHE_STARTUP_BINDING_ANNOTATION,
+    RUNNER_CACHE_STARTUP_BINDING_ID_ANNOTATION,
     RUNNER_CONTAINER_ANNOTATION,
     KubernetesPodPhase,
     KubernetesRunnerWatcher,
+    RunnerCacheStartupBinding,
+    RunnerCacheStartupPlacement,
     RunnerRuntimeObservation,
     parse_ready_endpoint_uids,
     parse_runner_pods,
 )
 
 NOW = datetime(2026, 9, 14, 4, 0, tzinfo=UTC)
+DIGEST = "a" * 64
+
+
+def _cache_binding() -> RunnerCacheStartupBinding:
+    placement = RunnerCacheStartupPlacement(
+        placement_id="placement-a",
+        node_name="gpu-node-a",
+        resource_flavor="h100-sxm",
+        profile_id="h100-sxm-tp1",
+        compatibility_approval_id="compat-qwen-h100",
+        manifest_digest=DIGEST,
+        pin_owner="prestage/model-serving/qwen/placement-a",
+        prestage_command_id=hashlib.sha256(b"command-a").hexdigest(),
+        prestage_command_generation=3,
+        hint_index_revision=11,
+        resident_record_generation=17,
+        hint_observed_at=NOW,
+        hint_valid_until=NOW + timedelta(minutes=5),
+    )
+    values = {
+        "schema_version": "runner-cache-startup-binding-v1",
+        "decision_id": "decision-a",
+        "decision_fingerprint": hashlib.sha256(b"decision-a").hexdigest(),
+        "target_id": "deployment/model-serving/qwen-runners",
+        "target_revision": 7,
+        "deployment_id": "model-serving/qwen",
+        "model_class": "qwen-14b",
+        "model_id": "qwen",
+        "model_revision": "revision-a",
+        "manifest_digest": DIGEST,
+        "placement_binding_id": "placement-binding-a",
+        "prewarm_snapshot_id": "snapshot-a",
+        "prewarm_cache_revision": 9,
+        "bound_at": NOW + timedelta(seconds=1),
+        "valid_until": NOW + timedelta(minutes=5),
+        "placements": (placement,),
+    }
+    unsigned = RunnerCacheStartupBinding.model_construct(binding_id="0" * 64, **values)
+    encoded = json.dumps(
+        unsigned.model_dump(mode="json", exclude={"binding_id"}),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode()
+    return RunnerCacheStartupBinding(
+        binding_id=hashlib.sha256(encoded).hexdigest(),
+        **values,
+    )
 
 
 def _pod_payload() -> dict:
@@ -122,6 +177,38 @@ def test_parsers_preserve_stable_identity_and_independent_gates() -> None:
     assert pods["uid-a"].pod.gpu_uuids == ("GPU-a", "GPU-b")
     assert pods["uid-b"].pod.waiting_reason == "ContainerCreating"
     assert parse_ready_endpoint_uids(_endpoint_payload()) == frozenset({"uid-a"})
+
+
+def test_parser_preserves_and_validates_inherited_cache_binding() -> None:
+    payload = _pod_payload()
+    binding = _cache_binding()
+    annotations = payload["items"][1]["metadata"]["annotations"]
+    annotations[RUNNER_CACHE_STARTUP_BINDING_ANNOTATION] = binding.model_dump_json()
+    annotations[RUNNER_CACHE_STARTUP_BINDING_ID_ANNOTATION] = binding.binding_id
+
+    parsed = parse_runner_pods(payload)["uid-a"]
+
+    assert parsed.cache_startup_binding == binding
+
+
+@pytest.mark.parametrize(
+    "annotations",
+    [
+        {RUNNER_CACHE_STARTUP_BINDING_ID_ANNOTATION: "0" * 64},
+        {
+            RUNNER_CACHE_STARTUP_BINDING_ANNOTATION: (
+                '{"binding_id":"a","binding_id":"b"}'
+            ),
+            RUNNER_CACHE_STARTUP_BINDING_ID_ANNOTATION: "0" * 64,
+        },
+    ],
+)
+def test_parser_rejects_incomplete_or_noncanonical_cache_binding(annotations) -> None:
+    payload = _pod_payload()
+    payload["items"][1]["metadata"]["annotations"].update(annotations)
+
+    with pytest.raises(ValueError):
+        parse_runner_pods(payload)
 
 
 def test_parser_preserves_fatal_main_container_state_over_completed_init() -> None:

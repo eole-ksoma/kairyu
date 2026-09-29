@@ -270,8 +270,37 @@ Changing a Deployment or StatefulSet template while replicas already exist can
 roll existing Pods and cannot express a distinct placement per new ordinal.
 Such an incremental scale-up is rejected before mutation. A later D3 unit must
 use a Pod-level scheduling gate or equivalent controller-owned per-Pod
-assignment, and must attest the actual Pod node plus WP4.6 artifact verification
-before readiness.
+assignment.
+
+## Runner startup attestation
+
+D3.3 closes the scale-from-zero evidence loop before readiness. The Kubernetes
+watcher strictly parses the full inherited binding and its independent digest
+annotation, rejects duplicate JSON keys, non-finite values, incomplete metadata,
+or model/revision conflicts, and retains the validated binding with the Pod
+observation.
+
+After scheduling, the Runner performs the WP4.6 full-digest verification on its
+local node. An allowed verification is converted into a canonical hash-bound
+`RunnerCacheStartupProof` containing the Pod UID, actual node, binding and
+placement IDs, scaling decision fingerprint, model/revision/manifest digest,
+pre-stage command generation, and resident record generation. The local artifact
+path is deliberately omitted. A denied verification, unselected node, proof
+predating the binding, future proof, altered generation, or cross-Pod replay
+fails closed.
+
+Legacy Pods without cache-binding metadata retain the existing readiness
+contract. A cache-bound Pod must additionally return the exact proof through the
+Runner runtime observation; until then, it remains `WARMING` even if Kubernetes,
+EndpointSlice, startup phases, and the ordinary Runner readiness flag are all
+ready. Only the fully matched proof makes the Runner routing eligible. The proof
+is based on current physical digest verification, so it need not complete before
+the short-lived placement hint expires. It must not predate binding beyond the
+same bounded Runner/controller clock-skew policy used by reconciliation, and it
+must precede the same-clock runtime observation that carries it. Once a Pod is
+observed with a binding, its digest is retained in `RunnerStatus`; removing or
+changing the Pod annotation cannot downgrade that Runner into the legacy
+readiness path.
 
 ## Deployment boundary
 
@@ -284,8 +313,8 @@ before readiness.
 - reconciliation that replays desired ensure/release commands after restart;
 - bounded tombstone retention/compaction that durably preserves each retired
   placement's generation, leader fence, and target-revision high-water marks;
-- incremental per-Pod scheduling plus Pod/startup attestation for the
-  implemented `RunnerCacheStartupBinding`;
+- incremental per-Pod scheduling for the implemented
+  `RunnerCacheStartupBinding` (scale-from-zero startup attestation is implemented);
 - metrics and audit export for command latency, bytes, attempts, failures, and
   pin reconciliation; and
 - live node-pool acceptance with real S3, NVMe, Kueue, and Runner startup.

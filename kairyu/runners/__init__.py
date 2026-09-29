@@ -110,6 +110,7 @@ from kairyu.runners.prestage import (
     apply_node_model_prestage_records,
     build_node_model_prestage_commands,
     build_node_model_prestage_release_command,
+    build_runner_start_prestage_commands,
 )
 from kairyu.runners.prewarm import (
     ModelCachePlacement,
@@ -181,6 +182,12 @@ from kairyu.runners.scaling_quota import (
     admit_scaling_quota,
     kueue_scaling_workload_name,
     parse_kueue_scaling_admission,
+)
+from kairyu.runners.startup_binding import (
+    RunnerCacheStartupBinding,
+    RunnerCacheStartupBindingError,
+    RunnerCacheStartupPlacement,
+    build_runner_cache_startup_binding,
 )
 
 __all__ = [
@@ -254,6 +261,9 @@ __all__ = [
     "LeaderFencedRunnerController",
     "RunnerBackoffDecision",
     "RunnerBackoffPolicy",
+    "RunnerCacheStartupBinding",
+    "RunnerCacheStartupBindingError",
+    "RunnerCacheStartupPlacement",
     "RunnerDispatchFence",
     "RunnerDrainActivityObservation",
     "RunnerDrainController",
@@ -284,6 +294,8 @@ __all__ = [
     "apply_node_model_prestage_records",
     "build_node_model_prestage_commands",
     "build_node_model_prestage_release_command",
+    "build_runner_cache_startup_binding",
+    "build_runner_start_prestage_commands",
     "create_node_model_cache_agent_app",
     "build_node_model_cache_agent_runtime",
     "KueueScalingAdmission",

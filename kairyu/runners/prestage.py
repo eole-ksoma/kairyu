@@ -185,12 +185,26 @@ class NodeModelPrestageRecord(BaseModel):
     claim_id: str | None = Field(default=None, min_length=64, max_length=64)
     failure: str | None = Field(default=None, max_length=1024)
     fill_result: NodeModelCacheFillResult | None = None
+    pin_record_generation: int | None = Field(
+        default=None,
+        ge=1,
+        le=_MAX_SIGNED_BIGINT,
+    )
     updated_at: datetime
 
     @field_validator("attempt", mode="before")
     @classmethod
     def validate_attempt(cls, value: object) -> int:
         return _integer(value, name="attempt")
+
+    @field_validator("pin_record_generation", mode="before")
+    @classmethod
+    def validate_pin_record_generation(cls, value: object) -> int | None:
+        return (
+            None
+            if value is None
+            else _integer(value, name="pin_record_generation")
+        )
 
     @field_validator("claim_id")
     @classmethod
@@ -234,6 +248,11 @@ class NodeModelPrestageRecord(BaseModel):
                 or self.fill_result is not None
             ):
                 raise ValueError("absent pre-stage state cannot retain execution evidence")
+        if (
+            self.state is not ModelCachePlacementState.READY
+            and self.pin_record_generation is not None
+        ):
+            raise ValueError("only ready pre-stage state can retain pin generation")
         return self
 
 
@@ -258,6 +277,7 @@ class NodeModelPrestageStore(Protocol):
         *,
         claim_id: str,
         fill_result: NodeModelCacheFillResult,
+        pin_record_generation: int | None = None,
         now: datetime,
     ) -> NodeModelPrestageRecord: ...
 
@@ -418,6 +438,7 @@ class _NodeModelPrestageTransitions:
         command: NodeModelPrestageCommand,
         claim_id: str,
         fill_result: NodeModelCacheFillResult,
+        pin_record_generation: int | None,
         now: datetime,
     ) -> NodeModelPrestageRecord:
         command = self.validate_command(command, now=now, require_active=False)
@@ -425,6 +446,13 @@ class _NodeModelPrestageTransitions:
         if not isinstance(fill_result, NodeModelCacheFillResult):
             raise TypeError("fill_result must be a NodeModelCacheFillResult")
         fill_result = NodeModelCacheFillResult.model_validate(fill_result.model_dump())
+        pin_record_generation = (
+            None
+            if pin_record_generation is None
+            else _integer(pin_record_generation, name="pin_record_generation")
+        )
+        if pin_record_generation is not None and pin_record_generation < 1:
+            raise ValueError("pin_record_generation must be positive")
         now = _aware(now, name="now")
         existing = self._require_claim(existing, command=command, claim_id=claim_id)
         self._require_monotonic_time(existing, now=now)
@@ -433,6 +461,7 @@ class _NodeModelPrestageTransitions:
             state=ModelCachePlacementState.READY,
             attempt=existing.attempt,
             fill_result=fill_result,
+            pin_record_generation=pin_record_generation,
             updated_at=now,
         )
 
@@ -573,6 +602,7 @@ class InMemoryNodeModelPrestageStore:
         *,
         claim_id: str,
         fill_result: NodeModelCacheFillResult,
+        pin_record_generation: int | None = None,
         now: datetime,
     ) -> NodeModelPrestageRecord:
         command = self._transitions.validate_command(
@@ -585,6 +615,7 @@ class InMemoryNodeModelPrestageStore:
                 command=command,
                 claim_id=claim_id,
                 fill_result=fill_result,
+                pin_record_generation=pin_record_generation,
                 now=now,
             )
             self._records[placement_id] = record
@@ -727,6 +758,7 @@ class NodeModelPrestageExecutor:
                 command,
                 claim_id=claim_id,
                 fill_result=result,
+                pin_record_generation=pinned.generation,
                 now=_aware(self._clock(), name="executor clock"),
             )
         except Exception as exc:
@@ -803,9 +835,11 @@ class NodeModelPrestageExecutor:
             raise NodeModelPrestageConflictError("verified cache pin does not match command")
 
 
-def build_node_model_prestage_commands(
+def _build_node_model_prestage_commands(
     plan: ScalingPrewarmPlan,
     *,
+    placement_ids: tuple[str, ...],
+    placement_purpose: str,
     authority: RunnerWriterAuthority,
     decision_id: str,
     decision_fingerprint: str,
@@ -817,7 +851,7 @@ def build_node_model_prestage_commands(
     issued_at: datetime,
     ttl_seconds: float,
 ) -> tuple[NodeModelPrestageCommand, ...]:
-    """Convert durable WP3.6 absent-placement intent into fenced node commands."""
+    """Build one canonical class of fenced node commands from a durable plan."""
 
     if not isinstance(plan, ScalingPrewarmPlan):
         raise TypeError("plan must be a ScalingPrewarmPlan")
@@ -841,9 +875,8 @@ def build_node_model_prestage_commands(
     if not math.isfinite(float(ttl_seconds)) or ttl_seconds <= 0:
         raise ValueError("ttl_seconds must be finite and positive")
     expires_at = issued_at + timedelta(seconds=float(ttl_seconds))
-    placement_ids = plan.cache_fill_placement_ids
     if set(command_generations) != set(placement_ids):
-        raise ValueError("command_generations must exactly cover cache-fill placements")
+        raise ValueError(f"command_generations must exactly cover {placement_purpose} placements")
     placements = {placement.placement_id: placement for placement in plan.snapshot.placements}
     commands = []
     for placement_id in placement_ids:
@@ -885,6 +918,76 @@ def build_node_model_prestage_commands(
         command_id = _canonical_digest(unsigned.model_dump(mode="json", exclude={"command_id"}))
         commands.append(NodeModelPrestageCommand(command_id=command_id, **payload))
     return tuple(commands)
+
+
+def build_node_model_prestage_commands(
+    plan: ScalingPrewarmPlan,
+    *,
+    authority: RunnerWriterAuthority,
+    decision_id: str,
+    decision_fingerprint: str,
+    target_id: str,
+    target_revision: int,
+    deployment_id: str,
+    model_id: str,
+    command_generations: Mapping[str, int],
+    issued_at: datetime,
+    ttl_seconds: float,
+) -> tuple[NodeModelPrestageCommand, ...]:
+    """Convert durable absent-placement intent into fenced cache-fill commands."""
+
+    if not isinstance(plan, ScalingPrewarmPlan):
+        raise TypeError("plan must be a ScalingPrewarmPlan")
+    return _build_node_model_prestage_commands(
+        plan,
+        placement_ids=plan.cache_fill_placement_ids,
+        placement_purpose="cache-fill",
+        authority=authority,
+        decision_id=decision_id,
+        decision_fingerprint=decision_fingerprint,
+        target_id=target_id,
+        target_revision=target_revision,
+        deployment_id=deployment_id,
+        model_id=model_id,
+        command_generations=command_generations,
+        issued_at=issued_at,
+        ttl_seconds=ttl_seconds,
+    )
+
+
+def build_runner_start_prestage_commands(
+    plan: ScalingPrewarmPlan,
+    *,
+    authority: RunnerWriterAuthority,
+    decision_id: str,
+    decision_fingerprint: str,
+    target_id: str,
+    target_revision: int,
+    deployment_id: str,
+    model_id: str,
+    command_generations: Mapping[str, int],
+    issued_at: datetime,
+    ttl_seconds: float,
+) -> tuple[NodeModelPrestageCommand, ...]:
+    """Fence and pin every cache-ready placement before Runner scheduling."""
+
+    if not isinstance(plan, ScalingPrewarmPlan):
+        raise TypeError("plan must be a ScalingPrewarmPlan")
+    return _build_node_model_prestage_commands(
+        plan,
+        placement_ids=plan.runner_start_placement_ids,
+        placement_purpose="Runner-start",
+        authority=authority,
+        decision_id=decision_id,
+        decision_fingerprint=decision_fingerprint,
+        target_id=target_id,
+        target_revision=target_revision,
+        deployment_id=deployment_id,
+        model_id=model_id,
+        command_generations=command_generations,
+        issued_at=issued_at,
+        ttl_seconds=ttl_seconds,
+    )
 
 
 def build_node_model_prestage_release_command(

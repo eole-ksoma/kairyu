@@ -196,6 +196,7 @@ class FakeExecutor:
                 file_count=1,
                 total_bytes=11,
             ),
+            pin_record_generation=1,
             now=_NOW + timedelta(seconds=2),
         )
 

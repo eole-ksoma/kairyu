@@ -534,6 +534,7 @@ class PostgresNodeModelPrestageStore:
         *,
         claim_id: str,
         fill_result: NodeModelCacheFillResult,
+        pin_record_generation: int | None = None,
         now: datetime,
     ) -> NodeModelPrestageRecord:
         command = self._transitions.validate_command(
@@ -546,6 +547,7 @@ class PostgresNodeModelPrestageStore:
                 command=command,
                 claim_id=claim_id,
                 fill_result=fill_result,
+                pin_record_generation=pin_record_generation,
                 now=now,
             ),
         )

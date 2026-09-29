@@ -3,9 +3,11 @@
 Status: WP4.7 implemented as fenced controller commands, placement-level
 claim/CAS, verified node execution, owner-scoped cache pins, status projection,
 and a shared durable PostgreSQL command store. The authenticated node HTTP API
-is implemented but not yet packaged or deployed with Kubernetes node binding.
-Safe released-placement tombstone compaction remains a separate store-lifecycle
-task.
+and executable runtime are implemented. D3.1 additionally binds every proposed
+Runner start to a decision-matching pre-stage pin and a later fresh physical
+residency hint on the exact scheduler node. Kubernetes workload mutation and
+Runner-side consumption of that binding remain open. Safe released-placement
+tombstone compaction remains a separate store-lifecycle task.
 
 ## Purpose
 
@@ -33,6 +35,9 @@ cache mutation.
 
 `build_node_model_prestage_commands()` accepts only the plan's canonical
 `cache_fill_placement_ids`. Its generation map must cover those IDs exactly.
+`build_runner_start_prestage_commands()` applies the same fenced command and pin
+contract to the canonical `runner_start_placement_ids`; a cache hit still passes
+full artifact verification before the deployment-scoped owner pin is recorded.
 Every `NodeModelPrestageCommand` includes:
 
 - a SHA-256 command ID over the complete canonical payload;
@@ -168,7 +173,10 @@ admission request before claiming. It then calls the WP4.2
 `NodeModelCacheAgent.ensure_cached()`, so signature, environment, GPU profile,
 blob digest, tree digest, resumable staging, and atomic publication checks are
 unchanged. Only after a verified result exists does it add the deterministic
-WP4.3 owner pin and CAS the command to `ready`.
+WP4.3 owner pin and CAS the command to `ready`. That durable completion also
+stores the cache record generation returned by the pin transaction. Older ready
+records without this additive evidence remain readable but cannot authorize a
+D3 startup binding; they must be released and ensured again.
 
 Fill errors produce a bounded `failed` record and can retry the exact command
 under a new claim while it remains valid. A completion conflict never converts
@@ -202,6 +210,32 @@ The controller persists the later snapshot and computes a new WP3.6 decision.
 Only placements still ready and eligible at the actuator's final
 reauthorization can justify Runner creation.
 
+## Runner startup binding
+
+`build_runner_cache_startup_binding()` is the D3.1 handoff to scheduler
+actuation. A ready placement is not sufficient by itself. For every planned
+Runner start, the builder requires all of the following to agree exactly:
+
+- scaling decision ID/fingerprint and target revision;
+- deployment, placement binding, placement/node, resource flavor, hardware
+  profile, and compatibility approval;
+- model ID, revision, and lowercase manifest SHA-256;
+- a completed `ensure` record with the deterministic deployment owner pin; and
+- a node hint observed after that completion which still publishes the exact
+  artifact as verified and pinned at binding time, with the same cache record
+  generation captured by the completed pin.
+
+The generation equality is load-bearing: releasing the deployment owner while
+another owner remains advances the cache record, so a later `pinned=true` hint
+cannot be combined with the stale completion. The resulting
+`RunnerCacheStartupBinding` lists the scheduler node for every
+placement, preserves the pin command/generation and node index/generation
+evidence, expires at the earliest source hint, and hashes its complete canonical
+payload into `binding_id`. Duplicate placements/nodes, stale or pre-completion
+hints, unpinned residency, cross-decision records, and payload substitution fail
+closed. The next D3 unit must CAS this binding into the workload Pod template and
+prove the resulting Pod node and startup artifact before replica readiness.
+
 ## Deployment boundary
 
 `private-ai-cloud-iac` must still provide:
@@ -213,7 +247,8 @@ reauthorization can justify Runner creation.
 - reconciliation that replays desired ensure/release commands after restart;
 - bounded tombstone retention/compaction that durably preserves each retired
   placement's generation, leader fence, and target-revision high-water marks;
-- scheduler/affinity enforcement for the placement binding;
+- scheduler/affinity enforcement and Pod/startup attestation for the implemented
+  `RunnerCacheStartupBinding`;
 - metrics and audit export for command latency, bytes, attempts, failures, and
   pin reconciliation; and
 - live node-pool acceptance with real S3, NVMe, Kueue, and Runner startup.

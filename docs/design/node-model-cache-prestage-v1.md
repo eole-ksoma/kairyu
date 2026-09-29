@@ -5,9 +5,11 @@ claim/CAS, verified node execution, owner-scoped cache pins, status projection,
 and a shared durable PostgreSQL command store. The authenticated node HTTP API
 and executable runtime are implemented. D3.1 additionally binds every proposed
 Runner start to a decision-matching pre-stage pin and a later fresh physical
-residency hint on the exact scheduler node. Kubernetes workload mutation and
-Runner-side consumption of that binding remain open. Safe released-placement
-tombstone compaction remains a separate store-lifecycle task.
+residency hint on the exact scheduler node. D3.2 atomically applies that binding
+to a scale-from-zero workload Pod template and replica count. Incremental
+per-Pod placement and Runner-side consumption of the binding remain open. Safe
+released-placement tombstone compaction remains a separate store-lifecycle
+task.
 
 ## Purpose
 
@@ -233,8 +235,43 @@ placement, preserves the pin command/generation and node index/generation
 evidence, expires at the earliest source hint, and hashes its complete canonical
 payload into `binding_id`. Duplicate placements/nodes, stale or pre-completion
 hints, unpinned residency, cross-decision records, and payload substitution fail
-closed. The next D3 unit must CAS this binding into the workload Pod template and
-prove the resulting Pod node and startup artifact before replica readiness.
+closed.
+
+## Atomic cold-start scheduling
+
+D3.2 passes a `RunnerCacheStartupBinding` to the fenced Kubernetes scale
+actuator. For a scale-from-zero decision, the actuator verifies the binding
+against the durable decision fingerprint, workload UID/generation, model and
+manifest, original prewarm snapshot, exact placement IDs/nodes/profiles, and
+target delta. It then builds one JSON Patch which tests the workload resource
+version, leader fence, placement binding, current replica count, and complete
+Pod template before replacing both the template and replica count. Kubernetes
+therefore cannot create a new Pod from the scale decision before its cache
+constraint is present.
+
+The managed Pod template carries the complete canonical binding JSON and full
+binding digest as annotations. Model/revision/release identity is copied or
+must already match. Required node affinity ANDs the binding's node names into
+every existing required selector term; existing preferred and required policy
+is preserved. A binding-scoped required Pod anti-affinity term prevents two
+new replicas from occupying the same hostname. Exact replay removes and
+rebuilds only the prior managed terms and produces byte-equivalent template
+state. Malformed prior evidence, ambiguous managed terms, conflicting identity,
+or annotation-size overflow fails closed.
+
+Immediately before the patch, leader, quota, prewarm, and binding authority are
+reauthorized. The binding must still be live and byte-identical. The API
+response must advance the workload generation exactly once and reproduce the
+expected template and decision annotations. An exact retry succeeds only while
+that template remains intact.
+
+This shared-template mechanism is deliberately limited to scale-from-zero.
+Changing a Deployment or StatefulSet template while replicas already exist can
+roll existing Pods and cannot express a distinct placement per new ordinal.
+Such an incremental scale-up is rejected before mutation. A later D3 unit must
+use a Pod-level scheduling gate or equivalent controller-owned per-Pod
+assignment, and must attest the actual Pod node plus WP4.6 artifact verification
+before readiness.
 
 ## Deployment boundary
 
@@ -247,8 +284,8 @@ prove the resulting Pod node and startup artifact before replica readiness.
 - reconciliation that replays desired ensure/release commands after restart;
 - bounded tombstone retention/compaction that durably preserves each retired
   placement's generation, leader fence, and target-revision high-water marks;
-- scheduler/affinity enforcement and Pod/startup attestation for the implemented
-  `RunnerCacheStartupBinding`;
+- incremental per-Pod scheduling plus Pod/startup attestation for the
+  implemented `RunnerCacheStartupBinding`;
 - metrics and audit export for command latency, bytes, attempts, failures, and
   pin reconciliation; and
 - live node-pool acceptance with real S3, NVMe, Kueue, and Runner startup.
@@ -269,3 +306,7 @@ HTTP tests cover API-key protection, local-only trust roots, node binding,
 ensure/release replay, path/failure-detail redaction, readiness sanitization,
 bounded cursor pagination, error mappings, concurrent admission, and declared
 or chunked request-size bounds.
+Scheduling tests cover affinity preservation, exact replay/rebinding, malformed
+managed state, decision and model mismatch, scale-from-zero-only enforcement,
+binding expiry, atomic template/replica CAS, response tampering, and retry-time
+template integrity.

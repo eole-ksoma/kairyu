@@ -8,6 +8,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
@@ -16,7 +17,11 @@ from urllib.parse import quote
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from kairyu.runners.kubernetes import MODEL_REVISION_ANNOTATION, RELEASE_ID_ANNOTATION
+from kairyu.runners.kubernetes import (
+    MODEL_ID_ANNOTATION,
+    MODEL_REVISION_ANNOTATION,
+    RELEASE_ID_ANNOTATION,
+)
 from kairyu.runners.leadership import RunnerWriterAuthority
 from kairyu.runners.prewarm import (
     ModelCachePlacementState,
@@ -30,6 +35,8 @@ from kairyu.runners.scaling_log import (
     ScalingDecisionTargetRevision,
 )
 from kairyu.runners.scaling_quota import ScalingQuotaAdmission
+from kairyu.runners.startup_binding import RunnerCacheStartupBinding
+from kairyu.runners.startup_scheduling import bind_runner_cache_to_pod_template
 
 SCALE_ELECTION_ID_ANNOTATION = "kairyu.ai/scale-election-id"
 SCALE_FENCING_TOKEN_ANNOTATION = "kairyu.ai/scale-fencing-token"
@@ -366,6 +373,7 @@ class _WorkloadSnapshot:
     generation: int
     annotations: dict[str, str]
     annotations_present: bool
+    pod_template: dict[str, Any] | None
 
 
 @dataclass(frozen=True)
@@ -833,6 +841,11 @@ class KubernetesScaleActuator:
             raise InvalidKubernetesScaleResponseError(
                 "workload metadata.annotations must contain string pairs"
             )
+        pod_template = spec.get("template")
+        if pod_template is not None and not isinstance(pod_template, dict):
+            raise InvalidKubernetesScaleResponseError(
+                "workload spec.template must be an object"
+            )
         return _WorkloadSnapshot(
             replicas=replicas,
             statefulset_start_ordinal=statefulset_start_ordinal,
@@ -841,7 +854,79 @@ class KubernetesScaleActuator:
             generation=generation,
             annotations=dict(annotations_payload),
             annotations_present=annotations_present,
+            pod_template=pod_template,
         )
+
+    @staticmethod
+    def _validate_startup_binding(
+        binding: RunnerCacheStartupBinding,
+        *,
+        decision: ScalingDecisionRecord,
+        target: KubernetesScaleTarget,
+        fence: KubernetesScaleFence,
+        model_id: str | None,
+        validated_at: datetime | None = None,
+    ) -> RunnerCacheStartupBinding:
+        if not isinstance(binding, RunnerCacheStartupBinding):
+            raise TypeError("startup_binding must be a RunnerCacheStartupBinding")
+        binding = RunnerCacheStartupBinding.model_validate(binding.model_dump())
+        prewarm = decision.prewarm_plan
+        if decision.action is not ScalingDecisionAction.SCALE_UP or prewarm is None:
+            raise ValueError("startup binding may authorize only a prewarmed scale-up")
+        expected_target_id = (
+            f"{target.kind.value.lower()}/{target.namespace}/{target.name}"
+        )
+        if (
+            binding.decision_id != decision.decision_id
+            or binding.decision_fingerprint != decision.fingerprint
+            or binding.target_id != expected_target_id
+            or binding.target_revision != fence.workload_generation
+            or binding.model_class != decision.window.model_class
+            or binding.model_revision != fence.model_revision
+            or binding.manifest_digest != prewarm.snapshot.artifact_digest
+            or binding.placement_binding_id != prewarm.snapshot.placement_binding_id
+            or binding.prewarm_snapshot_id != prewarm.snapshot.snapshot_id
+            or binding.prewarm_cache_revision != prewarm.snapshot.cache_revision
+            or binding.bound_at < decision.decided_at
+            or model_id != binding.model_id
+        ):
+            raise KubernetesScaleConflictError(
+                "startup binding does not match the durable scaling decision"
+            )
+        planned = {
+            placement.placement_id: placement
+            for placement in prewarm.snapshot.placements
+            if placement.placement_id in prewarm.runner_start_placement_ids
+        }
+        if (
+            tuple(placement.placement_id for placement in binding.placements)
+            != tuple(sorted(prewarm.runner_start_placement_ids))
+            or len(binding.placements) != decision.target_delta
+            or any(
+                placement.placement_id not in planned
+                or (
+                    placement.node_name,
+                    placement.resource_flavor,
+                    placement.profile_id,
+                    placement.compatibility_approval_id,
+                )
+                != (
+                    planned[placement.placement_id].node_name,
+                    planned[placement.placement_id].resource_flavor,
+                    planned[placement.placement_id].profile_id,
+                    planned[placement.placement_id].compatibility_approval_id,
+                )
+                for placement in binding.placements
+            )
+        ):
+            raise KubernetesScaleConflictError(
+                "startup binding placements do not match the prewarm plan"
+            )
+        if validated_at is not None and not binding.bound_at <= validated_at < binding.valid_until:
+            raise KubernetesScaleConflictError(
+                "startup binding is not live at final scale authorization"
+            )
+        return binding
 
     @staticmethod
     def _parse_drain_pod(
@@ -1358,6 +1443,8 @@ class KubernetesScaleActuator:
         reauthorize_quota: Callable[[], ScalingQuotaAdmission] | None = None,
         reauthorize_prewarm: Callable[[], ScalingPrewarmPlan] | None = None,
         reauthorize_drain: Callable[[], ScalingDrainPlan] | None = None,
+        startup_binding: RunnerCacheStartupBinding | None = None,
+        reauthorize_startup_binding: Callable[[], RunnerCacheStartupBinding] | None = None,
     ) -> KubernetesFencedScaleResult:
         """Apply a durable decision only under a previously claimed leader token."""
 
@@ -1427,6 +1514,10 @@ class KubernetesScaleActuator:
                 raise ValueError("fenced scale-down requires deterministic StatefulSet ordinals")
             if decision.drain_plan is None:
                 raise ValueError("fenced scale-down requires a durable drain plan")
+        if (startup_binding is None) != (reauthorize_startup_binding is None):
+            raise ValueError(
+                "startup_binding and reauthorize_startup_binding must be provided together"
+            )
 
         with self._lock:
             if self._closed:
@@ -1455,6 +1546,36 @@ class KubernetesScaleActuator:
                 raise KubernetesScaleConflictError(
                     "workload model revision changed since the scaling decision"
                 )
+            desired_pod_template: dict[str, Any] | None = None
+            if startup_binding is not None:
+                startup_binding = self._validate_startup_binding(
+                    startup_binding,
+                    decision=decision,
+                    target=target,
+                    fence=fence,
+                    model_id=observed.annotations.get(MODEL_ID_ANNOTATION),
+                )
+                if observed.pod_template is None:
+                    raise InvalidKubernetesScaleResponseError(
+                        "cache-bound scale-up requires a Pod template"
+                    )
+                desired_pod_template = bind_runner_cache_to_pod_template(
+                    observed.pod_template,
+                    startup_binding,
+                    release_id=fence.release_id,
+                )
+                expected_applied_decision = (
+                    decision.decision_generation,
+                    decision.decision_id,
+                    decision.fingerprint,
+                )
+                if (
+                    observed.replicas != 0
+                    and self._stored_decision(observed) != expected_applied_decision
+                ):
+                    raise KubernetesScaleConflictError(
+                        "cache-bound Pod-template scheduling requires scale-from-zero"
+                    )
             if (
                 decision.action is ScalingDecisionAction.SCALE_DOWN
                 and observed.statefulset_start_ordinal != 0
@@ -1510,6 +1631,13 @@ class KubernetesScaleActuator:
                 if observed.replicas != decision.desired_replicas:
                     raise KubernetesScaleConflictError(
                         "recorded scaling decision no longer matches live replicas"
+                    )
+                if (
+                    startup_binding is not None
+                    and desired_pod_template != observed.pod_template
+                ):
+                    raise KubernetesScaleConflictError(
+                        "recorded scaling decision lost its startup binding"
                     )
                 if decision.action is ScalingDecisionAction.SCALE_DOWN:
                     assert decision.drain_plan is not None
@@ -1616,6 +1744,22 @@ class KubernetesScaleActuator:
                     "path": "/spec/replicas",
                     "value": observed.replicas,
                 },
+                *(
+                    [
+                        {
+                            "op": "test",
+                            "path": "/spec/template",
+                            "value": observed.pod_template,
+                        },
+                        {
+                            "op": "replace",
+                            "path": "/spec/template",
+                            "value": desired_pod_template,
+                        },
+                    ]
+                    if startup_binding is not None
+                    else []
+                ),
                 {
                     "op": "replace",
                     "path": "/spec/replicas",
@@ -1647,6 +1791,21 @@ class KubernetesScaleActuator:
                     raise KubernetesScaleConflictError(
                         "final quota and prewarm authorities disagree"
                     )
+                if startup_binding is not None:
+                    assert callable(reauthorize_startup_binding)
+                    refreshed_binding = reauthorize_startup_binding()
+                    refreshed_binding = self._validate_startup_binding(
+                        refreshed_binding,
+                        decision=decision,
+                        target=target,
+                        fence=fence,
+                        model_id=observed.annotations.get(MODEL_ID_ANNOTATION),
+                        validated_at=authority.validated_at,
+                    )
+                    if refreshed_binding.model_dump() != startup_binding.model_dump():
+                        raise KubernetesScaleConflictError(
+                            "startup binding changed during Kubernetes mutation"
+                        )
             elif decision.action is ScalingDecisionAction.SCALE_DOWN:
                 refreshed_drain = self._reauthorize_drain(
                     decision,
@@ -1713,6 +1872,10 @@ class KubernetesScaleActuator:
                     and decision.prewarm_plan is not None
                     and updated.annotations.get(CACHE_PLACEMENT_BINDING_ANNOTATION)
                     != decision.prewarm_plan.snapshot.placement_binding_id
+                )
+                or (
+                    startup_binding is not None
+                    and updated.pod_template != desired_pod_template
                 )
             ):
                 raise InvalidKubernetesScaleResponseError(

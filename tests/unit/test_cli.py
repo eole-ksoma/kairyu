@@ -1,6 +1,7 @@
 """`kairyu serve` CLI (design m7 D3)."""
 
 import logging
+from types import SimpleNamespace
 
 import pytest
 
@@ -196,3 +197,33 @@ legacy_chat_models: [kairyu-auto]
 def test_command_is_required():
     with pytest.raises(SystemExit):
         cli.main([])
+
+
+def test_cache_agent_serve_uses_runtime_address_and_closes(monkeypatch, tmp_path):
+    config_path = tmp_path / "cache-agent.json"
+    config_path.write_text("{}", encoding="utf-8")
+    config = SimpleNamespace(listen_host="127.0.0.1", listen_port=8181)
+    runtime = SimpleNamespace(app=object(), close_calls=0)
+
+    def close():
+        runtime.close_calls += 1
+
+    runtime.close = close
+    captured = {}
+    monkeypatch.setattr(
+        "kairyu.runners.cache_agent_runtime.load_node_model_cache_agent_runtime_config",
+        lambda path: config,
+    )
+    monkeypatch.setattr(
+        "kairyu.runners.cache_agent_runtime.build_node_model_cache_agent_runtime",
+        lambda value: runtime,
+    )
+    monkeypatch.setattr("uvicorn.run", lambda app, **kwargs: captured.update(app=app, **kwargs))
+
+    cli.main(["cache-agent", "serve", str(config_path)])
+
+    assert captured["app"] is runtime.app
+    assert captured["host"] == "127.0.0.1"
+    assert captured["port"] == 8181
+    assert captured["access_log"] is False
+    assert runtime.close_calls == 1

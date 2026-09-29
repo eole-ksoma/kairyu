@@ -198,6 +198,7 @@ class NodeModelCacheIndex:
         path: Path,
         *,
         node_id: str,
+        cache_root: Path | None = None,
         busy_timeout_seconds: float = 5.0,
         clock_ns: Callable[[], int] = time.time_ns,
     ) -> None:
@@ -205,6 +206,9 @@ class NodeModelCacheIndex:
         self._node_id = self._validate_text(node_id, name="node_id", max_length=255)
         if not path.is_absolute() or "\x00" in str(path):
             raise ValueError("cache index path must be absolute and contain no NUL")
+        cache_root = path.parent if cache_root is None else cache_root
+        if not cache_root.is_absolute() or "\x00" in str(cache_root):
+            raise ValueError("cache root must be absolute and contain no NUL")
         if isinstance(busy_timeout_seconds, bool) or not isinstance(
             busy_timeout_seconds, (int, float)
         ):
@@ -214,7 +218,7 @@ class NodeModelCacheIndex:
         self._busy_timeout_ms = int(float(busy_timeout_seconds) * 1000)
         self._clock_ns = clock_ns
         self._prepare_parent()
-        self._cache_root = self._path.parent
+        self._cache_root = cache_root
         self._initialize()
 
     @property
@@ -224,6 +228,10 @@ class NodeModelCacheIndex:
     @property
     def node_id(self) -> str:
         return self._node_id
+
+    @property
+    def cache_root(self) -> Path:
+        return self._cache_root
 
     def record_verified(
         self,

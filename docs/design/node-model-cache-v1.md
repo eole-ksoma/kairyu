@@ -1,7 +1,8 @@
 # Node model cache v1
 
 Status: WP4.2 fill and WP4.6 Runner-start corruption recovery are implemented
-and integrated with the WP4.3 durable index; daemon/Pod wiring remains open.
+and integrated with the WP4.3 durable index. A fail-closed cache-agent process
+entrypoint is implemented; DaemonSet/Pod wiring remains open.
 
 ## Purpose and authority boundary
 
@@ -16,10 +17,11 @@ before cache directories are touched and again after waiting for the per-digest
 fill lock. A mutable model name, tag, or source path cannot select cache
 content.
 
-WP4.2 supplies the verified fill primitive. It does not yet run a privileged
-node daemon, mutate a Kubernetes workload, or assert that a Runner mounted the
-returned directory. Those integrations must preserve this API's digest-bound
-admission result rather than reconstructing it from labels or paths.
+WP4.2 supplies the verified fill primitive. `kairyu cache-agent serve` now
+assembles it into an authenticated node process, but does not mutate a
+Kubernetes workload or assert that a Runner mounted the returned directory.
+Those integrations must preserve this API's digest-bound admission result
+rather than reconstructing it from labels or paths.
 
 ## Published and staging layout
 

@@ -568,6 +568,7 @@ class NodeModelCacheAgent:
                     resumed_bytes=0,
                     downloaded_bytes=0,
                 )
+
                 self._record_index(
                     result,
                     envelope=envelope,
@@ -629,6 +630,11 @@ class NodeModelCacheAgent:
                 verification_source="filled",
             )
             return result
+
+    def check_ready(self) -> None:
+        """Validate or create the owned cache control directories."""
+
+        self._prepare_root()
 
     def verify_for_runner_start(
         self,

@@ -25,6 +25,13 @@ from kairyu.runners.cache_agent_api import (
     NodeModelPrestageStatus,
     create_node_model_cache_agent_app,
 )
+from kairyu.runners.cache_agent_runtime import (
+    NodeModelCacheAgentAPIKeys,
+    NodeModelCacheAgentRuntime,
+    NodeModelCacheAgentRuntimeConfig,
+    build_node_model_cache_agent_runtime,
+    load_node_model_cache_agent_runtime_config,
+)
 from kairyu.runners.drain import (
     InvalidRunnerDrainEvidenceError,
     ReplicaPoolDrainController,
@@ -208,6 +215,9 @@ __all__ = [
     "InMemoryNodeModelPrestageStore",
     "NodeModelPrestageCapacityError",
     "NodeModelCacheAgentHealth",
+    "NodeModelCacheAgentAPIKeys",
+    "NodeModelCacheAgentRuntime",
+    "NodeModelCacheAgentRuntimeConfig",
     "NodeModelPrestageCommand",
     "NodeModelPrestageConflictError",
     "NodeModelPrestageError",
@@ -275,7 +285,9 @@ __all__ = [
     "build_node_model_prestage_commands",
     "build_node_model_prestage_release_command",
     "create_node_model_cache_agent_app",
+    "build_node_model_cache_agent_runtime",
     "KueueScalingAdmission",
+    "load_node_model_cache_agent_runtime_config",
     "ScalingQuotaAdmission",
     "ScalingQuotaConstraint",
     "ScalingQuotaLimit",

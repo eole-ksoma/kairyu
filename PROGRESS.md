@@ -151,6 +151,13 @@ in `.claude/rules/progress-log.md`).
   kairyu/runners/cache_agent_api.py;
   tests/unit/test_node_model_cache_agent_api.py
 
+### 2026-09-29 — [progress] Executable model cache-agent runtime
+- What: added a fail-closed `cache-agent serve` process assembly with file-based
+  identity/credentials, explicit NVMe state/index binding, durable store
+  validation, resource cleanup, and strict versioned JSON configuration.
+- Refs: kairyu/runners/cache_agent_runtime.py; kairyu/entrypoints/cli.py;
+  tests/unit/test_node_model_cache_agent_runtime.py
+
 ### 2026-09-29 — [progress] Durable node pre-stage placement store
 - What: added a node-scoped PostgreSQL store with shared capacity locking,
   exact replay, fenced CAS transitions, strict schema/configuration checks,

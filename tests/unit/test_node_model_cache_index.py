@@ -50,7 +50,7 @@ def _record(
         manifest_digest=digest,
         model_id=model_id,
         model_revision=model_revision,
-        artifact_path=index.path.parent / "artifacts" / digest / "tree",
+        artifact_path=index.cache_root / "artifacts" / digest / "tree",
         total_bytes=total_bytes,
         file_count=file_count,
         verification_source=verification_source,
@@ -505,6 +505,20 @@ def test_index_is_bound_to_its_cache_root_even_after_database_copy(tmp_path: Pat
 
     with pytest.raises(NodeModelCacheIndexIdentityError, match="cache root"):
         NodeModelCacheIndex(copied_path, node_id="node-a")
+
+
+def test_index_state_file_can_live_below_a_separate_cache_root(tmp_path: Path):
+    cache_root = tmp_path / "cache"
+    index = NodeModelCacheIndex(
+        cache_root / "state/cache-index.sqlite3",
+        node_id="node-a",
+        cache_root=cache_root,
+    )
+
+    record = _record(index)
+
+    assert index.cache_root == cache_root
+    assert record.artifact_path == cache_root / "artifacts" / ("a" * 64) / "tree"
 
 
 def test_list_records_has_stable_model_revision_digest_order(tmp_path: Path):

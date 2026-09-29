@@ -253,6 +253,15 @@ from kairyu.runners.startup_binding_live_authority import (
     RunnerCachePlacementBindingTargetState,
     ScalingControllerPlacementBindingAuthority,
 )
+from kairyu.runners.startup_binding_live_source import (
+    ComposedRunnerCachePlacementBindingLiveStateSource,
+    RunnerCachePlacementBindingCacheReader,
+    RunnerCachePlacementBindingCacheState,
+    RunnerCachePlacementBindingCurrentReader,
+    RunnerCachePlacementBindingDecisionReader,
+    RunnerCachePlacementBindingQuotaReader,
+    RunnerCachePlacementBindingTargetReader,
+)
 from kairyu.runners.startup_scheduling import (
     RUNNER_CACHE_STARTUP_BINDING_ANNOTATION,
     RUNNER_CACHE_STARTUP_BINDING_ID_ANNOTATION,
@@ -377,6 +386,13 @@ __all__ = [
     "RunnerCachePlacementBindingPinEvidence",
     "RunnerCachePlacementBindingTargetState",
     "ScalingControllerPlacementBindingAuthority",
+    "ComposedRunnerCachePlacementBindingLiveStateSource",
+    "RunnerCachePlacementBindingCacheReader",
+    "RunnerCachePlacementBindingCacheState",
+    "RunnerCachePlacementBindingCurrentReader",
+    "RunnerCachePlacementBindingDecisionReader",
+    "RunnerCachePlacementBindingQuotaReader",
+    "RunnerCachePlacementBindingTargetReader",
     "create_runner_cache_placement_binding_authority_app",
     "build_runner_cache_placement_binding_authority_runtime",
     "build_runner_cache_placement_admission_runtime",

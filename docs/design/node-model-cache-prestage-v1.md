@@ -20,8 +20,10 @@ adds its embedded process-boundary assembly with strict configuration,
 file-backed credentials, TLS material validation, bounded budgets, and owned
 shutdown. D3.11 adds leader-fenced validation of the live binding, durable
 decision, target, quota, prewarm capacity, cache freshness, and lifetime.
-Concrete live-state source construction, scheduling compaction, and Kubernetes
-deployment wiring remain deployment tasks.
+D3.12 composes those facts through explicit deadline-bounded current-binding,
+decision, target, quota, and cache backend readers with a second binding read as
+a replacement fence. Concrete backend reader adapters, scheduling compaction,
+and Kubernetes deployment wiring remain deployment tasks.
 
 ## Purpose
 
@@ -559,6 +561,19 @@ Kubernetes, Kueue, and cache-state call. D3.11 does not create an echo source
 from the admission plan store: the live source must be independently backed by
 the process's durable decision and current controller state.
 
+D3.12 adds `ComposedRunnerCachePlacementBindingLiveStateSource`, the concrete
+assembly layer between that protocol and five explicit backend readers. It
+reads the current binding, durable decision, Kubernetes target, refreshed
+quota, and one coherent cache/pre-stage evidence group in order, capping every
+backend timeout by the remaining absolute request budget. It then reads the
+current binding again; replacement before the second read is an authorization
+denial rather than a mixed snapshot. Readiness checks every distinct backend
+once under the same budget. Reader outputs are deep-validated before the D3.11
+authority consumes them, and the cache reader must return prewarm, full
+pre-stage records, physical hints, and owner-scoped pin evidence together.
+Production adapters for the PostgreSQL, Kubernetes/Kueue, and authenticated
+node-agent transports remain the next integration unit.
+
 ## Deployment boundary
 
 `private-ai-cloud-iac` must still provide:
@@ -570,9 +585,9 @@ the process's durable decision and current controller state.
 - reconciliation that replays desired ensure/release commands after restart;
 - a scheduled caller for the implemented bounded compaction contract, with a
   documented retirement cutoff and monitoring of per-placement high-water rows;
-- a concrete deadline-bounded D3.11 live-state source and deployment for the
-  assembled scaling-authority reauthorization/readiness endpoint consumed by
-  D3.8, plus a highly available
+- concrete PostgreSQL, Kubernetes/Kueue, and node-agent reader adapters for the
+  D3.12 live-state source and deployment of the assembled scaling-authority
+  reauthorization/readiness endpoint consumed by D3.8, plus a highly available
   Deployment/Service/MutatingWebhookConfiguration, TLS
   certificate issuance/rotation and trust, ingress restriction, orchestration
   that registers the plan before the D3.2 scale write, and fail-closed webhook

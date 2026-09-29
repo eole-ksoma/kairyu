@@ -137,9 +137,12 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
   artifact, completed pin, and later fresh/pinned residency hint. D3.2 CASes a
   live binding and the scale-from-zero replica update into one workload write,
   carrying the full evidence into the Pod template with required node affinity
-  and binding-scoped node anti-affinity. Incremental per-Pod placement, startup
-  attestation, safe fencing-tombstone compaction, and live environment
-  acceptance remain.
+  and binding-scoped node anti-affinity. D3.3 parses that inherited binding,
+  binds the actual scheduled Pod UID/node to a Runner-side WP4.6 full-digest
+  proof, and blocks cache-bound readiness until the hash-bound proof exactly
+  matches the decision, artifact, pre-stage generation, and resident record.
+  Incremental per-Pod placement, safe fencing-tombstone compaction, and live
+  environment acceptance remain.
 - Qwen3.8-Flash-Next MTP speculative decoding stays off in `qwen3.8-flash-next-dp2-8gpu` until upstream fixes vllm#53912 (prefix caching + MTP output corruption on hybrid GDN); single-stream decode 104 vs 175 tok/s
 - DTO-D15 (2026-08-26) changed the served tiered-example config: verify.sh coding/generic gates and the digest re-pin are pending before the example status can be claimed green again
 - Human sign-off pending on M2–M4 design reviews

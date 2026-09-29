@@ -6,13 +6,15 @@ import hashlib
 import json
 import re
 from datetime import datetime
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from kairyu.artifacts.placement_hint import NodeModelCachePlacementHintSnapshot
-from kairyu.runners.prestage import NodeModelPrestageRecord
 from kairyu.runners.prewarm import ModelCachePlacementState, ScalingPrewarmPlan
+
+if TYPE_CHECKING:
+    from kairyu.runners.prestage import NodeModelPrestageRecord
 
 _MAX_SIGNED_BIGINT = 2**63 - 1
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -215,6 +217,8 @@ def build_runner_cache_startup_binding(
     bound_at: datetime,
 ) -> RunnerCacheStartupBinding:
     """Join ready plan slots to exact pin completions and later physical hints."""
+
+    from kairyu.runners.prestage import NodeModelPrestageRecord
 
     if not isinstance(plan, ScalingPrewarmPlan):
         raise TypeError("plan must be a ScalingPrewarmPlan")

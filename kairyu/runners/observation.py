@@ -8,6 +8,12 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from kairyu.runners.models import RunnerStartupReport
+from kairyu.runners.startup_attestation import (
+    RunnerCacheStartupAttestationError,
+    RunnerCacheStartupProof,
+    validate_runner_cache_startup_proof,
+)
+from kairyu.runners.startup_binding import RunnerCacheStartupBinding
 
 
 def _non_empty(value: str, *, name: str) -> str:
@@ -44,6 +50,7 @@ class RunnerRuntimeObservation(BaseModel):
     ready: bool
     active_requests: int = Field(ge=0)
     startup: RunnerStartupReport | None = None
+    cache_startup_proof: RunnerCacheStartupProof | None = None
     fatal: bool = False
     detail: str = Field(default="", max_length=256)
 
@@ -77,6 +84,13 @@ class RunnerRuntimeObservation(BaseModel):
             raise ValueError("a ready runtime cannot report a fatal condition")
         if self.startup is not None and self.startup.observed_at > self.observed_at:
             raise ValueError("startup observed_at cannot exceed runtime observed_at")
+        if (
+            self.cache_startup_proof is not None
+            and self.cache_startup_proof.verified_at > self.observed_at
+        ):
+            raise ValueError(
+                "cache startup proof verified_at cannot exceed runtime observed_at"
+            )
         return self
 
 
@@ -134,6 +148,7 @@ class RunnerObservation(BaseModel):
     model_revision: str = Field(max_length=512)
     observed_at: datetime
     pod: RunnerPodObservation | None = None
+    cache_startup_binding: RunnerCacheStartupBinding | None = None
     endpoint_ready: bool = False
     runtime: RunnerRuntimeObservation | None = None
 
@@ -158,6 +173,35 @@ class RunnerObservation(BaseModel):
             startup = self.runtime.startup
             if startup.runner_id != self.runner_id:
                 raise ValueError("startup runner_id must match observation runner_id")
+        proof = None if self.runtime is None else self.runtime.cache_startup_proof
+        binding = self.cache_startup_binding
+        if proof is not None and binding is None:
+            raise ValueError("cache startup proof requires an inherited binding")
+        if binding is not None:
+            if binding.model_id != self.model_id:
+                raise ValueError("cache startup binding model_id must match observation")
+            if binding.model_revision != self.model_revision:
+                raise ValueError(
+                    "cache startup binding model_revision must match observation"
+                )
+            if proof is not None:
+                if self.pod is None or self.pod.node_name is None:
+                    raise ValueError(
+                        "cache startup proof requires an assigned observed Pod"
+                    )
+                try:
+                    validate_runner_cache_startup_proof(
+                        binding,
+                        proof,
+                        runner_id=self.runner_id,
+                        node_name=self.pod.node_name,
+                        model_id=self.model_id,
+                        model_revision=self.model_revision,
+                        observed_at=self.runtime.observed_at,
+                        clock_skew_tolerance=None,
+                    )
+                except RunnerCacheStartupAttestationError as error:
+                    raise ValueError(str(error)) from error
         return self
 
 

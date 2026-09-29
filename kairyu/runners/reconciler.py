@@ -32,6 +32,10 @@ from kairyu.runners.observation import (
     RunnerObservationBatch,
     RunnerRuntimeObservation,
 )
+from kairyu.runners.startup_attestation import (
+    RunnerCacheStartupAttestationError,
+    validate_runner_cache_startup_proof,
+)
 
 
 class InvalidRunnerObservationError(RuntimeError):
@@ -119,6 +123,34 @@ def _runtime_fingerprint(runtime: RunnerRuntimeObservation) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _cache_startup_attested(
+    observation: RunnerObservation,
+    clock_skew_tolerance: timedelta,
+) -> bool:
+    runtime = observation.runtime
+    proof = None if runtime is None else runtime.cache_startup_proof
+    binding = observation.cache_startup_binding
+    if binding is None:
+        return proof is None
+    pod = observation.pod
+    if runtime is None or proof is None or pod is None or pod.node_name is None:
+        return False
+    try:
+        validate_runner_cache_startup_proof(
+            binding,
+            proof,
+            runner_id=observation.runner_id,
+            node_name=pod.node_name,
+            model_id=observation.model_id,
+            model_revision=observation.model_revision,
+            observed_at=runtime.observed_at,
+            clock_skew_tolerance=clock_skew_tolerance,
+        )
+    except (RunnerCacheStartupAttestationError, TypeError, ValueError):
+        return False
+    return True
+
+
 def _observed_failure(observation: RunnerObservation) -> RunnerFailure | None:
     pod = observation.pod
     runtime = observation.runtime
@@ -196,7 +228,10 @@ def _startup_state(startup: RunnerStartupReport | None) -> RunnerState:
     return _STARTUP_STATE[last_phase]
 
 
-def _missing_serving_gate(observation: RunnerObservation) -> RunnerFailure:
+def _missing_serving_gate(
+    observation: RunnerObservation,
+    clock_skew_tolerance: timedelta,
+) -> RunnerFailure:
     pod = observation.pod
     runtime = observation.runtime
     if pod is None:
@@ -221,6 +256,20 @@ def _missing_serving_gate(observation: RunnerObservation) -> RunnerFailure:
             "Runner readiness observation is unavailable",
             retryable=True,
         )
+    if observation.cache_startup_binding is not None and not _cache_startup_attested(
+        observation,
+        clock_skew_tolerance,
+    ):
+        if runtime.cache_startup_proof is None:
+            return _failure(
+                "cache_startup_attestation_missing",
+                "cache-bound Runner has not attested its scheduled node and artifact",
+                retryable=True,
+            )
+        return _failure(
+            "cache_startup_attestation_invalid",
+            "cache-bound Runner startup proof does not match the observed Pod",
+        )
     return _failure(
         "readiness_failed",
         runtime.detail or "Runner readiness is false",
@@ -231,6 +280,7 @@ def _missing_serving_gate(observation: RunnerObservation) -> RunnerFailure:
 def _serving_gates_ready(
     observation: RunnerObservation,
     startup: RunnerStartupReport | None,
+    clock_skew_tolerance: timedelta,
 ) -> bool:
     pod = observation.pod
     runtime = observation.runtime
@@ -242,6 +292,7 @@ def _serving_gates_ready(
         and observation.endpoint_ready
         and runtime is not None
         and runtime.ready
+        and _cache_startup_attested(observation, clock_skew_tolerance)
         and startup is not None
         and startup.completed
     )
@@ -254,6 +305,7 @@ def _desired_state(
     active_requests: int,
     startup: RunnerStartupReport | None,
     serving_gate_loss_confirmed: bool,
+    clock_skew_tolerance: timedelta,
 ) -> tuple[RunnerState, RunnerFailure | None]:
     pod = observation.pod
     if previous is not None:
@@ -295,7 +347,11 @@ def _desired_state(
     if pod.phase is KubernetesPodPhase.RUNNING and (startup is None or not startup.completed):
         return _startup_state(startup), None
 
-    all_serving_gates = _serving_gates_ready(observation, startup)
+    all_serving_gates = _serving_gates_ready(
+        observation,
+        startup,
+        clock_skew_tolerance,
+    )
     if all_serving_gates:
         state = RunnerState.BUSY if active_requests > 0 else RunnerState.READY
         return state, None
@@ -307,7 +363,10 @@ def _desired_state(
         if not serving_gate_loss_confirmed:
             state = RunnerState.BUSY if active_requests > 0 else RunnerState.READY
             return state, None
-        return RunnerState.UNHEALTHY, _missing_serving_gate(observation)
+        return RunnerState.UNHEALTHY, _missing_serving_gate(
+            observation,
+            clock_skew_tolerance,
+        )
     return RunnerState.WARMING, None
 
 
@@ -318,6 +377,14 @@ def _validate_identity(previous: RunnerStatus, observation: RunnerObservation) -
     if observation.observed_at < previous.observed_at:
         raise InvalidRunnerObservationError("Runner observations cannot move backwards")
     if observation.pod is not None:
+        binding = observation.cache_startup_binding
+        if previous.cache_startup_binding_id is not None and (
+            binding is None
+            or binding.binding_id != previous.cache_startup_binding_id
+        ):
+            raise InvalidRunnerObservationError(
+                "Runner cache startup binding cannot disappear or change"
+            )
         if previous.node_name is not None and observation.pod.node_name != previous.node_name:
             raise InvalidRunnerObservationError("Runner node_name cannot change")
         if previous.gpu_uuids and observation.pod.gpu_uuids != previous.gpu_uuids:
@@ -475,6 +542,7 @@ def reconcile_runner_status(
         active_requests=active_requests,
         startup=startup,
         serving_gate_loss_confirmed=serving_gate_loss_confirmed,
+        clock_skew_tolerance=runtime_clock_skew_tolerance,
     )
     if previous is None:
         previous = RunnerStatus(
@@ -487,6 +555,11 @@ def reconcile_runner_status(
             observed_at=observation.observed_at,
             node_name=None if observation.pod is None else observation.pod.node_name,
             pod_uid=None if observation.pod is None else observation.pod.uid,
+            cache_startup_binding_id=(
+                None
+                if observation.cache_startup_binding is None
+                else observation.cache_startup_binding.binding_id
+            ),
             gpu_uuids=() if observation.pod is None else observation.pod.gpu_uuids,
             runtime_observed_at=None if runtime is None else runtime.observed_at,
             runtime_observation_fingerprint=(
@@ -511,6 +584,10 @@ def reconcile_runner_status(
                 "pod_uid": observation.pod.uid,
                 "gpu_uuids": observation.pod.gpu_uuids,
             }
+        )
+    if observation.cache_startup_binding is not None:
+        values["cache_startup_binding_id"] = (
+            observation.cache_startup_binding.binding_id
         )
     if runtime is not None:
         values["runtime_observed_at"] = runtime.observed_at
@@ -658,7 +735,11 @@ class RunnerStatusReconciler:
                 if effective.runtime is None
                 else effective.runtime.startup
             )
-            gate_ready = _serving_gates_ready(effective, startup)
+            gate_ready = _serving_gates_ready(
+                effective,
+                startup,
+                self._runtime_clock_skew_tolerance,
+            )
             serving_gates[runner_id] = gate_ready
             serving_gate_observed_at[runner_id] = min(
                 batch.source_started_at,

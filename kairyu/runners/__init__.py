@@ -183,6 +183,13 @@ from kairyu.runners.scaling_quota import (
     kueue_scaling_workload_name,
     parse_kueue_scaling_admission,
 )
+from kairyu.runners.startup_attestation import (
+    DEFAULT_RUNNER_CLOCK_SKEW_TOLERANCE,
+    RunnerCacheStartupAttestationError,
+    RunnerCacheStartupProof,
+    build_runner_cache_startup_proof,
+    validate_runner_cache_startup_proof,
+)
 from kairyu.runners.startup_binding import (
     RunnerCacheStartupBinding,
     RunnerCacheStartupBindingError,
@@ -198,6 +205,7 @@ from kairyu.runners.startup_scheduling import (
 )
 
 __all__ = [
+    "DEFAULT_RUNNER_CLOCK_SKEW_TOLERANCE",
     "RUNNER_STARTUP_PHASES",
     "OPTIONAL_RUNNER_STARTUP_PHASES",
     "PostgresRunnerLeaderLeaseStore",
@@ -271,6 +279,8 @@ __all__ = [
     "RunnerCacheStartupBinding",
     "RunnerCacheStartupBindingError",
     "RunnerCacheStartupPlacement",
+    "RunnerCacheStartupAttestationError",
+    "RunnerCacheStartupProof",
     "RUNNER_CACHE_STARTUP_BINDING_ANNOTATION",
     "RUNNER_CACHE_STARTUP_BINDING_ID_ANNOTATION",
     "RUNNER_CACHE_STARTUP_BINDING_LABEL",
@@ -306,6 +316,7 @@ __all__ = [
     "build_node_model_prestage_commands",
     "build_node_model_prestage_release_command",
     "build_runner_cache_startup_binding",
+    "build_runner_cache_startup_proof",
     "build_runner_start_prestage_commands",
     "bind_runner_cache_to_pod_template",
     "create_node_model_cache_agent_app",
@@ -358,5 +369,6 @@ __all__ = [
     "start_startup_phase",
     "transition_runner_status",
     "validate_runner_transition",
+    "validate_runner_cache_startup_proof",
     "validate_startup_report_update",
 ]

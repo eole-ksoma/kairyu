@@ -13,10 +13,11 @@ from kairyu.runners.kubernetes import (
     RELEASE_ID_ANNOTATION,
 )
 from kairyu.runners.startup_binding import RunnerCacheStartupBinding
-
-RUNNER_CACHE_STARTUP_BINDING_ANNOTATION = "kairyu.ai/cache-startup-binding"
-RUNNER_CACHE_STARTUP_BINDING_ID_ANNOTATION = "kairyu.ai/cache-startup-binding-id"
-RUNNER_CACHE_STARTUP_BINDING_LABEL = "kairyu.ai/cache-startup-binding-slot"
+from kairyu.runners.startup_metadata import (
+    RUNNER_CACHE_STARTUP_BINDING_ANNOTATION,
+    RUNNER_CACHE_STARTUP_BINDING_ID_ANNOTATION,
+    RUNNER_CACHE_STARTUP_BINDING_LABEL,
+)
 
 _NODE_NAME_FIELD = "metadata.name"
 _NODE_TOPOLOGY_KEY = "kubernetes.io/hostname"

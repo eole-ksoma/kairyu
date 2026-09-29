@@ -6,10 +6,11 @@ and a shared durable PostgreSQL command store. The authenticated node HTTP API
 and executable runtime are implemented. D3.1 additionally binds every proposed
 Runner start to a decision-matching pre-stage pin and a later fresh physical
 residency hint on the exact scheduler node. D3.2 atomically applies that binding
-to a scale-from-zero workload Pod template and replica count. Incremental
-per-Pod placement and Runner-side consumption of the binding remain open. Safe
-released-placement tombstone compaction remains a separate store-lifecycle
-task.
+to a scale-from-zero workload Pod template and replica count. D3.3 requires an
+exact Runner-side startup proof before readiness. D3.4 adds the library-side
+CREATE admission and linearizable claim contract for incremental per-Pod
+placement. Safe released-placement tombstone compaction and production webhook
+wiring remain separate deployment/store-lifecycle tasks.
 
 ## Purpose
 
@@ -254,7 +255,9 @@ binding digest as annotations. Model/revision/release identity is copied or
 must already match. Required node affinity ANDs the binding's node names into
 every existing required selector term; existing preferred and required policy
 is preserved. A binding-scoped required Pod anti-affinity term prevents two
-new replicas from occupying the same hostname. Exact replay removes and
+new replicas from occupying the same hostname. The template also carries the
+target identity and managed scheduling gate consumed by D3.4 before each Pod
+is persisted. Exact replay removes and
 rebuilds only the prior managed terms and produces byte-equivalent template
 state. Malformed prior evidence, ambiguous managed terms, conflicting identity,
 or annotation-size overflow fails closed.
@@ -269,8 +272,8 @@ This shared-template mechanism is deliberately limited to scale-from-zero.
 Changing a Deployment or StatefulSet template while replicas already exist can
 roll existing Pods and cannot express a distinct placement per new ordinal.
 Such an incremental scale-up is rejected before mutation. A later D3 unit must
-use a Pod-level scheduling gate or equivalent controller-owned per-Pod
-assignment.
+use the D3.4 Pod CREATE admission path described below; it must not weaken this
+scale-from-zero guard by rewriting a live workload template.
 
 ## Runner startup attestation
 
@@ -302,6 +305,59 @@ observed with a binding, its digest is retained in `RunnerStatus`; removing or
 changing the Pod annotation cannot downgrade that Runner into the legacy
 readiness path.
 
+## Incremental per-Pod placement
+
+D3.4 supplies the library-side admission boundary for scale-up while replicas
+already exist. The controller registers one still-live
+`RunnerCacheStartupBinding` before increasing desired replicas. The workload
+template already carries `kairyu.ai/cache-startup-target` and the
+`kairyu.ai/cache-startup-placement` scheduling gate. A mutating admission
+handler processes each Pod CREATE before persistence; it does not attempt to
+change immutable scheduling fields on a live Pod or rewrite the shared workload
+template.
+
+When the CREATE object inherits a D3.2 full binding but has no selected-placement
+annotation, admission treats it as template-derived rather than already
+admitted. It strictly removes the old multi-node managed affinity, binding
+anti-affinity, and binding label, then writes the same or successor binding's
+single selected node. Once a selected-placement annotation exists, only an
+exact replay is accepted. This distinction lets the initial scale-from-zero and
+later incremental scale share one gated template without rolling existing Pods.
+
+Admission resolves the active target plan, then matches the request namespace,
+controller owner API version/kind/name/UID, and AdmissionRequest creator username
+before any capacity is consumed. It reauthorizes the complete binding and
+atomically claims the next canonical placement by namespace/name and binding
+digest. A retry for the same Pod name returns the same claim even if the API
+server supplies a new admission UID. Concurrent names receive unique placement
+IDs. Plan replacement, expiration, exhaustion, authority drift, and malformed
+Pod metadata all fail closed.
+
+The admitted Pod has the managed scheduling gate removed and an exact
+`metadata.name In [node]` match field ANDed into every existing required node
+selector term. Other gates and affinity remain intact. The full canonical
+binding, digest, selected placement, model/revision/release identity, and
+binding label are written into Pod metadata for the D3.3 observer and startup
+proof. The watcher retains the selected placement separately, checks it against
+the actual scheduler node, and D3.3 requires the Runner proof to name that same
+placement. Reconciliation prevents the placement annotation from disappearing
+or changing after observation. Replay accepts only the same binding and placement and strictly rejects
+duplicate JSON keys, non-finite values, incomplete annotations, conflicting
+identity, or changed managed affinity.
+
+`InMemoryRunnerCachePlacementAdmissionStore` is an executable thread-safe
+specification for tests and a single admission process. A production webhook
+replica set requires a shared linearizable implementation of the same
+register/resolve/claim/release protocol. Rollback applies only to a newly created
+claim that no concurrent retry has observed; once replayed, it is conservatively
+protected even if one request later fails mutation. A claim is retained after
+an allowed response because the webhook cannot prove that later admission
+stages persisted the Pod. A claimed plan cannot be replaced—even when
+exhausted—until its binding expiry plus a configured replay safety window. The
+window must exceed the admission request/response timeout. Thus old placement
+nodes stay reserved until no prior allowed response can plausibly persist; an
+unclaimed plan may rotate immediately after binding expiry.
+
 ## Deployment boundary
 
 `private-ai-cloud-iac` must still provide:
@@ -313,8 +369,9 @@ readiness path.
 - reconciliation that replays desired ensure/release commands after restart;
 - bounded tombstone retention/compaction that durably preserves each retired
   placement's generation, leader fence, and target-revision high-water marks;
-- incremental per-Pod scheduling for the implemented
-  `RunnerCacheStartupBinding` (scale-from-zero startup attestation is implemented);
+- a highly available mutating admission webhook, shared linearizable D3.4 plan
+  and claim store, orchestration that registers the plan before the D3.2 scale
+  write, and fail-closed webhook policy;
 - metrics and audit export for command latency, bytes, attempts, failures, and
   pin reconciliation; and
 - live node-pool acceptance with real S3, NVMe, Kueue, and Runner startup.

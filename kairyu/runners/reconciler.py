@@ -143,6 +143,7 @@ def _cache_startup_attested(
             node_name=pod.node_name,
             model_id=observation.model_id,
             model_revision=observation.model_revision,
+            placement_id=observation.cache_startup_placement_id,
             observed_at=runtime.observed_at,
             clock_skew_tolerance=clock_skew_tolerance,
         )
@@ -385,6 +386,13 @@ def _validate_identity(previous: RunnerStatus, observation: RunnerObservation) -
             raise InvalidRunnerObservationError(
                 "Runner cache startup binding cannot disappear or change"
             )
+        if previous.cache_startup_placement_id is not None and (
+            observation.cache_startup_placement_id
+            != previous.cache_startup_placement_id
+        ):
+            raise InvalidRunnerObservationError(
+                "Runner cache startup placement cannot disappear or change"
+            )
         if previous.node_name is not None and observation.pod.node_name != previous.node_name:
             raise InvalidRunnerObservationError("Runner node_name cannot change")
         if previous.gpu_uuids and observation.pod.gpu_uuids != previous.gpu_uuids:
@@ -560,6 +568,7 @@ def reconcile_runner_status(
                 if observation.cache_startup_binding is None
                 else observation.cache_startup_binding.binding_id
             ),
+            cache_startup_placement_id=observation.cache_startup_placement_id,
             gpu_uuids=() if observation.pod is None else observation.pod.gpu_uuids,
             runtime_observed_at=None if runtime is None else runtime.observed_at,
             runtime_observation_fingerprint=(
@@ -588,6 +597,10 @@ def reconcile_runner_status(
     if observation.cache_startup_binding is not None:
         values["cache_startup_binding_id"] = (
             observation.cache_startup_binding.binding_id
+        )
+    if observation.cache_startup_placement_id is not None:
+        values["cache_startup_placement_id"] = (
+            observation.cache_startup_placement_id
         )
     if runtime is not None:
         values["runtime_observed_at"] = runtime.observed_at

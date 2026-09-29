@@ -141,7 +141,11 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
   binds the actual scheduled Pod UID/node to a Runner-side WP4.6 full-digest
   proof, and blocks cache-bound readiness until the hash-bound proof exactly
   matches the decision, artifact, pre-stage generation, and resident record.
-  Incremental per-Pod placement, safe fencing-tombstone compaction, and live
+  D3.4 adds a Pod CREATE admission contract with workload/creator-bound,
+  linearizable per-name claims, exact per-placement node affinity, replay
+  safety-window reservations, retry idempotency, and concurrent placement uniqueness without
+  rewriting the shared workload template. Production webhook
+  and shared claim-store wiring, safe fencing-tombstone compaction, and live
   environment acceptance remain.
 - Qwen3.8-Flash-Next MTP speculative decoding stays off in `qwen3.8-flash-next-dp2-8gpu` until upstream fixes vllm#53912 (prefix caching + MTP output corruption on hybrid GDN); single-stream decode 104 vs 175 tok/s
 - DTO-D15 (2026-08-26) changed the served tiered-example config: verify.sh coding/generic gates and the digest re-pin are pending before the example status can be claimed green again
@@ -151,6 +155,19 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
+
+### 2026-09-29 — [progress] Incremental cache-bound Pod placement
+- What: added a gated Pod CREATE admission controller, canonical per-Pod
+  placement claims, workload/creator authorization, replay-safe claim rollback
+  and cross-generation node reservations, exact node-affinity injection, end-to-end selected-placement
+  attestation, strict binding replay, and a thread-safe executable store contract
+  for production shared-store wiring.
+- Why: increasing replicas on a live workload must assign every new Pod to one
+  unique ready cache placement without changing its shared template and rolling
+  existing Pods.
+- Refs: docs/design/node-model-cache-prestage-v1.md;
+  kairyu/runners/{startup_admission,startup_scheduling,startup_metadata}.py;
+  tests/unit/test_runner_startup_admission.py
 
 ### 2026-09-29 — [progress] Atomic cache-bound cold-start scheduling
 - What: added an idempotent Pod-template binding, exact node affinity,

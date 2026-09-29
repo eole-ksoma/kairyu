@@ -214,6 +214,7 @@ def validate_runner_cache_startup_proof(
     model_id: str,
     model_revision: str,
     observed_at: datetime,
+    placement_id: str | None = None,
     clock_skew_tolerance: timedelta | None = DEFAULT_RUNNER_CLOCK_SKEW_TOLERANCE,
 ) -> None:
     """Fail closed unless a runtime proof exactly attests one observed Pod."""
@@ -244,6 +245,7 @@ def validate_runner_cache_startup_proof(
         )
     if (
         placement is None
+        or (placement_id is not None and proof.placement_id != placement_id)
         or proof.runner_id != runner_id
         or proof.node_name != node_name
         or proof.binding_id != binding.binding_id

@@ -18,6 +18,8 @@ from kairyu.runners import (
     RELEASE_ID_ANNOTATION,
     RUNNER_CACHE_STARTUP_BINDING_ANNOTATION,
     RUNNER_CACHE_STARTUP_BINDING_ID_ANNOTATION,
+    RUNNER_CACHE_STARTUP_PLACEMENT_ANNOTATION,
+    RUNNER_CACHE_STARTUP_TARGET_ANNOTATION,
     RUNNER_CONTAINER_ANNOTATION,
     KubernetesPodPhase,
     KubernetesRunnerWatcher,
@@ -189,6 +191,51 @@ def test_parser_preserves_and_validates_inherited_cache_binding() -> None:
     parsed = parse_runner_pods(payload)["uid-a"]
 
     assert parsed.cache_startup_binding == binding
+
+
+def test_parser_preserves_exact_incremental_placement() -> None:
+    payload = _pod_payload()
+    binding = _cache_binding()
+    annotations = payload["items"][1]["metadata"]["annotations"]
+    annotations.update(
+        {
+            RUNNER_CACHE_STARTUP_BINDING_ANNOTATION: binding.model_dump_json(),
+            RUNNER_CACHE_STARTUP_BINDING_ID_ANNOTATION: binding.binding_id,
+            RUNNER_CACHE_STARTUP_TARGET_ANNOTATION: binding.target_id,
+            RUNNER_CACHE_STARTUP_PLACEMENT_ANNOTATION: "placement-a",
+        }
+    )
+
+    parsed = parse_runner_pods(payload)["uid-a"]
+
+    assert parsed.cache_startup_binding == binding
+    assert parsed.cache_startup_placement_id == "placement-a"
+
+
+@pytest.mark.parametrize(
+    ("placement", "node_name"),
+    [(None, "gpu-node-a"), ("placement-missing", "gpu-node-a"), ("placement-a", "gpu-b")],
+)
+def test_parser_rejects_incomplete_or_mismatched_incremental_placement(
+    placement: str | None,
+    node_name: str,
+) -> None:
+    payload = _pod_payload()
+    binding = _cache_binding()
+    annotations = payload["items"][1]["metadata"]["annotations"]
+    annotations.update(
+        {
+            RUNNER_CACHE_STARTUP_BINDING_ANNOTATION: binding.model_dump_json(),
+            RUNNER_CACHE_STARTUP_BINDING_ID_ANNOTATION: binding.binding_id,
+            RUNNER_CACHE_STARTUP_TARGET_ANNOTATION: binding.target_id,
+        }
+    )
+    if placement is not None:
+        annotations[RUNNER_CACHE_STARTUP_PLACEMENT_ANNOTATION] = placement
+    payload["items"][1]["spec"]["nodeName"] = node_name
+
+    with pytest.raises(ValueError):
+        parse_runner_pods(payload)
 
 
 @pytest.mark.parametrize(

@@ -149,6 +149,7 @@ class RunnerObservation(BaseModel):
     observed_at: datetime
     pod: RunnerPodObservation | None = None
     cache_startup_binding: RunnerCacheStartupBinding | None = None
+    cache_startup_placement_id: str | None = Field(default=None, max_length=255)
     endpoint_ready: bool = False
     runtime: RunnerRuntimeObservation | None = None
 
@@ -161,6 +162,13 @@ class RunnerObservation(BaseModel):
     @classmethod
     def validate_observed_at(cls, value: datetime) -> datetime:
         return _aware(value, name="observed_at")
+
+    @field_validator("cache_startup_placement_id")
+    @classmethod
+    def validate_cache_placement_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _non_empty(value, name="cache_startup_placement_id")
 
     @model_validator(mode="after")
     def validate_consistency(self) -> RunnerObservation:
@@ -177,6 +185,8 @@ class RunnerObservation(BaseModel):
         binding = self.cache_startup_binding
         if proof is not None and binding is None:
             raise ValueError("cache startup proof requires an inherited binding")
+        if self.cache_startup_placement_id is not None and binding is None:
+            raise ValueError("cache startup placement requires an inherited binding")
         if binding is not None:
             if binding.model_id != self.model_id:
                 raise ValueError("cache startup binding model_id must match observation")
@@ -184,6 +194,24 @@ class RunnerObservation(BaseModel):
                 raise ValueError(
                     "cache startup binding model_revision must match observation"
                 )
+            if self.cache_startup_placement_id is not None:
+                placements = tuple(
+                    placement
+                    for placement in binding.placements
+                    if placement.placement_id == self.cache_startup_placement_id
+                )
+                if len(placements) != 1:
+                    raise ValueError(
+                        "cache startup placement must belong to the inherited binding"
+                    )
+                if (
+                    self.pod is not None
+                    and self.pod.node_name is not None
+                    and self.pod.node_name != placements[0].node_name
+                ):
+                    raise ValueError(
+                        "observed Pod node must match the selected cache placement"
+                    )
             if proof is not None:
                 if self.pod is None or self.pod.node_name is None:
                     raise ValueError(
@@ -197,6 +225,7 @@ class RunnerObservation(BaseModel):
                         node_name=self.pod.node_name,
                         model_id=self.model_id,
                         model_revision=self.model_revision,
+                        placement_id=self.cache_startup_placement_id,
                         observed_at=self.runtime.observed_at,
                         clock_skew_tolerance=None,
                     )

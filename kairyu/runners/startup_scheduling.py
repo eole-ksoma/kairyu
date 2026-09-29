@@ -17,6 +17,10 @@ from kairyu.runners.startup_metadata import (
     RUNNER_CACHE_STARTUP_BINDING_ANNOTATION,
     RUNNER_CACHE_STARTUP_BINDING_ID_ANNOTATION,
     RUNNER_CACHE_STARTUP_BINDING_LABEL,
+    RUNNER_CACHE_STARTUP_PLACEMENT_ANNOTATION,
+    RUNNER_CACHE_STARTUP_SCHEDULING_GATE,
+    RUNNER_CACHE_STARTUP_TARGET_ANNOTATION,
+    parse_runner_cache_startup_binding_annotations,
 )
 
 _NODE_NAME_FIELD = "metadata.name"
@@ -71,20 +75,16 @@ def _anti_affinity_term(label_value: str) -> dict[str, object]:
 def _old_binding(annotations: Mapping[str, str]) -> RunnerCacheStartupBinding | None:
     payload = annotations.get(RUNNER_CACHE_STARTUP_BINDING_ANNOTATION)
     binding_id = annotations.get(RUNNER_CACHE_STARTUP_BINDING_ID_ANNOTATION)
-    if payload is None and binding_id is None:
-        return None
-    if payload is None or binding_id is None:
-        raise RunnerCacheSchedulingError("Pod template has incomplete startup binding metadata")
+    if (payload is None) != (binding_id is None):
+        raise RunnerCacheSchedulingError(
+            "Pod template has incomplete startup binding metadata"
+        )
     try:
-        decoded = json.loads(payload)
-        binding = RunnerCacheStartupBinding.model_validate(decoded)
+        return parse_runner_cache_startup_binding_annotations(annotations)
     except (ValueError, TypeError) as error:
         raise RunnerCacheSchedulingError(
             "Pod template startup binding metadata is invalid"
         ) from error
-    if binding.binding_id != binding_id:
-        raise RunnerCacheSchedulingError("Pod template startup binding ID is inconsistent")
-    return binding
 
 
 def _required_node_affinity(
@@ -147,6 +147,32 @@ def _required_pod_anti_affinity(
     required.append(_anti_affinity_term(label_value))
 
 
+def _remove_required_pod_anti_affinity(
+    affinity: dict[str, Any],
+    *,
+    label_value: str,
+) -> None:
+    pod_anti_affinity = affinity.get("podAntiAffinity")
+    if not isinstance(pod_anti_affinity, dict):
+        raise RunnerCacheSchedulingError(
+            "template-derived Pod requires managed Pod anti-affinity"
+        )
+    required = pod_anti_affinity.get("requiredDuringSchedulingIgnoredDuringExecution")
+    if not isinstance(required, list) or not all(isinstance(item, dict) for item in required):
+        raise RunnerCacheSchedulingError(
+            "template-derived Pod required anti-affinity must contain objects"
+        )
+    expected = _anti_affinity_term(label_value)
+    matches = [index for index, item in enumerate(required) if item == expected]
+    if len(matches) != 1:
+        raise RunnerCacheSchedulingError(
+            "template-derived managed Pod anti-affinity is missing or ambiguous"
+        )
+    required.pop(matches[0])
+    if not required:
+        pod_anti_affinity.pop("requiredDuringSchedulingIgnoredDuringExecution")
+
+
 def bind_runner_cache_to_pod_template(
     template: Mapping[str, Any],
     binding: RunnerCacheStartupBinding,
@@ -207,6 +233,7 @@ def bind_runner_cache_to_pod_template(
     annotations[RUNNER_CACHE_STARTUP_BINDING_ANNOTATION] = _binding_payload(binding)
     annotations[RUNNER_CACHE_STARTUP_BINDING_ID_ANNOTATION] = binding.binding_id
     identities = {
+        RUNNER_CACHE_STARTUP_TARGET_ANNOTATION: binding.target_id,
         MODEL_ID_ANNOTATION: binding.model_id,
         MODEL_REVISION_ANNOTATION: binding.model_revision,
         RELEASE_ID_ANNOTATION: release_id,
@@ -225,8 +252,153 @@ def bind_runner_cache_to_pod_template(
     if annotation_bytes > _MAX_TOTAL_ANNOTATION_BYTES:
         raise RunnerCacheSchedulingError("Pod template annotations exceed the safe size limit")
     labels[RUNNER_CACHE_STARTUP_BINDING_LABEL] = label_value
+    gates = spec.setdefault("schedulingGates", [])
+    if not isinstance(gates, list) or not all(isinstance(gate, dict) for gate in gates):
+        raise RunnerCacheSchedulingError("Pod template schedulingGates must contain objects")
+    managed_gate = {"name": RUNNER_CACHE_STARTUP_SCHEDULING_GATE}
+    matches = [gate for gate in gates if gate == managed_gate]
+    if previous is None:
+        if matches:
+            raise RunnerCacheSchedulingError(
+                "unbound Pod template has an ambiguous cache startup scheduling gate"
+            )
+        gates.append(managed_gate)
+    elif len(matches) != 1:
+        raise RunnerCacheSchedulingError(
+            "bound Pod template requires exactly one cache startup scheduling gate"
+        )
     if annotations or annotations_present:
         metadata["annotations"] = annotations
     if labels or labels_present:
         metadata["labels"] = labels
+    return result
+
+
+def admit_runner_cache_placement_for_gated_pod(
+    pod: Mapping[str, Any],
+    binding: RunnerCacheStartupBinding,
+    *,
+    placement_id: str,
+    release_id: str,
+) -> dict[str, Any]:
+    """Mutate one gated Pod CREATE object to one exact cache placement."""
+
+    if not isinstance(binding, RunnerCacheStartupBinding):
+        raise TypeError("binding must be a RunnerCacheStartupBinding")
+    binding = RunnerCacheStartupBinding.model_validate(binding.model_dump())
+    if not isinstance(placement_id, str) or not placement_id.strip() or "\x00" in placement_id:
+        raise ValueError("placement_id must be a non-empty string without NUL")
+    if not isinstance(release_id, str) or not release_id.strip() or "\x00" in release_id:
+        raise ValueError("release_id must be a non-empty string without NUL")
+    placements = {
+        placement.placement_id: placement for placement in binding.placements
+    }
+    placement = placements.get(placement_id)
+    if placement is None:
+        raise RunnerCacheSchedulingError("placement_id is absent from startup binding")
+    if not isinstance(pod, Mapping):
+        raise TypeError("pod must be a mapping")
+    result = copy.deepcopy(dict(pod))
+    metadata = result.get("metadata")
+    spec = result.get("spec")
+    if not isinstance(metadata, dict) or not isinstance(spec, dict):
+        raise RunnerCacheSchedulingError("Pod requires metadata and spec objects")
+    node_name = spec.get("nodeName")
+    if node_name is not None and node_name != placement.node_name:
+        raise RunnerCacheSchedulingError("scheduled Pod is on a different placement node")
+
+    annotations_present = "annotations" in metadata
+    labels_present = "labels" in metadata
+    annotations = _string_map(metadata.get("annotations", {}), name="Pod annotations")
+    labels = _string_map(metadata.get("labels", {}), name="Pod labels")
+    if annotations.get(RUNNER_CACHE_STARTUP_TARGET_ANNOTATION) != binding.target_id:
+        raise RunnerCacheSchedulingError(
+            "gated Pod target annotation does not match the startup binding"
+        )
+    previous = _old_binding(annotations)
+    previous_placement_id = annotations.get(
+        RUNNER_CACHE_STARTUP_PLACEMENT_ANNOTATION
+    )
+    if previous is None and previous_placement_id is not None:
+        raise RunnerCacheSchedulingError("Pod has incomplete startup placement metadata")
+    admitted_replay = previous is not None and previous_placement_id is not None
+    template_derived = previous is not None and previous_placement_id is None
+    if admitted_replay and (
+        previous.binding_id != binding.binding_id
+        or previous_placement_id != placement_id
+    ):
+        raise RunnerCacheSchedulingError("Pod is already bound to another placement")
+
+    gates = spec.get("schedulingGates", [])
+    if not isinstance(gates, list) or not all(isinstance(gate, dict) for gate in gates):
+        raise RunnerCacheSchedulingError("Pod schedulingGates must contain objects")
+    managed_gate = {"name": RUNNER_CACHE_STARTUP_SCHEDULING_GATE}
+    matches = [index for index, gate in enumerate(gates) if gate == managed_gate]
+    if previous is None or template_derived:
+        if len(matches) != 1:
+            raise RunnerCacheSchedulingError(
+                "unbound Pod requires exactly one cache startup scheduling gate"
+            )
+        if node_name is not None:
+            raise RunnerCacheSchedulingError("unbound gated Pod must not be scheduled")
+        gates.pop(matches[0])
+    elif matches:
+        raise RunnerCacheSchedulingError("bound Pod cannot regain its scheduling gate")
+
+    affinity = spec.setdefault("affinity", {})
+    if not isinstance(affinity, dict):
+        raise RunnerCacheSchedulingError("Pod affinity must be an object")
+    previous_nodes = None
+    if admitted_replay:
+        previous_nodes = (placement.node_name,)
+    elif template_derived:
+        previous_nodes = tuple(
+            prior_placement.node_name for prior_placement in previous.placements
+        )
+    _required_node_affinity(
+        affinity,
+        node_names=(placement.node_name,),
+        previous_node_names=previous_nodes,
+    )
+    if template_derived:
+        previous_label = _binding_label(previous.binding_id)
+        if labels.get(RUNNER_CACHE_STARTUP_BINDING_LABEL) != previous_label:
+            raise RunnerCacheSchedulingError(
+                "template-derived Pod binding label is missing or inconsistent"
+            )
+        _remove_required_pod_anti_affinity(
+            affinity,
+            label_value=previous_label,
+        )
+
+    annotations[RUNNER_CACHE_STARTUP_BINDING_ANNOTATION] = _binding_payload(binding)
+    annotations[RUNNER_CACHE_STARTUP_BINDING_ID_ANNOTATION] = binding.binding_id
+    annotations[RUNNER_CACHE_STARTUP_PLACEMENT_ANNOTATION] = placement_id
+    identities = {
+        MODEL_ID_ANNOTATION: binding.model_id,
+        MODEL_REVISION_ANNOTATION: binding.model_revision,
+        RELEASE_ID_ANNOTATION: release_id,
+    }
+    for name, value in identities.items():
+        existing = annotations.get(name)
+        if existing is not None and existing != value:
+            raise RunnerCacheSchedulingError(
+                f"Pod {name!r} conflicts with the startup binding"
+            )
+        annotations[name] = value
+    annotation_bytes = sum(
+        len(name.encode("utf-8")) + len(value.encode("utf-8"))
+        for name, value in annotations.items()
+    )
+    if annotation_bytes > _MAX_TOTAL_ANNOTATION_BYTES:
+        raise RunnerCacheSchedulingError("Pod annotations exceed the safe size limit")
+    labels[RUNNER_CACHE_STARTUP_BINDING_LABEL] = _binding_label(binding.binding_id)
+    if annotations or annotations_present:
+        metadata["annotations"] = annotations
+    if labels or labels_present:
+        metadata["labels"] = labels
+    if gates:
+        spec["schedulingGates"] = gates
+    else:
+        spec.pop("schedulingGates", None)
     return result

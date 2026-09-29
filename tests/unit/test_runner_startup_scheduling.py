@@ -118,6 +118,10 @@ def test_binding_constrains_every_node_term_and_persists_full_evidence() -> None
     annotations = result["metadata"]["annotations"]
     assert annotations["example.com/owner"] == "platform"
     assert annotations[RUNNER_CACHE_STARTUP_BINDING_ID_ANNOTATION] == binding.binding_id
+    assert annotations["kairyu.ai/cache-startup-target"] == binding.target_id
+    assert result["spec"]["schedulingGates"] == [
+        {"name": "kairyu.ai/cache-startup-placement"}
+    ]
     assert (
         RunnerCacheStartupBinding.model_validate_json(
             annotations[RUNNER_CACHE_STARTUP_BINDING_ANNOTATION]

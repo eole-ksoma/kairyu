@@ -305,6 +305,19 @@ def test_observed_pod_cannot_downgrade_by_removing_its_binding() -> None:
         reconcile_runner_status(ready, downgraded)
 
 
+def test_incremental_pod_cannot_remove_its_selected_placement() -> None:
+    initial = _observation(include_proof=True).model_copy(
+        update={"cache_startup_placement_id": "placement-a"}
+    )
+    initial = RunnerObservation.model_validate(initial.model_dump())
+    ready = reconcile_runner_status(None, initial)
+    downgraded = initial.model_copy(update={"cache_startup_placement_id": None})
+    assert ready.cache_startup_placement_id == "placement-a"
+
+    with pytest.raises(InvalidRunnerObservationError, match="cannot disappear"):
+        reconcile_runner_status(ready, downgraded)
+
+
 def test_legacy_runner_without_binding_keeps_existing_readiness_contract() -> None:
     observation = _observation(include_proof=False).model_copy(
         update={"cache_startup_binding": None}

@@ -291,6 +291,7 @@ class RunnerStatus(BaseModel):
         default=None,
         pattern=r"^[0-9a-f]{64}$",
     )
+    cache_startup_placement_id: str | None = Field(default=None, max_length=255)
     gpu_uuids: tuple[str, ...] = Field(default=(), max_length=64)
     active_requests: int = Field(default=0, ge=0)
     runtime_observed_at: datetime | None = None
@@ -314,7 +315,7 @@ class RunnerStatus(BaseModel):
             raise ValueError(f"{info.field_name} must be an integer")
         return value
 
-    @field_validator("node_name", "pod_uid")
+    @field_validator("node_name", "pod_uid", "cache_startup_placement_id")
     @classmethod
     def validate_optional_identity(cls, value: str | None, info) -> str | None:
         if value is None:

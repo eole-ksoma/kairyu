@@ -50,9 +50,11 @@ _PREPLACEMENT_PHASES = frozenset(
 class _AsyncRequestStoreCollector:
     """Fail-open cached view over shared durable request stores.
 
-    Blocking backends perform their first warmup in the metrics worker thread,
-    after application startup, then refresh in the background at a bounded
-    frequency. The ASGI event loop never performs the store query.
+    Blocking backends perform their first warmup in ``warm`` (called from a
+    worker thread before each scrape), then refresh in the background at a
+    bounded frequency. ``collect`` never performs a blocking store query, so
+    the registry can render on the event loop that owns the other collectors'
+    state.
     """
 
     _REFRESH_INTERVAL_S = 1.0
@@ -92,6 +94,25 @@ class _AsyncRequestStoreCollector:
         finally:
             with self._lock:
                 self._refreshing.discard(store_id)
+
+    def _begin_first_refresh(self, store_id: str) -> bool:
+        with self._lock:
+            if store_id in self._attempted:
+                return False
+            self._attempted.add(store_id)
+            self._refreshing.add(store_id)
+            self._last_refresh_started[store_id] = time.monotonic()
+            return True
+
+    def warm(self) -> None:
+        """Run each blocking store's first snapshot; may block the caller."""
+        with self._lock:
+            stores = tuple(self._stores.items())
+        for store_id, store in stores:
+            if bool(getattr(store, "metrics_snapshot_nonblocking", False)):
+                continue
+            if self._begin_first_refresh(store_id):
+                self._refresh(store_id, store)
 
     def _schedule_refresh(
         self,
@@ -180,16 +201,7 @@ class _AsyncRequestStoreCollector:
             if bool(getattr(store, "metrics_snapshot_nonblocking", False)):
                 self._refresh(store_id, store)
             else:
-                with self._lock:
-                    first_refresh = store_id not in self._attempted
-                    if first_refresh:
-                        self._attempted.add(store_id)
-                        self._refreshing.add(store_id)
-                        self._last_refresh_started[store_id] = time.monotonic()
-                if first_refresh:
-                    self._refresh(store_id, store)
-                else:
-                    self._schedule_refresh(store_id, store)
+                self._schedule_refresh(store_id, store)
             with self._lock:
                 snapshot_ok = self._snapshot_ok.get(store_id, False)
                 snapshot = self._last_good.get(store_id, self._empty_snapshot())
@@ -676,6 +688,10 @@ class ServerMetrics:
 
     def track_async_request_store(self, store: object) -> None:
         self._async_request_store_collector.add(store)
+
+    def prepare_render(self) -> None:
+        """Perform blocking collector warmup; call off the event loop."""
+        self._async_request_store_collector.warm()
 
     def set_admission_depth(self, *, active: int, waiting: int) -> None:
         self.admission_active_requests.set(active)

@@ -419,6 +419,55 @@ def test_expired_lease_is_reclaimed_and_old_fence_cannot_publish(store_factory) 
     ]
 
 
+def test_repeated_lease_expiry_fails_instead_of_reexecuting(store_factory) -> None:
+    create, store_id = store_factory
+    store = create(max_lease_expirations=2)
+    request = store.submit(submission())
+
+    def expire_lease() -> None:
+        assert psycopg is not None
+        with psycopg.connect(_POSTGRES_DSN, autocommit=True) as connection:
+            connection.execute(
+                """
+                UPDATE async_requests
+                SET claimed_at = clock_timestamp() - interval '2 seconds',
+                    lease_until = clock_timestamp() - interval '1 second'
+                WHERE store_id = %s AND request_id = %s
+                """,
+                (store_id, request.id),
+            )
+
+    released = store.claim_next("worker-a", lease_seconds=30)
+    assert released is not None
+    # A released claim is requeued without a tenant cooldown and is not an
+    # abandoned lease.
+    store.defer(released, delay_seconds=0)
+    first = store.claim_next("worker-a", lease_seconds=30)
+    assert first is not None
+    store.mark_running(first)
+    expire_lease()
+    second = store.claim_next("worker-b", lease_seconds=30)
+    assert second is not None
+    assert second.request.attempt == 3
+    expire_lease()
+
+    assert store.claim_next("worker-c", lease_seconds=30) is None
+    failed = store.get(request.id)
+    assert failed.state is AsyncRequestState.FAILED
+    assert failed.error is not None
+    assert failed.error.code == "lease_expired"
+    with pytest.raises(StaleRequestClaimError):
+        store.mark_running(second)
+    assert [row["event"] for row in store.export_claim_audit(request.id)] == [
+        "claim",
+        "defer",
+        "claim",
+        "running",
+        "reclaim",
+        "fail",
+    ]
+
+
 def test_deadline_precedes_replay_and_cancel_and_invalidates_claim(store_factory) -> None:
     create, store_id = store_factory
     first = create()

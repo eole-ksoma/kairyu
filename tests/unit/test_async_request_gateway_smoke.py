@@ -92,6 +92,24 @@ def test_takeover_requires_a_new_worker_and_higher_fence():
     assert find_takeover(events, original_worker="old", original_fence=2) == events[3]
 
 
+def test_takeover_accepts_a_claim_only_after_the_owner_released_it():
+    released = [
+        {"event": "running", "worker_id": "old", "fencing_token": 2},
+        {"event": "defer", "worker_id": "old", "fencing_token": 3},
+        {"event": "claim", "worker_id": "new", "fencing_token": 4},
+    ]
+
+    assert find_takeover(released, original_worker="old", original_fence=2) == released[2]
+    assert (
+        find_takeover(
+            [released[0], released[2]],
+            original_worker="old",
+            original_fence=2,
+        )
+        is None
+    )
+
+
 def test_f1c_fixture_enables_async_requests_on_all_gateways():
     documents = list(yaml.safe_load_all(Path("deploy/kind/f1c/gateways.yaml").read_text()))
     config_map = documents[0]

@@ -813,5 +813,8 @@ def add_health_routes(
 
         @app.get("/metrics")
         async def metrics_endpoint() -> Response:
-            body, content_type = await asyncio.to_thread(metrics.render)
+            # Collectors read event-loop-owned state (for example ReplicaPool),
+            # so only blocking store warmup leaves the loop.
+            await asyncio.to_thread(metrics.prepare_render)
+            body, content_type = metrics.render()
             return Response(content=body, media_type=content_type)

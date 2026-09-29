@@ -1024,7 +1024,20 @@ def build_app_from_spec(
             admission_controller=app.state.slo_admission,
         )
         workers.append(request_worker)
-        add_async_request_routes(app, request_store, request_worker)
+        request_retention_enabled = spec.async_requests.request_retention_s is not None
+        if not request_retention_enabled:
+            logger.warning(
+                "async_requests.request_retention_s is unset: completed requests "
+                "are never deleted, so each tenant can submit at most %d "
+                "requests in total",
+                spec.async_requests.max_records_per_tenant,
+            )
+        add_async_request_routes(
+            app,
+            request_store,
+            request_worker,
+            request_retention_enabled=request_retention_enabled,
+        )
         app.state.async_request_store = request_store
         app.state.async_request_worker = request_worker
     return app

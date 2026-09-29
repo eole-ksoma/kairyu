@@ -403,14 +403,17 @@ available at the limit, while new records return 429 until retained terminal
 records cross the configured request TTL and the external retention job removes
 them. At that point the idempotency guarantee for the deleted request also ends;
 reusing its key creates a new request and may execute inference again.
+Without `request_retention_s` nothing frees capacity, so each tenant can submit
+at most `max_records_per_tenant` requests in total: the gateway logs a startup
+warning and the 429 carries no `Retry-After`.
 At the default 8 MiB input cap this bounds persisted input to roughly 512 MiB
 per tenant; size the PostgreSQL volume/quota for the configured tenant count,
 results, indexes, and audit history.
 
 Set `KAIRYU_ASYNC_REQUEST_WORKER_ID` to the immutable gateway Pod UID when it is
-available. Workers renew database-clock leases while waiting or executing, use
-fencing for terminal publication, and run only publicly served direct Chat
-models in v1. Local cancellation aborts generation immediately; another
+available. Workers renew database-clock leases while waiting or executing
+(retrying a failed renewal until the lease would expire), use fencing for
+terminal publication, and run only publicly served direct Chat models in v1. Local cancellation aborts generation immediately; another
 gateway observes cancellation no later than its next heartbeat. AUTO
 orchestration, Responses inputs, and Redis wake-up hints remain separate later
 extensions.
@@ -477,8 +480,9 @@ temporarily locked by another purger, but concurrent commits immediately after
 the observation may change it. A later CronJob run safely resumes the backlog.
 
 PostgreSQL connect, statement, lock, idle-transaction, and TCP keepalive waits
-are bounded; worker shutdown also has a bounded drain before forced task
-cancellation. Successful result JSON encoding is offloaded from the gateway
+are bounded; worker shutdown aborts local generation and returns each
+unfinished claim to the queue immediately, within a bounded drain before forced
+task cancellation. Successful result JSON encoding is offloaded from the gateway
 event loop.
 
 Temporary tenant request, token, or in-flight pressure returns the request to
@@ -490,7 +494,10 @@ a configuration/request mismatch.
 Execution is at-least-once across lease takeover. Fencing prevents stale result
 publication, but usage metering is not yet exactly-once; a takeover after an old
 worker records usage can duplicate accounting. A future ledger schema should
-use the request ID as an idempotency key.
+use the request ID as an idempotency key. A request whose lease expires a third
+time (each a gateway crash or hang) fails with `lease_expired` instead of
+running again, and a result the store cannot persist fails with
+`result_persistence_failed`.
 
 The first deployment gate is CPU-only and reuses the disposable F1c kind
 topology (three independently restartable gateways and one shared PostgreSQL):
@@ -501,9 +508,10 @@ bash scripts/kind_async_request_gate.sh
 
 It runs the existing F1c shared-store gate before checking cross-gateway
 idempotency and reads, remote cancellation, deadline expiry, a concurrent
-768 KiB submit and responsiveness probe, lease-fenced takeover after killing
-the active owner, and persistence plus new work after a PostgreSQL process
-restart. The registered live smoke entrypoint is
+768 KiB submit and responsiveness probe, fenced takeover after the active
+owner is scaled away (its shutdown releases the claim; a crashed owner's claim
+is reclaimed after lease expiry), and persistence plus new work after a
+PostgreSQL process restart. The registered live smoke entrypoint is
 `verification/fleet/resilience/async_request_gateway_smoke.py`. Use
 `--keep-cluster` only for inspection; the default collects the
 report, claim audit, Kubernetes state/events, and service logs before bounded

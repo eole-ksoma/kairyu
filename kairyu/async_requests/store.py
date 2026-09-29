@@ -37,6 +37,7 @@ ASYNC_REQUEST_TRANSITION_EVENTS = (
     "cancel",
     "expire",
 )
+_DEFAULT_MAX_LEASE_EXPIRATIONS = 3
 
 
 @dataclass(frozen=True)
@@ -86,6 +87,18 @@ class StaleRequestClaimError(RuntimeError):
 
 class RequestCapacityError(RuntimeError):
     """A tenant reached its bounded durable-record allocation."""
+
+
+def _lease_expired_error(expirations: int) -> AsyncRequestError:
+    """Terminal error for a request whose worker leases keep expiring."""
+    return AsyncRequestError(
+        code="lease_expired",
+        message=(
+            f"the request lost its worker lease {expirations} times without "
+            "completing"
+        ),
+        retryable=True,
+    )
 
 
 @runtime_checkable
@@ -171,6 +184,7 @@ class InMemoryRequestStore:
         clock: Callable[[], datetime] | None = None,
         id_factory: Callable[[], str] | None = None,
         max_records_per_owner: int = 64,
+        max_lease_expirations: int = _DEFAULT_MAX_LEASE_EXPIRATIONS,
     ) -> None:
         if not store_id.strip() or "\x00" in store_id:
             raise ValueError("store_id must be a non-empty string without NUL")
@@ -180,9 +194,13 @@ class InMemoryRequestStore:
         if max_records_per_owner <= 0:
             raise ValueError("max_records_per_owner must be positive")
         self._max_records_per_owner = max_records_per_owner
+        self._max_lease_expirations = _validate_max_lease_expirations(
+            max_lease_expirations
+        )
         self._requests: dict[str, AsyncRequest] = {}
         self._leases: dict[str, _Lease] = {}
         self._fencing_tokens: dict[str, int] = {}
+        self._lease_expirations: dict[str, int] = {}
         self._owner_not_before: dict[str, datetime] = {}
         self._idempotency: dict[tuple[str, str], tuple[str, str]] = {}
         self._transition_counts = {
@@ -324,27 +342,35 @@ class InMemoryRequestStore:
         with self._lock:
             now = self._now()
             self._expire_due(now)
-            candidates = [
-                request
-                for request in self._requests.values()
-                if self._owner_not_before.get(request.owner, now) <= now
-                and (
-                    request.state is AsyncRequestState.QUEUED
-                    or (
-                        request.state in {
-                            AsyncRequestState.CLAIMED,
-                            AsyncRequestState.RUNNING,
-                        }
-                        and self._leases[request.id].lease_until <= now
+            while True:
+                candidates = [
+                    request
+                    for request in self._requests.values()
+                    if self._owner_not_before.get(request.owner, now) <= now
+                    and (
+                        request.state is AsyncRequestState.QUEUED
+                        or (
+                            request.state in {
+                                AsyncRequestState.CLAIMED,
+                                AsyncRequestState.RUNNING,
+                            }
+                            and self._leases[request.id].lease_until <= now
+                        )
                     )
+                ]
+                if not candidates:
+                    return None
+                request = min(
+                    candidates,
+                    key=lambda item: (item.priority, item.created_at, item.id),
                 )
-            ]
-            if not candidates:
-                return None
-            request = min(
-                candidates,
-                key=lambda item: (item.priority, item.created_at, item.id),
-            )
+                if request.state is AsyncRequestState.QUEUED:
+                    break
+                expirations = self._lease_expirations.get(request.id, 0) + 1
+                self._lease_expirations[request.id] = expirations
+                if expirations < self._max_lease_expirations:
+                    break
+                self._fail_abandoned(request, now, expirations)
             token = self._fencing_tokens[request.id] + 1
             claimed = request.model_copy(
                 update={
@@ -381,7 +407,7 @@ class InMemoryRequestStore:
             return self._claim(request, renewed)
 
     def defer(self, claim: RequestClaim, *, delay_seconds: float) -> AsyncRequest:
-        delay_seconds = self._validate_lease_seconds(delay_seconds)
+        delay_seconds = _validate_defer_seconds(delay_seconds)
         with self._lock:
             now = self._now()
             request, _lease = self._validate_claim(claim, now=now)
@@ -392,10 +418,11 @@ class InMemoryRequestStore:
             self._requests[request.id] = deferred
             self._leases.pop(request.id, None)
             self._fencing_tokens[request.id] += 1
-            self._owner_not_before[request.owner] = max(
-                self._owner_not_before.get(request.owner, now),
-                now + timedelta(seconds=delay_seconds),
-            )
+            if delay_seconds > 0:
+                self._owner_not_before[request.owner] = max(
+                    self._owner_not_before.get(request.owner, now),
+                    now + timedelta(seconds=delay_seconds),
+                )
             self._transition_counts["defer"] += 1
             return self._copy(deferred)
 
@@ -572,6 +599,7 @@ class InMemoryRequestStore:
                     self._requests.pop(request.id, None)
                     self._leases.pop(request.id, None)
                     self._fencing_tokens.pop(request.id, None)
+                    self._lease_expirations.pop(request.id, None)
                     if request.idempotency_key is not None:
                         key = (request.owner, request.idempotency_key)
                         existing = self._idempotency.get(key)
@@ -648,6 +676,26 @@ class InMemoryRequestStore:
         self._fencing_tokens[request.id] += 1
         self._transition_counts["expire"] += 1
 
+    def _fail_abandoned(
+        self,
+        request: AsyncRequest,
+        now: datetime,
+        expirations: int,
+    ) -> None:
+        failed = request.model_copy(
+            update={
+                "state": AsyncRequestState.FAILED,
+                "updated_at": now,
+                "completed_at": now,
+                "error": _lease_expired_error(expirations),
+            },
+            deep=True,
+        )
+        self._requests[request.id] = failed
+        self._leases.pop(request.id, None)
+        self._fencing_tokens[request.id] += 1
+        self._transition_counts["fail"] += 1
+
     def _load(self, request_id: str, *, owner: str | None) -> AsyncRequest:
         request = self._requests.get(request_id)
         if request is None or (owner is not None and request.owner != owner):
@@ -702,6 +750,20 @@ class InMemoryRequestStore:
         if not math.isfinite(lease_seconds) or lease_seconds <= 0:
             raise ValueError("lease_seconds must be finite and greater than zero")
         return lease_seconds
+
+
+def _validate_max_lease_expirations(value: int) -> int:
+    if type(value) is not int or value <= 0:
+        raise ValueError("max_lease_expirations must be a positive integer")
+    return value
+
+
+def _validate_defer_seconds(value: float) -> float:
+    """Zero releases a claim without cooling down the tenant."""
+    delay_seconds = float(value)
+    if not math.isfinite(delay_seconds) or delay_seconds < 0:
+        raise ValueError("delay_seconds must be finite and non-negative")
+    return delay_seconds
 
 
 def _validate_optional_retention_seconds(

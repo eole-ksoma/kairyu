@@ -84,9 +84,9 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 - AsyncRequest retention-expanded Kind evidence awaits registry access.
 - Runner autoscaling WP3.1–WP3.7 is fail-closed and CPU-tested; deployment wiring,
   durable runtime status, instrumentation, and live acceptance remain.
-- Model-cache WP4.1–WP4.7 and D3.1–D3.10 provide signed identity, verified cache,
+- Model-cache WP4.1–WP4.7 and D3.1–D3.11 provide signed identity, verified cache,
   fenced pre-stage/startup/admission, PostgreSQL authority, and TLS HTTP runtime.
-  Live controller callbacks, scheduled compaction, deployment, and acceptance remain.
+  Concrete live-state sources, scheduled compaction, deployment, and acceptance remain.
 - Qwen3.8 MTP stays disabled pending vllm#53912; DTO-D15 verification/re-pin and
   human sign-off for M2–M4 remain pending.
 
@@ -94,6 +94,17 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
+
+### 2026-09-30 — [progress] Leader-fenced placement-binding authorization
+- What: added the D3.11 scaling-controller adapter that rechecks leadership and
+  validates exact live binding, durable decision/target, quota, prewarm/cache
+  freshness, current pre-stage/pin/resident lineage, lifetime, and
+  deadline-bounded dependency readiness.
+- Why: the D3.10 service must not authorize from its admission-store echo or a
+  stale callback after controller leadership or scale-up capacity changes.
+- Refs: docs/design/node-model-cache-prestage-v1.md;
+  kairyu/runners/startup_binding_live_authority.py;
+  tests/unit/test_runner_startup_binding_live_authority.py
 
 ### 2026-09-30 — [progress] Placement-binding authority runtime assembly
 - What: added the embedded D3.10 authority runtime with a strict versioned

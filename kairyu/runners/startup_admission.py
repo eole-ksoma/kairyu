@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 import threading
+import time
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta
 from typing import Any, Protocol, runtime_checkable
@@ -23,6 +25,10 @@ class RunnerCachePlacementAdmissionError(RuntimeError):
 
 class RunnerCachePlacementAdmissionConflictError(RunnerCachePlacementAdmissionError):
     """Admission state changed or no unique placement remains."""
+
+
+class RunnerCachePlacementAdmissionTimeoutError(RuntimeError):
+    """The internal admission deadline expired before a safe response."""
 
 
 def _text(value: str, *, name: str, max_length: int = 255) -> str:
@@ -284,13 +290,23 @@ class RunnerCachePlacementAdmissionController:
         store: RunnerCachePlacementAdmissionStore,
         *,
         reauthorize: Callable[[RunnerCacheStartupBinding], RunnerCacheStartupBinding],
+        monotonic_clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if not isinstance(store, RunnerCachePlacementAdmissionStore):
             raise TypeError("store must implement RunnerCachePlacementAdmissionStore")
         if not callable(reauthorize):
             raise TypeError("reauthorize must be callable")
+        if not callable(monotonic_clock):
+            raise TypeError("monotonic_clock must be callable")
         self._store = store
         self._reauthorize = reauthorize
+        self._monotonic_clock = monotonic_clock
+
+    def _check_deadline(self, deadline_monotonic: float | None) -> None:
+        if deadline_monotonic is not None and self._monotonic_clock() >= deadline_monotonic:
+            raise RunnerCachePlacementAdmissionTimeoutError(
+                "cache placement admission deadline expired"
+            )
 
     def admit(
         self,
@@ -299,6 +315,7 @@ class RunnerCachePlacementAdmissionController:
         admission_uid: str,
         request_username: str,
         observed_at: datetime,
+        deadline_monotonic: float | None = None,
     ) -> tuple[dict[str, Any], RunnerCachePlacementAdmissionClaim]:
         if not isinstance(pod, Mapping):
             raise TypeError("pod must be a mapping")
@@ -309,6 +326,13 @@ class RunnerCachePlacementAdmissionController:
             max_length=255,
         )
         observed_at = _aware(observed_at, name="observed_at")
+        if deadline_monotonic is not None and (
+            isinstance(deadline_monotonic, bool)
+            or not isinstance(deadline_monotonic, (int, float))
+            or not math.isfinite(float(deadline_monotonic))
+        ):
+            raise TypeError("deadline_monotonic must be a number or None")
+        self._check_deadline(deadline_monotonic)
         metadata = pod.get("metadata")
         if not isinstance(metadata, Mapping):
             raise RunnerCachePlacementAdmissionError("Pod metadata must be an object")
@@ -323,6 +347,7 @@ class RunnerCachePlacementAdmissionController:
                 "gated Pod requires a cache startup target annotation"
             )
         plan = self._store.resolve(target_id)
+        self._check_deadline(deadline_monotonic)
         if namespace != plan.namespace:
             raise RunnerCachePlacementAdmissionError(
                 "Pod namespace does not match the admission plan"
@@ -354,6 +379,7 @@ class RunnerCachePlacementAdmissionController:
                 "Pod controller owner does not match the admission plan"
             )
         refreshed = self._reauthorize(plan.binding)
+        self._check_deadline(deadline_monotonic)
         if not isinstance(refreshed, RunnerCacheStartupBinding):
             raise TypeError("reauthorize must return RunnerCacheStartupBinding")
         refreshed = RunnerCacheStartupBinding.model_validate(refreshed.model_dump())
@@ -362,6 +388,7 @@ class RunnerCachePlacementAdmissionController:
                 "cache startup binding changed during admission"
             )
         pod_key = f"{namespace}/{name}"
+        self._check_deadline(deadline_monotonic)
         allocation = self._store.claim(
             target_id=target_id,
             binding_id=plan.binding.binding_id,
@@ -370,13 +397,20 @@ class RunnerCachePlacementAdmissionController:
             claimed_at=observed_at,
         )
         try:
+            self._check_deadline(deadline_monotonic)
             admitted = admit_runner_cache_placement_for_gated_pod(
                 pod,
                 plan.binding,
                 placement_id=allocation.claim.placement_id,
                 release_id=plan.release_id,
             )
-        except (RunnerCacheSchedulingError, TypeError, ValueError):
+            self._check_deadline(deadline_monotonic)
+        except (
+            RunnerCachePlacementAdmissionTimeoutError,
+            RunnerCacheSchedulingError,
+            TypeError,
+            ValueError,
+        ):
             if allocation.created:
                 self._store.release(allocation.claim)
             raise

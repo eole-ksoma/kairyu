@@ -252,6 +252,8 @@ def test_runtime_config_loader_is_strict_and_https_by_default(tmp_path: Path) ->
     path.write_text(config.model_dump_json(), encoding="utf-8")
 
     assert load_runner_cache_placement_admission_runtime_config(path) == config
+    assert config.admission_request_timeout_s == 4.0
+    assert config.postgres_connect_timeout_s == 1.0
 
     path.write_text(
         '{"schema_version":"kairyu-runner-cache-placement-admission-runtime-v1",'
@@ -270,6 +272,26 @@ def test_runtime_config_loader_is_strict_and_https_by_default(tmp_path: Path) ->
         _config(
             tmp_path,
             authorization_ready_url="https://other.test/readyz",
+        )
+    with pytest.raises(ValueError):
+        _config(tmp_path, admission_request_timeout_s="4")
+    with pytest.raises(ValueError, match="authorization_timeout_s"):
+        _config(
+            tmp_path,
+            authorization_timeout_s=4.0,
+            admission_request_timeout_s=4.0,
+        )
+    with pytest.raises(ValueError, match="effective PostgreSQL timeout"):
+        _config(
+            tmp_path,
+            postgres_connect_timeout_s=3.9,
+            admission_request_timeout_s=4.0,
+        )
+    with pytest.raises(ValueError, match="replay_safety_window_s"):
+        _config(
+            tmp_path,
+            replay_safety_window_s=4,
+            admission_request_timeout_s=4.0,
         )
 
 

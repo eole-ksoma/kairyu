@@ -197,6 +197,7 @@ from kairyu.runners.startup_admission import (
     RunnerCachePlacementAdmissionError,
     RunnerCachePlacementAdmissionPlan,
     RunnerCachePlacementAdmissionStore,
+    RunnerCachePlacementAdmissionTimeoutError,
 )
 from kairyu.runners.startup_admission_api import (
     KubernetesAdmissionRequest,
@@ -330,6 +331,7 @@ __all__ = [
     "RunnerCachePlacementAdmissionError",
     "RunnerCachePlacementAdmissionPlan",
     "RunnerCachePlacementAdmissionStore",
+    "RunnerCachePlacementAdmissionTimeoutError",
     "KubernetesAdmissionRequest",
     "KubernetesAdmissionReview",
     "KubernetesAdmissionUserInfo",

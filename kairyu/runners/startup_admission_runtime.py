@@ -71,7 +71,7 @@ class RunnerCachePlacementAdmissionRuntimeConfig(BaseModel):
     initialize_postgres_schema: bool = Field(default=False, strict=True)
     max_targets: int = Field(default=10_000, ge=1, le=100_000, strict=True)
     replay_safety_window_s: int = Field(default=300, ge=1, le=3600, strict=True)
-    postgres_connect_timeout_s: float = Field(default=10.0, gt=0, le=300, strict=True)
+    postgres_connect_timeout_s: float = Field(default=1.0, gt=0, le=300, strict=True)
 
     authorization_url: str
     authorization_ready_url: str
@@ -100,6 +100,7 @@ class RunnerCachePlacementAdmissionRuntimeConfig(BaseModel):
     active_request_limit: int = Field(default=16, ge=1, le=256, strict=True)
     total_request_limit: int = Field(default=64, ge=1, le=2048, strict=True)
     queue_wait_timeout_s: float = Field(default=0.5, gt=0, le=30, strict=True)
+    admission_request_timeout_s: float = Field(default=4.0, gt=0, le=30, strict=True)
 
     listen_host: str = "0.0.0.0"
     listen_port: int = Field(default=8443, ge=1, le=65535, strict=True)
@@ -130,6 +131,7 @@ class RunnerCachePlacementAdmissionRuntimeConfig(BaseModel):
         "postgres_connect_timeout_s",
         "authorization_timeout_s",
         "queue_wait_timeout_s",
+        "admission_request_timeout_s",
     )
     @classmethod
     def validate_finite_number(cls, value: float, info) -> float:
@@ -156,6 +158,20 @@ class RunnerCachePlacementAdmissionRuntimeConfig(BaseModel):
             raise ValueError("authorization and readiness URLs must use distinct paths")
         if self.total_request_limit < self.active_request_limit:
             raise ValueError("total_request_limit must be at least active_request_limit")
+        if self.authorization_timeout_s >= self.admission_request_timeout_s:
+            raise ValueError(
+                "authorization_timeout_s must be less than "
+                "admission_request_timeout_s"
+            )
+        if math.ceil(self.postgres_connect_timeout_s) >= self.admission_request_timeout_s:
+            raise ValueError(
+                "effective PostgreSQL timeout must be less than "
+                "admission_request_timeout_s"
+            )
+        if self.replay_safety_window_s <= self.admission_request_timeout_s:
+            raise ValueError(
+                "replay_safety_window_s must exceed admission_request_timeout_s"
+            )
         return self
 
 
@@ -509,6 +525,7 @@ def build_runner_cache_placement_admission_runtime(
             active_request_limit=config.active_request_limit,
             total_request_limit=config.total_request_limit,
             queue_wait_timeout_s=config.queue_wait_timeout_s,
+            request_timeout_s=config.admission_request_timeout_s,
         )
     except Exception:
         try:

@@ -292,7 +292,10 @@ def test_execute_fills_pins_completes_and_replays_without_download(tmp_path: Pat
     assert ready.fill_result is not None and not ready.fill_result.cache_hit
     assert replay == ready
     assert tuple(source.calls) == calls
-    assert command.pin_owner in index.get(command.manifest_digest).pin_owners
+    cached = index.get(command.manifest_digest)
+    assert cached is not None
+    assert command.pin_owner in cached.pin_owners
+    assert ready.pin_record_generation == cached.generation
     assert store.list_records() == (ready,)
 
 

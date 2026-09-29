@@ -180,8 +180,10 @@ def test_cross_instance_claim_complete_release_and_replay(store_factory) -> None
         command,
         claim_id="b" * 64,
         fill_result=_fill_result(),
+        pin_record_generation=7,
         now=_NOW + timedelta(seconds=2),
     )
+    assert ready.pin_record_generation == 7
     assert first.list_records() == (ready,)
     assert first.claim(
         command,

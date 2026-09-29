@@ -31,6 +31,7 @@ from kairyu.async_requests.models import (
     RequestClaim,
 )
 from kairyu.async_requests.store import (
+    _DEFAULT_MAX_LEASE_EXPIRATIONS,
     ASYNC_REQUEST_TRANSITION_EVENTS,
     IdempotencyConflictError,
     InvalidRequestTransitionError,
@@ -38,6 +39,9 @@ from kairyu.async_requests.store import (
     RequestQueueMetricsSnapshot,
     RequestRetentionBatchResult,
     StaleRequestClaimError,
+    _lease_expired_error,
+    _validate_defer_seconds,
+    _validate_max_lease_expirations,
     _validate_optional_retention_seconds,
     _validate_retention_batch_size,
     _validate_retention_dry_run,
@@ -581,6 +585,7 @@ class PostgresRequestStore:
         connect_timeout_s: float = 10.0,
         eager_connect: bool = True,
         max_records_per_owner: int = 64,
+        max_lease_expirations: int = _DEFAULT_MAX_LEASE_EXPIRATIONS,
         allow_store_creation: bool = True,
         initialize_schema: bool = True,
     ) -> None:
@@ -597,6 +602,9 @@ class PostgresRequestStore:
         if max_records_per_owner <= 0:
             raise ValueError("max_records_per_owner must be positive")
         self._max_records_per_owner = max_records_per_owner
+        self._max_lease_expirations = _validate_max_lease_expirations(
+            max_lease_expirations
+        )
         self._allow_store_creation = bool(allow_store_creation)
         self._initialize_schema_on_open = bool(initialize_schema)
         self._lock = threading.RLock()
@@ -2295,6 +2303,16 @@ class PostgresRequestStore:
                         previous_token = int(previous[3])
                         previous_claimed_at = previous[4]
                         previous_lease = previous[5]
+                        if previous_state in _CLAIM_STATES and self._fail_if_abandoned(
+                            cursor,
+                            request_id=request_id,
+                            previous_state=previous_state,
+                            worker_id=previous_worker,
+                            fencing_token=previous_token,
+                            claimed_at=previous_claimed_at,
+                            lease_until=previous_lease,
+                        ):
+                            continue
                         cursor.execute("SELECT clock_timestamp()")
                         claimed_at = cursor.fetchone()[0]
                         cursor.execute(
@@ -2503,9 +2521,12 @@ class PostgresRequestStore:
         raise RuntimeError("PostgreSQL running transition produced no result")
 
     def defer(self, claim: RequestClaim, *, delay_seconds: float) -> AsyncRequest:
-        """Release a fence and cool down its tenant without occupying a consumer."""
+        """Release a fence and cool down its tenant without occupying a consumer.
+
+        A zero delay only returns the request to the queue (shutdown release).
+        """
         self._validate_claim_identity(claim)
-        delay_seconds = _validate_lease_seconds(delay_seconds)
+        delay_seconds = _validate_defer_seconds(delay_seconds)
         stale_after_commit = False
         with self._lease_lock:
             self._require_open()
@@ -2545,21 +2566,22 @@ class PostgresRequestStore:
                         else:
                             deferred = self._request_from_row(row)
                             next_token = int(row[15])
-                            cursor.execute(
-                                """
-                                INSERT INTO async_request_owner_deferrals (
-                                    store_id, owner, not_before
-                                ) VALUES (
-                                    %s, %s, %s + (%s * interval '1 second')
+                            if delay_seconds > 0:
+                                cursor.execute(
+                                    """
+                                    INSERT INTO async_request_owner_deferrals (
+                                        store_id, owner, not_before
+                                    ) VALUES (
+                                        %s, %s, %s + (%s * interval '1 second')
+                                    )
+                                    ON CONFLICT (store_id, owner) DO UPDATE
+                                    SET not_before = GREATEST(
+                                        async_request_owner_deferrals.not_before,
+                                        EXCLUDED.not_before
+                                    )
+                                    """,
+                                    (self._store_id, request.owner, now, delay_seconds),
                                 )
-                                ON CONFLICT (store_id, owner) DO UPDATE
-                                SET not_before = GREATEST(
-                                    async_request_owner_deferrals.not_before,
-                                    EXCLUDED.not_before
-                                )
-                                """,
-                                (self._store_id, request.owner, now, delay_seconds),
-                            )
                             self._audit(
                                 cursor,
                                 request_id=request.id,
@@ -2946,6 +2968,77 @@ class PostgresRequestStore:
         ):
             raise StaleRequestClaimError(f"request claim for {claim.request_id!r} is stale")
         return request, claimed_at, lease_until, now
+
+    def _fail_if_abandoned(
+        self,
+        cursor: Any,
+        *,
+        request_id: str,
+        previous_state: AsyncRequestState,
+        worker_id: str | None,
+        fencing_token: int,
+        claimed_at: datetime | None,
+        lease_until: datetime | None,
+    ) -> bool:
+        """Fail a locked, lease-expired row instead of reclaiming it again.
+
+        Earlier expirations are the row's ``reclaim`` audit events; audit rows
+        of non-terminal requests are only removed by an audit TTL.
+        """
+        cursor.execute(
+            """
+            SELECT count(*) FROM async_request_claim_audit
+            WHERE store_id = %s AND request_id = %s AND event = 'reclaim'
+            """,
+            (self._store_id, request_id),
+        )
+        expirations = int(cursor.fetchone()[0]) + 1
+        if expirations < self._max_lease_expirations:
+            return False
+        error = _lease_expired_error(expirations)
+        cursor.execute(
+            """
+            UPDATE async_requests
+            SET state = 'failed', updated_at = clock_timestamp(),
+                completed_at = clock_timestamp(), error = %s::jsonb,
+                claim_worker = NULL, fencing_token = fencing_token + 1,
+                claimed_at = NULL, lease_until = NULL
+            WHERE store_id = %s AND request_id = %s
+              AND state IN ('claimed', 'running')
+              AND lease_until <= clock_timestamp()
+            RETURNING fencing_token, updated_at
+            """,
+            (
+                json.dumps(error.model_dump(mode="json")),
+                self._store_id,
+                request_id,
+            ),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise RuntimeError("PostgreSQL abandoned-claim failure produced no result")
+        self._audit(
+            cursor,
+            request_id=request_id,
+            worker_id=worker_id,
+            fencing_token=int(row[0]),
+            event="fail",
+            at=row[1],
+            lease_until=None,
+            details={
+                "reason": "lease_expired",
+                "lease_expirations": expirations,
+                "previous_state": previous_state.value,
+                "previous_fencing_token": fencing_token,
+                "previous_claimed_at": (
+                    claimed_at.isoformat() if claimed_at is not None else None
+                ),
+                "previous_lease_until": (
+                    lease_until.isoformat() if lease_until is not None else None
+                ),
+            },
+        )
+        return True
 
     def _sweep_expired(self, cursor: Any, *, limit: int) -> None:
         cursor.execute(

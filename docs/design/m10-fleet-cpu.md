@@ -1228,3 +1228,22 @@ online learning or the M4 request-family bandit.
   store identity, and an independent persisted-body byte cap (8 MiB by default).
   Request IDs are collapsed in metric route labels; high-cardinality IDs remain
   in request state and logs rather than Prometheus labels.
+
+- **A39 (2026-09-30)**: pre-merge review fixes to A37/A38 (PR #604 review).
+  A result the store rejects no longer leaves its claim for takeover: after
+  one retry the worker publishes a fenced `result_persistence_failed` error.
+  A request whose worker lease expires for the third time
+  (`max_lease_expirations`, counted from `reclaim` audit events) fails with
+  `lease_expired` instead of executing again; defers and releases do not count.
+  The heartbeat treats only a stale fence as a lost lease and retries other
+  renewal errors until the locally tracked lease would expire. Shutdown still
+  aborts local work but returns each unfinished claim to the queue with a
+  zero-delay defer (no tenant cooldown), superseding A38's "leaves unfinished
+  claims for lease-based takeover"; lease expiry remains the fallback.
+  `/metrics` renders collectors on the event loop, whose `ReplicaPool` state is
+  unlocked; only the blocking first store snapshot runs in a worker thread.
+  Tenant-capacity 429 responses carry `Retry-After` only when request retention
+  is configured, because otherwise terminal records never free capacity.
+  Rationale: each replaced path re-ran inference (without bound for an
+  unstorable result), read unlocked pool state from a second thread, or gave
+  clients a retry hint that could not succeed.

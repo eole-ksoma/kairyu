@@ -104,6 +104,11 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
 
+### 2026-09-30 — [amendment] m10 A39: AsyncRequest v1 pre-merge review fixes
+- What: an unstorable result publishes a fenced `result_persistence_failed` error after one retry; the third lease expiry fails a request with `lease_expired` instead of re-running it (defers and releases do not count); heartbeats retry transient renewal errors until the lease would expire; shutdown returns unfinished claims to the queue at once (zero-delay defer, no tenant cooldown); `/metrics` collectors render on the event loop with only the blocking store warmup off-loop; the capacity 429 omits `Retry-After` when request retention is off, and startup warns.
+- Why: PR #604 review — each replaced path re-ran inference (without bound for an unstorable result), read unlocked `ReplicaPool` state from a second thread, or promised a retry that could not succeed.
+- Refs: `docs/design/m10-fleet-cpu.md` A39 (supersedes A38's shutdown sentence); PR #604; `kairyu/async_requests/{worker,store,postgres_store}.py`, `kairyu/entrypoints/server/{metrics,health}.py`
+
 ### 2026-09-15 — [progress] Durable autoscaler observation and decision log
 - What: added bounded source-timestamped scaling windows, exact policy/input
   decision records, stale-input scale-down rejection, and a shared PostgreSQL

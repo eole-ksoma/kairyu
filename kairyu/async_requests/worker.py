@@ -50,6 +50,8 @@ _WORKER_ID_ENV = "KAIRYU_ASYNC_REQUEST_WORKER_ID"
 _PRESSURE_POLL_S = 0.01
 _TENANT_DEFER_S = 0.5
 _MAX_SHUTDOWN_DRAIN_S = 10.0
+_RENEW_RETRY_S = 0.5
+_RESULT_PUBLISH_ATTEMPTS = 2
 
 
 class _TransientAdmission(RuntimeError):
@@ -122,6 +124,7 @@ class AsyncRequestWorker:
         self._admission_controller = admission_controller
         self._wakeup = asyncio.Event()
         self._active_cancellations: dict[str, asyncio.Event] = {}
+        self._draining = False
 
     def submit(self, request_id: str) -> None:
         """Wake local consumers; PostgreSQL remains the queue authority."""
@@ -152,6 +155,7 @@ class AsyncRequestWorker:
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
+            self._draining = True
             shutdown.set()
             self._wakeup.set()
             for cancellation in self._active_cancellations.values():
@@ -210,8 +214,9 @@ class AsyncRequestWorker:
         if claim is None:
             return False
         if shutdown is not None and shutdown.is_set():
-            # The claim remains fenced and becomes reclaimable after its lease;
-            # shutdown must not begin new inference or publish through it.
+            # Shutdown must not begin new inference; return the claim to the
+            # queue so another gateway need not wait for the lease to expire.
+            await self._release_for_shutdown(claim)
             return True
         await self.process(claim)
         return True
@@ -221,6 +226,7 @@ class AsyncRequestWorker:
         locally_cancelled = asyncio.Event()
         self._active_cancellations[claim.request_id] = locally_cancelled
         try:
+            marked_at = asyncio.get_running_loop().time()
             try:
                 running = await asyncio.to_thread(self._store.mark_running, claim)
             except StaleRequestClaimError:
@@ -232,9 +238,13 @@ class AsyncRequestWorker:
             )
             claim_state = [updated_claim]
             claim_lost = asyncio.Event()
-            heartbeat = asyncio.create_task(self._heartbeat(claim_state, claim_lost))
+            heartbeat = asyncio.create_task(
+                self._heartbeat(claim_state, claim_lost, granted_at=marked_at)
+            )
             try:
                 if not await self._wait_for_capacity(claim_lost, locally_cancelled):
+                    if not claim_lost.is_set():
+                        await self._release_for_shutdown(claim_state[0])
                     return
                 dispatch = asyncio.create_task(self._dispatch(running))
                 lost_wait = asyncio.create_task(claim_lost.wait())
@@ -248,6 +258,8 @@ class AsyncRequestWorker:
                         dispatch.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
                             await dispatch
+                        if not claim_lost.is_set():
+                            await self._release_for_shutdown(claim_state[0])
                         return
                     try:
                         executed = await dispatch
@@ -292,17 +304,13 @@ class AsyncRequestWorker:
                             ),
                         )
                     else:
-                        try:
+                        await self._publish_result(
+                            claim_state,
                             await asyncio.to_thread(
-                                self._store.succeed,
-                                claim_state[0],
-                                await asyncio.to_thread(
-                                    executed.response.model_dump,
-                                    mode="json",
-                                ),
-                            )
-                        except StaleRequestClaimError:
-                            pass
+                                executed.response.model_dump,
+                                mode="json",
+                            ),
+                        )
                 finally:
                     if not dispatch.done():
                         dispatch.cancel()
@@ -325,7 +333,12 @@ class AsyncRequestWorker:
         self,
         claim_state: list[RequestClaim],
         claim_lost: asyncio.Event,
+        *,
+        granted_at: float,
     ) -> None:
+        """Renew the lease; ``granted_at`` is a local time no later than the
+        store update that ``claim.request.updated_at`` records."""
+        loop = asyncio.get_running_loop()
         while True:
             remaining = max(
                 0.0,
@@ -334,20 +347,40 @@ class AsyncRequestWorker:
                     - claim_state[0].request.updated_at
                 ).total_seconds(),
             )
+            lease_deadline = granted_at + remaining
             interval = max(0.01, min(self._lease_seconds, remaining) / 3.0)
             await asyncio.sleep(interval)
-            try:
-                claim_state[0] = await asyncio.to_thread(
-                    self._store.renew_claim,
-                    claim_state[0],
-                    lease_seconds=self._lease_seconds,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.warning("async request lease lost", exc_info=True)
-                claim_lost.set()
-                return
+            while True:
+                requested_at = loop.time()
+                try:
+                    claim_state[0] = await asyncio.to_thread(
+                        self._store.renew_claim,
+                        claim_state[0],
+                        lease_seconds=self._lease_seconds,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except StaleRequestClaimError:
+                    # Cancellation, deadline expiry, or takeover: definitive.
+                    logger.warning("async request lease lost", exc_info=True)
+                    claim_lost.set()
+                    return
+                except Exception:
+                    # The lease stays valid until it expires; a store error
+                    # before then is retried instead of aborting inference.
+                    retry_delay = min(_RENEW_RETRY_S, interval)
+                    if loop.time() + retry_delay >= lease_deadline:
+                        logger.warning("async request lease lost", exc_info=True)
+                        claim_lost.set()
+                        return
+                    logger.warning(
+                        "async request lease renewal failed; retrying",
+                        exc_info=True,
+                    )
+                    await asyncio.sleep(retry_delay)
+                else:
+                    granted_at = requested_at
+                    break
 
     async def _wait_for_capacity(
         self,
@@ -538,6 +571,39 @@ class AsyncRequestWorker:
             exact=executed.result.usage is not None,
         )
 
+    async def _publish_result(
+        self,
+        claim_state: list[RequestClaim],
+        result: dict,
+    ) -> None:
+        """Publish a result, or a terminal error when it cannot be stored.
+
+        An unpublished claim would otherwise be reclaimed and re-executed
+        after its lease expires, indefinitely for a result the store rejects.
+        """
+        for attempt in range(1, _RESULT_PUBLISH_ATTEMPTS + 1):
+            try:
+                await asyncio.to_thread(self._store.succeed, claim_state[0], result)
+            except StaleRequestClaimError:
+                return
+            except Exception as error:
+                logger.error(
+                    "async request result publication failed (%s, attempt %d)",
+                    type(error).__name__,
+                    attempt,
+                    extra={"request_id": claim_state[0].request_id},
+                )
+            else:
+                return
+        await self._publish_failure(
+            claim_state[0],
+            _request_error(
+                code="result_persistence_failed",
+                message="the completed result could not be stored",
+                retryable=True,
+            ),
+        )
+
     async def _publish_failure(
         self,
         claim: RequestClaim,
@@ -547,3 +613,18 @@ class AsyncRequestWorker:
             await asyncio.to_thread(self._store.fail, claim, error)
         except StaleRequestClaimError:
             pass
+
+    async def _release_for_shutdown(self, claim: RequestClaim) -> None:
+        """Requeue an unfinished claim at shutdown; lease expiry stays the fallback."""
+        if not self._draining:
+            return
+        try:
+            await asyncio.to_thread(self._store.defer, claim, delay_seconds=0.0)
+        except StaleRequestClaimError:
+            pass
+        except Exception:
+            logger.warning(
+                "async request claim release failed; it is reclaimed after lease expiry",
+                exc_info=True,
+                extra={"request_id": claim.request_id},
+            )

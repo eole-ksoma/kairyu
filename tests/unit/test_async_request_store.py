@@ -335,6 +335,32 @@ def test_expired_lease_is_reclaimed_with_a_new_fencing_token(
         store.fail(first, AsyncRequestError(code="old", message="stale"))
 
 
+def test_repeated_lease_expiry_fails_instead_of_reexecuting(clock: Clock) -> None:
+    store = InMemoryRequestStore(store_id="test", clock=clock, max_lease_expirations=2)
+    request = store.submit(submission())
+    released = store.claim_next("worker-a", lease_seconds=5)
+    assert released is not None
+    # A released claim is requeued without a tenant cooldown and is not an
+    # abandoned lease.
+    store.defer(released, delay_seconds=0)
+    first = store.claim_next("worker-a", lease_seconds=5)
+    assert first is not None
+    store.mark_running(first)
+    clock.advance(6)
+    second = store.claim_next("worker-b", lease_seconds=5)
+    assert second is not None
+    assert second.request.attempt == 3
+    clock.advance(6)
+
+    assert store.claim_next("worker-c", lease_seconds=5) is None
+    failed = store.get(request.id)
+    assert failed.state is AsyncRequestState.FAILED
+    assert failed.error is not None
+    assert failed.error.code == "lease_expired"
+    with pytest.raises(StaleRequestClaimError):
+        store.mark_running(second)
+
+
 def test_renewed_claim_extends_from_store_clock(
     store: InMemoryRequestStore,
     clock: Clock,

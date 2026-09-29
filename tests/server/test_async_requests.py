@@ -8,6 +8,7 @@ import threading
 from datetime import UTC, datetime, timedelta
 
 import httpx
+import pytest
 
 from kairyu.async_requests import (
     AsyncRequestState,
@@ -46,6 +47,7 @@ def _surface(
     resolved_keys=None,
     async_request_body_limit=None,
     max_records_per_owner=64,
+    request_retention_enabled=False,
 ):
     backend = backend or MockBackend(responses={"hello": "durable answer"})
     app = create_legacy_app(
@@ -63,7 +65,12 @@ def _surface(
         tenant_limiter=getattr(app.state, "tenant_limiter", None),
         tenant_config=tenant_config,
     )
-    add_async_request_routes(app, store, worker)
+    add_async_request_routes(
+        app,
+        store,
+        worker,
+        request_retention_enabled=request_retention_enabled,
+    )
     return app, store, worker
 
 
@@ -255,6 +262,83 @@ async def test_cancel_during_mark_running_cannot_escape_local_abort() -> None:
     assert store.get(request.id).state is AsyncRequestState.CANCELLED
 
 
+async def test_transient_renewal_error_does_not_abort_inference() -> None:
+    class FlakyRenewStore(InMemoryRequestStore):
+        failures = 1
+
+        def renew_claim(self, claim, *, lease_seconds):
+            if self.failures:
+                self.failures -= 1
+                raise RuntimeError("connection reset")
+            return super().renew_claim(claim, lease_seconds=lease_seconds)
+
+    backend = MockBackend(responses={"hello": "done"}, latency_s=0.5)
+    store = FlakyRenewStore()
+    worker = AsyncRequestWorker(
+        store,
+        {"m": backend},
+        lease_seconds=0.6,
+        legacy_chat_models={"m"},
+    )
+    request = store.submit(
+        AsyncRequestSubmission(endpoint="/v1/chat/completions", body=_body())
+    )
+
+    assert await worker.process_next() is True
+    completed = store.get(request.id)
+    assert store.failures == 0
+    assert completed.state is AsyncRequestState.SUCCEEDED
+    assert completed.attempt == 1
+
+
+async def test_unstorable_result_fails_the_request_instead_of_rerunning_it() -> None:
+    class RejectingResultStore(InMemoryRequestStore):
+        def succeed(self, claim, result):
+            raise RuntimeError("unsupported Unicode escape sequence")
+
+    store = RejectingResultStore()
+    worker = AsyncRequestWorker(
+        store,
+        {"m": MockBackend(responses={"hello": "answer"})},
+        legacy_chat_models={"m"},
+    )
+    request = store.submit(
+        AsyncRequestSubmission(endpoint="/v1/chat/completions", body=_body())
+    )
+
+    assert await worker.process_next() is True
+    failed = store.get(request.id)
+    assert failed.state is AsyncRequestState.FAILED
+    assert failed.error is not None
+    assert failed.error.code == "result_persistence_failed"
+    assert store.claim_next("other-gateway", lease_seconds=1) is None
+
+
+async def test_shutdown_requeues_active_inference_without_waiting_for_lease() -> None:
+    backend = _CancellableBackend()
+    store = InMemoryRequestStore()
+    worker = AsyncRequestWorker(
+        store,
+        {"m": backend},
+        lease_seconds=30,
+        legacy_chat_models={"m"},
+    )
+    request = store.submit(
+        AsyncRequestSubmission(endpoint="/v1/chat/completions", body=_body())
+    )
+    worker_task = asyncio.create_task(worker.run())
+    await asyncio.wait_for(backend.started.wait(), timeout=1)
+    worker_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await worker_task
+
+    assert backend.cancelled.is_set()
+    assert store.get(request.id).state is AsyncRequestState.QUEUED
+    reclaimed = store.claim_next("next-gateway", lease_seconds=30)
+    assert reclaimed is not None
+    assert reclaimed.request_id == request.id
+
+
 async def test_heartbeat_keeps_long_inference_claim_alive() -> None:
     backend = MockBackend(responses={"hello": "done"}, latency_s=0.25)
     store = InMemoryRequestStore()
@@ -327,7 +411,7 @@ async def test_worker_replaces_client_priority_with_tenant_batch_class() -> None
     assert backend.requests[0].scheduling_class == "batch"
 
 
-async def test_shutdown_does_not_dispatch_a_claim_returned_during_drain() -> None:
+async def test_shutdown_requeues_a_claim_returned_during_drain_without_dispatch() -> None:
     claim_started = threading.Event()
     release_claim = threading.Event()
 
@@ -360,7 +444,8 @@ async def test_shutdown_does_not_dispatch_a_claim_returned_during_drain() -> Non
         await worker_task
 
     assert backend.requests == []
-    assert store.get(request.id).state is AsyncRequestState.CLAIMED
+    assert store.get(request.id).state is AsyncRequestState.QUEUED
+    assert store.claim_next("next-gateway", lease_seconds=1) is not None
 
 
 async def test_worker_validation_failure_is_terminal_and_does_not_echo_payload() -> None:
@@ -573,8 +658,18 @@ async def test_invalid_async_metadata_returns_sanitized_client_error() -> None:
     assert store.list(limit=10) == []
 
 
-async def test_tenant_durable_record_capacity_returns_429() -> None:
-    app, _store, _worker = _surface(max_records_per_owner=1)
+@pytest.mark.parametrize(
+    ("request_retention_enabled", "retry_after"),
+    [(False, None), (True, "60")],
+)
+async def test_tenant_durable_record_capacity_returns_429(
+    request_retention_enabled: bool,
+    retry_after: str | None,
+) -> None:
+    app, _store, _worker = _surface(
+        max_records_per_owner=1,
+        request_retention_enabled=request_retention_enabled,
+    )
     async with _client(app) as client:
         first = await client.post("/v1/async/chat/completions", json=_body())
         second = await client.post("/v1/async/chat/completions", json=_body("two"))
@@ -582,3 +677,5 @@ async def test_tenant_durable_record_capacity_returns_429() -> None:
     assert first.status_code == 202
     assert second.status_code == 429
     assert second.json()["error"]["code"] == "request_capacity_exhausted"
+    # Without retention the terminal record never leaves, so no retry hint.
+    assert second.headers.get("Retry-After") == retry_after

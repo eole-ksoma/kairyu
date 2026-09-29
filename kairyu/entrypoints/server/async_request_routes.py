@@ -87,7 +87,14 @@ def add_async_request_routes(
     app: FastAPI,
     store: RequestStoreProtocol,
     worker: AsyncRequestWorker,
+    *,
+    request_retention_enabled: bool = False,
 ) -> None:
+    """Mount the durable routes.
+
+    ``request_retention_enabled`` states whether terminal records are deleted
+    by a retention job; only then can exhausted tenant capacity recover.
+    """
     metrics = getattr(app.state, "metrics", None)
     if metrics is not None:
         metrics.track_async_request_store(store)
@@ -168,16 +175,27 @@ def add_async_request_routes(
                 },
             )
         except RequestCapacityError:
+            if request_retention_enabled:
+                message = "tenant durable request capacity is exhausted"
+                headers = {"Retry-After": "60"}
+            else:
+                # Terminal records count toward capacity and are never deleted
+                # without retention, so a retry hint would never be honored.
+                message = (
+                    "tenant durable request capacity is exhausted; this "
+                    "deployment does not delete completed requests"
+                )
+                headers = None
             return JSONResponse(
                 status_code=429,
                 content={
                     "error": {
-                        "message": "tenant durable request capacity is exhausted",
+                        "message": message,
                         "type": "rate_limit_error",
                         "code": "request_capacity_exhausted",
                     }
                 },
-                headers={"Retry-After": "60"},
+                headers=headers,
             )
         worker.submit(created.id)
         return JSONResponse(

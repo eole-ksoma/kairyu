@@ -26,6 +26,7 @@ from kairyu.runners import (
     RunnerCachePlacementAdmissionError,
     RunnerCachePlacementAdmissionPlan,
     RunnerCachePlacementAdmissionTimeoutError,
+    RunnerCachePlacementBindingAuthorizationDeniedError,
     RunnerCacheSchedulingError,
     RunnerCacheStartupBinding,
     RunnerCacheStartupPlacement,
@@ -668,6 +669,27 @@ def test_controller_fails_closed_on_expired_or_changed_authority() -> None:
             admission_uid="admission-b",
             request_username="system:serviceaccount:kairyu:statefulset-controller",
             observed_at=binding.valid_until,
+        )
+
+
+def test_controller_maps_live_authority_denial_to_conflict() -> None:
+    binding = _binding()
+    store = InMemoryRunnerCachePlacementAdmissionStore()
+    store.register(_plan(binding))
+
+    def deny(_candidate: RunnerCacheStartupBinding) -> RunnerCacheStartupBinding:
+        raise RunnerCachePlacementBindingAuthorizationDeniedError("private stale detail")
+
+    controller = RunnerCachePlacementAdmissionController(store, reauthorize=deny)
+    with pytest.raises(
+        RunnerCachePlacementAdmissionConflictError,
+        match="no longer authorized",
+    ):
+        controller.admit(
+            _pod(),
+            admission_uid="admission-a",
+            request_username="system:serviceaccount:kairyu:statefulset-controller",
+            observed_at=NOW + timedelta(seconds=2),
         )
 
 

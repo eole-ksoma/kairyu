@@ -14,9 +14,10 @@ per-placement fencing high-water marks. D3.6 adds the shared PostgreSQL plan and
 claim store required by a replicated admission service. D3.7 adds the strict
 Kubernetes AdmissionReview v1 HTTP boundary and deterministic JSON Patch
 mutation. D3.8 adds the executable TLS webhook runtime, shared-store assembly,
-and authenticated nonce-bound binding reauthorization client. Scheduling
-compaction, the scaling-authority endpoint, and Kubernetes deployment wiring
-remain deployment tasks.
+and authenticated nonce-bound binding reauthorization client. D3.9 adds the
+authenticated scaling-authority HTTP boundary that serves that client.
+Scheduling compaction, authority runtime assembly, and Kubernetes deployment
+wiring remain deployment tasks.
 
 ## Purpose
 
@@ -463,12 +464,31 @@ scaling-authority HTTPS origin; no plaintext opt-in exists. The request includes
 the complete candidate binding and a fresh 256-bit nonce. Both serialized
 request and response are independently size-bounded before network send or
 JSON validation, and the strict response must echo that nonce and return a
-complete binding. D3.4 then requires the returned binding to be
+complete binding. The configured response limit must exceed the request limit
+because the response schema identifier is one byte longer. D3.4 then requires
+the returned binding to be
 byte-equivalent to the plan. Redirect following, environment proxy inheritance,
 duplicate keys, non-finite numbers, cross-origin readiness, unbounded response
 bodies, and cached responses are rejected. The authority readiness endpoint
-must return an empty HTTP 204 response. The bearer token authenticates this
+must return an empty HTTP 204 response. The bearer token is 32--4096 visible
+ASCII characters so it is safe to place in an HTTP header and authenticates this
 internal client; it does not replace API-server-to-webhook TLS and NetworkPolicy.
+
+D3.9 defines the corresponding library-side authority endpoint. It requires an
+exact bearer token before parsing authorization JSON, rejects duplicate keys,
+non-finite numbers, oversized bodies, unknown fields, and unsupported media,
+then passes the complete binding to a caller-owned live-authority callback.
+Only a byte-equivalent current binding receives a nonce-echoed HTTP 200
+response. A stale or explicitly denied binding returns a sanitized 409;
+dependency failures return a sanitized 503. Readiness is authenticated and
+empty-body HTTP 204, matching the D3.8 client contract. Request concurrency is
+bounded, responses are marked `no-store`, and backend detail never crosses the
+HTTP boundary. Both callbacks receive an absolute monotonic deadline and a
+shorter backend timeout. They must apply that hard timeout to every database or
+remote call: the outer asynchronous deadline releases the HTTP request but
+cannot stop a worker thread that ignores the callback contract. The live
+callback remains responsible for leader, target revision, quota, prewarm,
+binding lifetime, and cache-freshness reauthorization.
 
 ## Deployment boundary
 
@@ -481,8 +501,9 @@ internal client; it does not replace API-server-to-webhook TLS and NetworkPolicy
 - reconciliation that replays desired ensure/release commands after restart;
 - a scheduled caller for the implemented bounded compaction contract, with a
   documented retirement cutoff and monitoring of per-placement high-water rows;
-- the scaling-authority reauthorization/readiness endpoint consumed by D3.8,
-  plus a highly available Deployment/Service/MutatingWebhookConfiguration, TLS
+- runtime assembly and deployment for the implemented scaling-authority
+  reauthorization/readiness endpoint consumed by D3.8, plus a highly available
+  Deployment/Service/MutatingWebhookConfiguration, TLS
   certificate issuance/rotation and trust, ingress restriction, orchestration
   that registers the plan before the D3.2 scale write, and fail-closed webhook
   policy;
@@ -524,3 +545,6 @@ Runtime tests cover strict bounded config/secrets, HTTPS/same-origin policy,
 nonce and full-binding request/response integrity, redirect/proxy suppression,
 response-size and non-finite-number rejection, TLS key permissions, dependency
 readiness, resource cleanup, end-to-end admission, and TLS CLI arguments.
+Authority API tests cover bearer protection, nonce echo, exact-binding denial,
+strict/size-bounded JSON, authenticated readiness, concurrency limits, and
+failure-detail redaction.

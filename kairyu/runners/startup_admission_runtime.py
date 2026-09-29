@@ -26,36 +26,15 @@ from kairyu.runners.startup_admission_api import (
     create_runner_cache_placement_admission_app,
 )
 from kairyu.runners.startup_binding import RunnerCacheStartupBinding
+from kairyu.runners.startup_binding_authority import (
+    RunnerCachePlacementBindingAuthorizationDeniedError,
+    RunnerCachePlacementBindingAuthorizationError,
+    RunnerCachePlacementBindingAuthorizationRequest,
+    RunnerCachePlacementBindingAuthorizationResponse,
+    validate_runner_cache_placement_bearer_token,
+)
 
 _MAX_CONFIG_BYTES = 64 * 1024
-
-
-class RunnerCachePlacementBindingAuthorizationError(RuntimeError):
-    """The live binding authority could not authorize an exact binding."""
-
-
-class RunnerCachePlacementBindingAuthorizationRequest(BaseModel):
-    """Nonce-bound request sent to the live scaling authority."""
-
-    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
-
-    schema_version: Literal["kairyu-runner-cache-placement-binding-authorization-request-v1"] = (
-        "kairyu-runner-cache-placement-binding-authorization-request-v1"
-    )
-    nonce: str = Field(pattern=r"^[0-9a-f]{64}$")
-    binding: RunnerCacheStartupBinding
-
-
-class RunnerCachePlacementBindingAuthorizationResponse(BaseModel):
-    """Exact live binding returned by the trusted scaling authority."""
-
-    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
-
-    schema_version: Literal["kairyu-runner-cache-placement-binding-authorization-response-v1"] = (
-        "kairyu-runner-cache-placement-binding-authorization-response-v1"
-    )
-    nonce: str = Field(pattern=r"^[0-9a-f]{64}$")
-    binding: RunnerCacheStartupBinding
 
 
 class RunnerCachePlacementAdmissionRuntimeConfig(BaseModel):
@@ -63,9 +42,10 @@ class RunnerCachePlacementAdmissionRuntimeConfig(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal["kairyu-runner-cache-placement-admission-runtime-v1"] = (
-        "kairyu-runner-cache-placement-admission-runtime-v1"
-    )
+    schema_version: Literal[
+        "kairyu-runner-cache-placement-admission-runtime-v1",
+        "kairyu-runner-cache-placement-admission-runtime-v2",
+    ] = "kairyu-runner-cache-placement-admission-runtime-v1"
     postgres_dsn_file: Path
     postgres_store_id: str = "kairyu-runner-cache-placement-admission"
     initialize_postgres_schema: bool = Field(default=False, strict=True)
@@ -85,8 +65,8 @@ class RunnerCachePlacementAdmissionRuntimeConfig(BaseModel):
         strict=True,
     )
     authorization_response_limit_bytes: int = Field(
-        default=1024 * 1024,
-        ge=1,
+        default=1024 * 1024 + 1,
+        ge=2,
         le=16 * 1024 * 1024,
         strict=True,
     )
@@ -158,6 +138,14 @@ class RunnerCachePlacementAdmissionRuntimeConfig(BaseModel):
             raise ValueError("authorization and readiness URLs must use distinct paths")
         if self.total_request_limit < self.active_request_limit:
             raise ValueError("total_request_limit must be at least active_request_limit")
+        if (
+            self.schema_version == "kairyu-runner-cache-placement-admission-runtime-v2"
+            and self.authorization_response_limit_bytes
+            <= self.authorization_request_limit_bytes
+        ):
+            raise ValueError(
+                "authorization_response_limit_bytes must exceed authorization_request_limit_bytes"
+            )
         if self.authorization_timeout_s >= self.admission_request_timeout_s:
             raise ValueError(
                 "authorization_timeout_s must be less than "
@@ -368,6 +356,10 @@ class RunnerCachePlacementBindingAuthorizer:
                     "Cache-Control": "no-store",
                 },
             ) as response:
+                if response.status_code == 409:
+                    raise RunnerCachePlacementBindingAuthorizationDeniedError(
+                        "binding authority denied reauthorization"
+                    )
                 if response.status_code != 200:
                     raise RunnerCachePlacementBindingAuthorizationError(
                         "binding authority rejected reauthorization"
@@ -479,8 +471,7 @@ def build_runner_cache_placement_admission_runtime(
         kind="binding authority bearer token",
         max_bytes=4096,
     )
-    if not token.isascii() or not 32 <= len(token) <= 4096:
-        raise ValueError("binding authority bearer token must be 32-4096 ASCII characters")
+    token = validate_runner_cache_placement_bearer_token(token)
     verify: bool | str = (
         str(config.authorization_ca_bundle) if config.authorization_ca_bundle is not None else True
     )

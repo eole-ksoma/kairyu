@@ -211,9 +211,6 @@ from kairyu.runners.startup_admission_api import (
 from kairyu.runners.startup_admission_runtime import (
     RunnerCachePlacementAdmissionRuntime,
     RunnerCachePlacementAdmissionRuntimeConfig,
-    RunnerCachePlacementBindingAuthorizationError,
-    RunnerCachePlacementBindingAuthorizationRequest,
-    RunnerCachePlacementBindingAuthorizationResponse,
     RunnerCachePlacementBindingAuthorizer,
     build_runner_cache_placement_admission_runtime,
     load_runner_cache_placement_admission_runtime_config,
@@ -230,6 +227,18 @@ from kairyu.runners.startup_binding import (
     RunnerCacheStartupBindingError,
     RunnerCacheStartupPlacement,
     build_runner_cache_startup_binding,
+)
+from kairyu.runners.startup_binding_authority import (
+    RunnerCachePlacementBindingAuthorityReadiness,
+    RunnerCachePlacementBindingAuthorizationDeniedError,
+    RunnerCachePlacementBindingAuthorizationError,
+    RunnerCachePlacementBindingAuthorizationRequest,
+    RunnerCachePlacementBindingAuthorizationResponse,
+    RunnerCachePlacementBindingLiveAuthority,
+    validate_runner_cache_placement_bearer_token,
+)
+from kairyu.runners.startup_binding_authority_api import (
+    create_runner_cache_placement_binding_authority_app,
 )
 from kairyu.runners.startup_scheduling import (
     RUNNER_CACHE_STARTUP_BINDING_ANNOTATION,
@@ -341,10 +350,14 @@ __all__ = [
     "create_runner_cache_placement_admission_app",
     "RunnerCachePlacementAdmissionRuntime",
     "RunnerCachePlacementAdmissionRuntimeConfig",
+    "RunnerCachePlacementBindingAuthorityReadiness",
+    "RunnerCachePlacementBindingAuthorizationDeniedError",
     "RunnerCachePlacementBindingAuthorizationError",
     "RunnerCachePlacementBindingAuthorizationRequest",
     "RunnerCachePlacementBindingAuthorizationResponse",
     "RunnerCachePlacementBindingAuthorizer",
+    "RunnerCachePlacementBindingLiveAuthority",
+    "create_runner_cache_placement_binding_authority_app",
     "build_runner_cache_placement_admission_runtime",
     "load_runner_cache_placement_admission_runtime_config",
     "RUNNER_CACHE_STARTUP_BINDING_ANNOTATION",
@@ -440,5 +453,6 @@ __all__ = [
     "transition_runner_status",
     "validate_runner_transition",
     "validate_runner_cache_startup_proof",
+    "validate_runner_cache_placement_bearer_token",
     "validate_startup_report_update",
 ]

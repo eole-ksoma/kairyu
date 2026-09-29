@@ -19,6 +19,7 @@ from kairyu.runners import (
     InMemoryRunnerCachePlacementAdmissionStore,
     RunnerCachePlacementAdmissionPlan,
     RunnerCachePlacementAdmissionRuntimeConfig,
+    RunnerCachePlacementBindingAuthorizationDeniedError,
     RunnerCachePlacementBindingAuthorizationError,
     RunnerCachePlacementBindingAuthorizer,
     RunnerCacheStartupBinding,
@@ -226,6 +227,21 @@ def test_authorizer_rejects_redirect_and_nonempty_readiness() -> None:
         client.close()
 
 
+def test_authorizer_preserves_stale_binding_denial() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(409, json={"detail": "private authority detail"})
+
+    authorizer, client = _authorizer(handler)
+    try:
+        with pytest.raises(
+            RunnerCachePlacementBindingAuthorizationDeniedError,
+            match="denied",
+        ):
+            authorizer.reauthorize(_binding())
+    finally:
+        client.close()
+
+
 def test_authorizer_rejects_oversized_request_before_transport() -> None:
     calls = 0
 
@@ -254,6 +270,27 @@ def test_runtime_config_loader_is_strict_and_https_by_default(tmp_path: Path) ->
     assert load_runner_cache_placement_admission_runtime_config(path) == config
     assert config.admission_request_timeout_s == 4.0
     assert config.postgres_connect_timeout_s == 1.0
+    assert config.schema_version == "kairyu-runner-cache-placement-admission-runtime-v1"
+
+    legacy_without_version = json.loads(config.model_dump_json())
+    legacy_without_version.pop("schema_version")
+    legacy_without_version["authorization_request_limit_bytes"] = 1024
+    legacy_without_version["authorization_response_limit_bytes"] = 1024
+    path.write_text(json.dumps(legacy_without_version), encoding="utf-8")
+    loaded_legacy = load_runner_cache_placement_admission_runtime_config(path)
+    assert loaded_legacy.schema_version == (
+        "kairyu-runner-cache-placement-admission-runtime-v1"
+    )
+    assert loaded_legacy.authorization_request_limit_bytes == 1024
+    assert loaded_legacy.authorization_response_limit_bytes == 1024
+
+    legacy = _config(
+        tmp_path,
+        schema_version="kairyu-runner-cache-placement-admission-runtime-v1",
+        authorization_request_limit_bytes=1024,
+        authorization_response_limit_bytes=1024,
+    )
+    assert legacy.schema_version == "kairyu-runner-cache-placement-admission-runtime-v1"
 
     path.write_text(
         '{"schema_version":"kairyu-runner-cache-placement-admission-runtime-v1",'
@@ -293,6 +330,13 @@ def test_runtime_config_loader_is_strict_and_https_by_default(tmp_path: Path) ->
             replay_safety_window_s=4,
             admission_request_timeout_s=4.0,
         )
+    with pytest.raises(ValueError, match="response_limit_bytes"):
+        _config(
+            tmp_path,
+            schema_version="kairyu-runner-cache-placement-admission-runtime-v2",
+            authorization_request_limit_bytes=1024,
+            authorization_response_limit_bytes=1024,
+        )
 
 
 class FakePostgresStore(InMemoryRunnerCachePlacementAdmissionStore):
@@ -309,9 +353,15 @@ class FakePostgresStore(InMemoryRunnerCachePlacementAdmissionStore):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("authorization_status", "allowed"),
+    [(200, True), (409, False)],
+)
 async def test_runtime_assembles_app_checks_dependencies_and_closes(
     tmp_path: Path,
     monkeypatch,
+    authorization_status: int,
+    allowed: bool,
 ) -> None:
     binding = _binding()
     stores: list[FakePostgresStore] = []
@@ -325,6 +375,8 @@ async def test_runtime_assembles_app_checks_dependencies_and_closes(
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET":
             return httpx.Response(204)
+        if authorization_status == 409:
+            return httpx.Response(409, json={"detail": "private authority detail"})
         return _authorization_response(request, binding)
 
     def client_factory(**kwargs):
@@ -404,7 +456,14 @@ async def test_runtime_assembles_app_checks_dependencies_and_closes(
 
     assert health.json() == {"status": "ok"}
     assert ready.status_code == 200
-    assert admitted.json()["response"]["allowed"] is True
+    admission_response = admitted.json()["response"]
+    assert admission_response["allowed"] is allowed
+    if not allowed:
+        assert admission_response["status"] == {
+            "code": 409,
+            "message": "cache placement admission conflicts with current state",
+        }
+        assert "private" not in admitted.text
     assert stores[0].ready_checks == 1
     runtime.close()
     runtime.close()
@@ -430,6 +489,35 @@ def test_runtime_rejects_broad_tls_key_permissions_before_dependencies(
         create_store,
     )
     with pytest.raises(ValueError, match="permissions are too broad"):
+        build_runner_cache_placement_admission_runtime(config)
+    assert opened is False
+
+
+@pytest.mark.parametrize(
+    ("invalid_byte", "message"),
+    [(b"\x00", "without NUL"), (b"\x7f", "visible ASCII")],
+)
+def test_runtime_rejects_non_visible_ascii_authority_token_before_dependencies(
+    tmp_path: Path,
+    monkeypatch,
+    invalid_byte: bytes,
+    message: str,
+) -> None:
+    config = _config(tmp_path)
+    config.authorization_bearer_token_file.write_bytes(b"a" * 31 + invalid_byte + b"\n")
+    config.authorization_bearer_token_file.chmod(0o640)
+    opened = False
+
+    def create_store(*_args, **_kwargs):
+        nonlocal opened
+        opened = True
+
+    monkeypatch.setattr(
+        runtime_module,
+        "PostgresRunnerCachePlacementAdmissionStore",
+        create_store,
+    )
+    with pytest.raises(ValueError, match=message):
         build_runner_cache_placement_admission_runtime(config)
     assert opened is False
 

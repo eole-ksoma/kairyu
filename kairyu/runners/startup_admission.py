@@ -12,6 +12,9 @@ from typing import Any, Protocol, runtime_checkable
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from kairyu.runners.startup_binding import RunnerCacheStartupBinding
+from kairyu.runners.startup_binding_authority import (
+    RunnerCachePlacementBindingAuthorizationDeniedError,
+)
 from kairyu.runners.startup_metadata import RUNNER_CACHE_STARTUP_TARGET_ANNOTATION
 from kairyu.runners.startup_scheduling import (
     RunnerCacheSchedulingError,
@@ -378,7 +381,12 @@ class RunnerCachePlacementAdmissionController:
             raise RunnerCachePlacementAdmissionError(
                 "Pod controller owner does not match the admission plan"
             )
-        refreshed = self._reauthorize(plan.binding)
+        try:
+            refreshed = self._reauthorize(plan.binding)
+        except RunnerCachePlacementBindingAuthorizationDeniedError as exc:
+            raise RunnerCachePlacementAdmissionConflictError(
+                "cache startup binding is no longer authorized"
+            ) from exc
         self._check_deadline(deadline_monotonic)
         if not isinstance(refreshed, RunnerCacheStartupBinding):
             raise TypeError("reauthorize must return RunnerCacheStartupBinding")

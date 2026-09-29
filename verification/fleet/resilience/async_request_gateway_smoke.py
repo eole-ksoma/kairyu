@@ -724,8 +724,14 @@ class Smoke:
             != 0
         ):
             raise AssertionError("completed smoke left durable work queued")
+        # Owner failover shows up as the transition its takeover used: a
+        # reclaim after lease expiry, or the owner's shutdown release (defer).
+        failover = next(
+            check for check in self.checks if check["name"] == "lease_fenced_owner_failover"
+        )
+        takeover_transition = "reclaim" if failover["takeover_event"] == "reclaim" else "defer"
         minimums = {
-            ("kairyu_async_request_transitions_total", "reclaim"): 1,
+            ("kairyu_async_request_transitions_total", takeover_transition): 1,
             ("kairyu_async_request_transitions_total", "expire"): 1,
             ("kairyu_async_request_transitions_total", "cancel"): 2,
             ("kairyu_async_request_transitions_total", "succeed"): 3,

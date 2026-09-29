@@ -156,10 +156,12 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
   and D3.7 app, validates bounded secret/config files, and performs
   authenticated nonce-bound final binding reauthorization without redirects or
   environment proxies. Plaintext authority URLs are rejected; request and
-  response bytes plus secret-file permissions are bounded before use. The
-  scaling-authority endpoint, Kubernetes TLS and
-  admission resources, scheduled compaction, and live environment acceptance
-  remain.
+  response bytes plus secret-file permissions are bounded before use. D3.9 adds
+  the authenticated, strict, size/concurrency-bounded scaling-authority HTTP
+  boundary with nonce echo, exact-binding authorization, sanitized fail-closed
+  errors, and protected empty-body readiness. Authority runtime assembly,
+  Kubernetes TLS and admission resources, scheduled compaction, and live
+  environment acceptance remain.
 - Qwen3.8-Flash-Next MTP speculative decoding stays off in `qwen3.8-flash-next-dp2-8gpu` until upstream fixes vllm#53912 (prefix caching + MTP output corruption on hybrid GDN); single-stream decode 104 vs 175 tok/s
 - DTO-D15 (2026-08-26) changed the served tiered-example config: verify.sh coding/generic gates and the digest re-pin are pending before the example status can be claimed green again
 - Human sign-off pending on M2–M4 design reviews
@@ -168,6 +170,18 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
+
+### 2026-09-29 — [progress] Live placement-binding authority API
+- What: added the authenticated D3.9 scaling-authority HTTP boundary with strict
+  nonce-bound request/response models, exact live-binding reauthorization,
+  bounded body/concurrency, protected empty-body readiness, no-store responses,
+  sanitized stale/dependency failures, and deadline-aware backend contracts.
+- Why: the D3.8 admission runtime must revalidate its stored binding against a
+  live authority over a concrete fail-closed service boundary before consuming
+  placement capacity.
+- Refs: docs/design/node-model-cache-prestage-v1.md;
+  kairyu/runners/startup_binding_authority{,_api}.py;
+  tests/unit/test_runner_startup_binding_authority_api.py
 
 ### 2026-09-29 — [progress] Executable placement webhook runtime
 - What: added `kairyu placement-admission serve` with versioned strict config,

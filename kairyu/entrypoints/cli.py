@@ -62,6 +62,20 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Version-controlled GitOps model deployment-intent JSON.",
     )
+
+    cache_agent = subparsers.add_parser(
+        "cache-agent",
+        help="Run the authenticated node-local model cache agent.",
+    )
+    cache_agent_commands = cache_agent.add_subparsers(
+        dest="cache_agent_command",
+        required=True,
+    )
+    cache_agent_serve = cache_agent_commands.add_parser(
+        "serve",
+        help="Assemble and serve a cache agent from a versioned JSON config.",
+    )
+    cache_agent_serve.add_argument("config", type=Path)
     return parser
 
 
@@ -117,6 +131,32 @@ def _run_artifact_command(args: argparse.Namespace) -> None:
         raise SystemExit(1) from None
 
 
+def _run_cache_agent(args: argparse.Namespace) -> None:
+    import uvicorn
+
+    from kairyu.entrypoints.server.middleware import configure_json_logging
+    from kairyu.runners.cache_agent_runtime import (
+        build_node_model_cache_agent_runtime,
+        load_node_model_cache_agent_runtime_config,
+    )
+
+    configure_json_logging()
+    config = load_node_model_cache_agent_runtime_config(args.config)
+    runtime = build_node_model_cache_agent_runtime(config)
+    try:
+        uvicorn.run(
+            runtime.app,
+            host=config.listen_host,
+            port=config.listen_port,
+            loop="uvloop" if sys.platform == "linux" else "auto",
+            http="httptools" if sys.platform == "linux" else "auto",
+            log_config=None,
+            access_log=False,
+        )
+    finally:
+        runtime.close()
+
+
 def main(argv: list[str] | None = None) -> None:
     args = _build_parser().parse_args(argv)
     if args.command == "serve":
@@ -157,6 +197,8 @@ def main(argv: list[str] | None = None) -> None:
             sys.exit(1)
     elif args.command == "artifact":
         _run_artifact_command(args)
+    elif args.command == "cache-agent":
+        _run_cache_agent(args)
 
 
 if __name__ == "__main__":

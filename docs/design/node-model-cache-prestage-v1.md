@@ -136,6 +136,31 @@ security boundary. The DaemonSet must receive rotated credentials through the
 approved secret mechanism and be isolated by NetworkPolicy; production may add
 mTLS at the service mesh or sidecar without changing the command contract.
 
+## Executable runtime boundary
+
+`kairyu cache-agent serve <runtime.json>` is the deployment entrypoint. Its
+versioned JSON config contains only paths and non-secret limits. Node identity,
+PostgreSQL DSN, controller API keys, optional artifact-gateway bearer token,
+and public manifest trust roots are loaded from separately mounted files before
+the listener starts. Duplicate config keys, non-finite values, embedded URL
+credentials, invalid hosts/ports, plaintext HTTP without an explicit opt-in,
+multiline scalar secrets (apart from one optional terminal LF), non-regular
+config/secret files, and an index outside `<cache-root>/state` fail startup.
+Projected-secret symlinks remain supported because validation applies to the
+opened file descriptor.
+
+The runtime constructs one node-bound SQLite index, HTTP range source,
+PostgreSQL pre-stage store, verified cache agent, executor, and HTTP app. The
+PostgreSQL schema is validate-only by default; migration/initialization remains
+an explicit deployment action. Startup and readiness validate the owned cache
+directories, durable registry, and local index. Shutdown closes the PostgreSQL
+connection and artifact HTTP client idempotently.
+
+The index accepts an explicit artifact cache root independently of its SQLite
+file location. Production therefore stores metadata at
+`<cache-root>/state/cache-index.sqlite3` while all validated artifact paths
+remain under `<cache-root>/artifacts/<digest>/tree`.
+
 ## Node execution and pins
 
 `NodeModelPrestageExecutor.execute()` validates the command against the GitOps
@@ -183,7 +208,8 @@ reauthorization can justify Runner creation.
 
 - service discovery, rotated API credentials or mTLS, and NetworkPolicy for the
   authenticated per-node HTTP API;
-- a node DaemonSet/service hosting the executor and WP4.2 cache agent;
+- a node DaemonSet/service invoking the implemented `cache-agent serve`
+  entrypoint;
 - reconciliation that replays desired ensure/release commands after restart;
 - bounded tombstone retention/compaction that durably preserves each retired
   placement's generation, leader fence, and target-revision high-water marks;

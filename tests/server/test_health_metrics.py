@@ -52,32 +52,53 @@ async def test_health_and_readyz_ok():
     assert ready.json() == {"status": "ready"}
 
 
-async def test_blocked_metrics_render_does_not_block_health() -> None:
+async def test_blocking_store_warmup_does_not_block_health_or_move_render() -> None:
+    from kairyu.async_requests import RequestQueueMetricsSnapshot
+
+    snapshot_started = threading.Event()
+    release_snapshot = threading.Event()
+
+    class _Store:
+        store_id = "durable"
+
+        def metrics_snapshot(self):
+            snapshot_started.set()
+            assert release_snapshot.wait(2)
+            return RequestQueueMetricsSnapshot(
+                state_counts={AsyncRequestState.QUEUED: 1},
+                oldest_queued_age_seconds=0.0,
+                transition_counts={},
+            )
+
     app = create_legacy_app(engines={"m": MockBackend()})
-    render_started = threading.Event()
-    release_render = threading.Event()
+    app.state.metrics.track_async_request_store(_Store())
+    render_threads = []
     original_render = app.state.metrics.render
 
-    def blocking_render():
-        render_started.set()
-        assert release_render.wait(2)
+    def recording_render():
+        render_threads.append(threading.get_ident())
         return original_render()
 
-    app.state.metrics.render = blocking_render
-    watchdog = threading.Timer(1, release_render.set)
+    app.state.metrics.render = recording_render
+    watchdog = threading.Timer(1, release_snapshot.set)
     watchdog.start()
     try:
         async with _client(app) as client:
             metrics_task = asyncio.create_task(client.get("/metrics"))
-            assert await asyncio.to_thread(render_started.wait, 0.5)
-            assert not release_render.is_set()
+            assert await asyncio.to_thread(snapshot_started.wait, 0.5)
+            assert not release_snapshot.is_set()
             health = await asyncio.wait_for(client.get("/health"), timeout=0.5)
             assert health.status_code == 200
-            release_render.set()
-            assert (await metrics_task).status_code == 200
+            release_snapshot.set()
+            scraped = await metrics_task
     finally:
-        release_render.set()
+        release_snapshot.set()
         watchdog.cancel()
+
+    assert scraped.status_code == 200
+    assert 'kairyu_async_request_queue_depth{store="durable"} 1.0' in scraped.text
+    # ReplicaPool and other collectors are event-loop-owned and unlocked.
+    assert render_threads == [threading.get_ident()]
 
 
 async def test_readyz_503_when_pool_has_no_healthy_replica():
@@ -263,7 +284,7 @@ def test_async_store_metrics_fail_open_and_retain_last_good_snapshot() -> None:
     assert 'kairyu_async_request_metrics_snapshot_success{store="durable"} 0.0' in degraded
 
 
-def test_blocking_async_store_warms_only_on_first_render() -> None:
+def test_blocking_async_store_warms_before_render_not_during_collect() -> None:
     from kairyu.async_requests import RequestQueueMetricsSnapshot
 
     class _Store:
@@ -285,6 +306,8 @@ def test_blocking_async_store_warms_only_on_first_render() -> None:
     metrics.track_async_request_store(store)
     assert store.calls == 0
 
+    metrics.prepare_render()
+    assert store.calls == 1
     rendered = metrics.render()[0].decode()
 
     assert store.calls == 1

@@ -10,7 +10,6 @@ from typing import Protocol, runtime_checkable
 from pydantic import BaseModel, ConfigDict, Field
 
 from kairyu.artifacts.placement_hint import NodeModelCachePlacementHintSnapshot
-from kairyu.runners.prestage import NodeModelPrestageRecord
 from kairyu.runners.prewarm import ScalingPrewarmPlan
 from kairyu.runners.scaling_log import ScalingDecisionRecord
 from kairyu.runners.scaling_quota import ScalingQuotaAdmission
@@ -21,6 +20,7 @@ from kairyu.runners.startup_binding_authority import (
 from kairyu.runners.startup_binding_live_authority import (
     RunnerCachePlacementBindingLiveState,
     RunnerCachePlacementBindingPinEvidence,
+    RunnerCachePlacementBindingPrestageEvidence,
     RunnerCachePlacementBindingTargetState,
 )
 
@@ -41,7 +41,7 @@ class RunnerCachePlacementBindingCacheState(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
 
     prewarm_plan: ScalingPrewarmPlan
-    prestage_records: tuple[NodeModelPrestageRecord, ...] = Field(
+    prestage_records: tuple[RunnerCachePlacementBindingPrestageEvidence, ...] = Field(
         min_length=1,
         max_length=100_000,
     )

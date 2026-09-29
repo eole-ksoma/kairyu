@@ -42,6 +42,7 @@ from kairyu.runners import (
     NodeModelPrestageConflictError,
     NodeModelPrestageExecutor,
     NodeModelPrestageExpiredError,
+    NodeModelPrestageLookupStore,
     NodeModelPrestageStore,
     RunnerWriterAuthority,
     ScalingPrewarmSnapshot,
@@ -733,9 +734,7 @@ def test_compaction_reclaims_active_capacity_and_preserves_all_fences() -> None:
             now=_NOW + timedelta(seconds=5),
         )
 
-    changed_election_payload = stale_generation.model_dump(
-        mode="json", exclude={"command_id"}
-    )
+    changed_election_payload = stale_generation.model_dump(mode="json", exclude={"command_id"})
     changed_election_payload["command_generation"] = 22
     changed_election_payload["authority"]["election_id"] = "other-election"
     changed_election_payload["command_id"] = _canonical_digest(changed_election_payload)
@@ -747,9 +746,7 @@ def test_compaction_reclaims_active_capacity_and_preserves_all_fences() -> None:
             now=_NOW + timedelta(seconds=5),
         )
 
-    changed_holder_payload = stale_generation.model_dump(
-        mode="json", exclude={"command_id"}
-    )
+    changed_holder_payload = stale_generation.model_dump(mode="json", exclude={"command_id"})
     changed_holder_payload["command_generation"] = 22
     changed_holder_payload["authority"]["fencing_token"] = 5
     changed_holder_payload["authority"]["holder_id"] = "controller-b"
@@ -844,10 +841,13 @@ def test_compaction_is_cutoff_limited_and_never_moves_live_records() -> None:
     assert tuple(record.command.placement_id for record in store.list_records()) == (
         "placement-live",
     )
-    assert store.compact_absent_records(
-        retired_before=_NOW + timedelta(seconds=20),
-        compacted_at=_NOW + timedelta(seconds=20),
-    ) == ()
+    assert (
+        store.compact_absent_records(
+            retired_before=_NOW + timedelta(seconds=20),
+            compacted_at=_NOW + timedelta(seconds=20),
+        )
+        == ()
+    )
 
     with pytest.raises(ValueError, match="cannot predate"):
         store.compact_absent_records(
@@ -932,7 +932,27 @@ def test_compaction_extension_preserves_legacy_store_runtime_compatibility() -> 
     legacy = LegacyStore()
 
     assert isinstance(legacy, NodeModelPrestageStore)
+    assert not isinstance(legacy, NodeModelPrestageLookupStore)
     assert not isinstance(legacy, NodeModelPrestageCompactionStore)
+
+
+def test_lookup_extension_returns_an_isolated_exact_record() -> None:
+    command = _commands("a" * 64)[0]
+    store = InMemoryNodeModelPrestageStore(node_id="gpu-node-00")
+    claimed = store.claim(
+        command,
+        claim_id="b" * 64,
+        now=_NOW + timedelta(seconds=1),
+    )
+
+    first = store.get_record(command.placement_id)
+    second = store.get_record(command.placement_id)
+
+    assert isinstance(store, NodeModelPrestageLookupStore)
+    assert first == claimed
+    assert second == claimed
+    assert first is not second
+    assert store.get_record("missing-placement") is None
 
 
 def test_overlay_publishes_filling_ready_failed_and_preserves_released_residency(

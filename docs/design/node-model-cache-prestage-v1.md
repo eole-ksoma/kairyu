@@ -22,8 +22,10 @@ shutdown. D3.11 adds leader-fenced validation of the live binding, durable
 decision, target, quota, prewarm capacity, cache freshness, and lifetime.
 D3.12 composes those facts through explicit deadline-bounded current-binding,
 decision, target, quota, and cache backend readers with a second binding read as
-a replacement fence. Concrete backend reader adapters, scheduling compaction,
-and Kubernetes deployment wiring remain deployment tasks.
+a replacement fence. D3.13 exposes path-free, owner-scoped live pre-stage and
+cache-index evidence from the authenticated node agent. Controller-side backend
+reader adapters, scheduling compaction, and Kubernetes deployment wiring remain
+deployment tasks.
 
 ## Purpose
 
@@ -154,6 +156,8 @@ by a trusted controller:
 - `POST /v1/prestage/ensure` accepts one fenced command, claim digest, signed
   manifest, and GitOps admission request;
 - `POST /v1/prestage/release` accepts one separately fenced release command;
+- `POST /v1/cache/live-evidence` returns one path-free, owner-scoped placement
+  lineage joined from the durable pre-stage store and one cache-index snapshot;
 - `GET /v1/prestage/records` returns at most 100 node-scoped status projections
   with a placement cursor; and
 - `/health` and `/readyz` provide low-disclosure liveness and an injected
@@ -571,8 +575,21 @@ denial rather than a mixed snapshot. Readiness checks every distinct backend
 once under the same budget. Reader outputs are deep-validated before the D3.11
 authority consumes them, and the cache reader must return prewarm, full
 pre-stage records, physical hints, and owner-scoped pin evidence together.
-Production adapters for the PostgreSQL, Kubernetes/Kueue, and authenticated
-node-agent transports remain the next integration unit.
+Production adapters for PostgreSQL and Kubernetes/Kueue, plus the authenticated
+node-agent client/aggregation side, remain the next integration unit.
+
+D3.13 adds `LocalNodeModelCacheLiveEvidenceSource` and the authenticated
+`POST /v1/cache/live-evidence` node-agent endpoint. The request carries one
+exact binding placement and model identity. The source reads the durable
+pre-stage record before and after one transactionally consistent cache-index
+snapshot, rejects lineage drift, and requires the requested command generation,
+pin owner, artifact identity, and resident generation to remain current. Its
+response contains only a path-free ready pre-stage projection, one filtered
+physical residency hint, and owner-scoped pin evidence derived from the same
+index revision and observation time; local artifact paths, fill results, and
+failure details never cross the transport. The production node-agent runtime
+always constructs this source and uses a bounded hint TTL. Missing or changed
+lineage is a sanitized conflict, while unavailable state remains fail closed.
 
 ## Deployment boundary
 
@@ -585,8 +602,9 @@ node-agent transports remain the next integration unit.
 - reconciliation that replays desired ensure/release commands after restart;
 - a scheduled caller for the implemented bounded compaction contract, with a
   documented retirement cutoff and monitoring of per-placement high-water rows;
-- concrete PostgreSQL, Kubernetes/Kueue, and node-agent reader adapters for the
-  D3.12 live-state source and deployment of the assembled scaling-authority
+- concrete PostgreSQL, Kubernetes/Kueue, and authenticated D3.13 node-agent
+  client/aggregation adapters for the D3.12 live-state source and deployment of
+  the assembled scaling-authority
   reauthorization/readiness endpoint consumed by D3.8, plus a highly available
   Deployment/Service/MutatingWebhookConfiguration, TLS
   certificate issuance/rotation and trust, ingress restriction, orchestration

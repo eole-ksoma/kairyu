@@ -24,6 +24,7 @@ from kairyu.artifacts import (
     ModelArtifactTrustStore,
     NodeModelCacheError,
     NodeModelCacheFillResult,
+    NodeModelCacheIndex,
     SignedModelArtifactManifest,
     TrustedModelSigner,
     model_file_tree_digest,
@@ -31,11 +32,15 @@ from kairyu.artifacts import (
 )
 from kairyu.runners import (
     InMemoryNodeModelPrestageStore,
+    LocalNodeModelCacheLiveEvidenceSource,
     ModelCachePlacement,
     ModelCachePlacementState,
+    NodeModelCacheLiveEvidenceRequest,
+    NodeModelCacheLiveEvidenceResponse,
     NodeModelPrestageCapacityError,
     NodeModelPrestageConflictError,
     NodeModelPrestageRecord,
+    RunnerCacheStartupPlacement,
     RunnerWriterAuthority,
     ScalingPrewarmSnapshot,
     build_node_model_prestage_commands,
@@ -243,15 +248,86 @@ def _client(app) -> httpx.AsyncClient:
     )
 
 
+def _live_evidence_setup(tmp_path: Path):
+    signed, trust, _admission = _artifact()
+    command = _command(signed.manifest_digest)
+    store = InMemoryNodeModelPrestageStore(node_id="gpu-node-00")
+    store.claim(command, claim_id="b" * 64, now=_NOW + timedelta(seconds=1))
+    cache_root = tmp_path / "cache"
+    artifact_path = cache_root / "artifacts" / signed.manifest_digest / "tree"
+    artifact_path.mkdir(parents=True)
+    index = NodeModelCacheIndex(
+        cache_root / "state" / "index.sqlite3",
+        node_id="gpu-node-00",
+        cache_root=cache_root,
+    )
+    index.record_verified(
+        manifest_digest=signed.manifest_digest,
+        model_id="org/cache-api-test",
+        model_revision="release-1",
+        artifact_path=artifact_path,
+        total_bytes=11,
+        file_count=1,
+        verification_source="filled",
+    )
+    pinned = index.pin(
+        signed.manifest_digest,
+        owner=command.pin_owner,
+        reason=f"prestage:{command.command_id}",
+    )
+    store.complete(
+        command,
+        claim_id="b" * 64,
+        fill_result=NodeModelCacheFillResult(
+            deployment_id=command.deployment_id,
+            manifest_digest=signed.manifest_digest,
+            artifact_path=artifact_path,
+            cache_hit=False,
+            resumed_bytes=0,
+            downloaded_bytes=11,
+            file_count=1,
+            total_bytes=11,
+        ),
+        pin_record_generation=pinned.generation,
+        now=_NOW + timedelta(seconds=2),
+    )
+    placement = RunnerCacheStartupPlacement(
+        placement_id=command.placement_id,
+        node_name=command.node_id,
+        resource_flavor=command.resource_flavor,
+        profile_id=command.profile_id,
+        compatibility_approval_id=command.compatibility_approval_id,
+        manifest_digest=command.manifest_digest,
+        pin_owner=command.pin_owner,
+        prestage_command_id=command.command_id,
+        prestage_command_generation=command.command_generation,
+        hint_index_revision=1,
+        resident_record_generation=pinned.generation,
+        hint_observed_at=_NOW,
+        hint_valid_until=_NOW + timedelta(minutes=1),
+    )
+    request = NodeModelCacheLiveEvidenceRequest(
+        placement=placement,
+        model_id=command.model_id,
+        model_revision=command.model_revision,
+    )
+    source = LocalNodeModelCacheLiveEvidenceSource(
+        node_id="gpu-node-00",
+        store=store,
+        index=index,
+        hint_ttl_seconds=30,
+        clock=lambda: _NOW + timedelta(seconds=3),
+    )
+    return source, request, store, index, trust
+
+
 @pytest.mark.asyncio
 async def test_health_is_open_but_state_requires_bearer_authentication() -> None:
     app, _executor, _store, _command_value, _signed, _trust, _admission = _app()
     async with _client(app) as client:
         health = await client.get("/health")
         unauthenticated = await client.get("/v1/prestage/records")
-        wrong = await client.get(
-            "/v1/prestage/records", headers={"Authorization": "Bearer wrong"}
-        )
+        wrong = await client.get("/v1/prestage/records", headers={"Authorization": "Bearer wrong"})
         authorized = await client.get(
             "/v1/prestage/records",
             headers={"Authorization": f"Bearer {_TOKEN}"},
@@ -262,6 +338,154 @@ async def test_health_is_open_but_state_requires_bearer_authentication() -> None
     assert wrong.status_code == 401
     assert authorized.status_code == 200
     assert authorized.json()["records"] == []
+
+
+def test_local_live_evidence_is_owner_scoped_and_path_free(tmp_path: Path) -> None:
+    source, request, _store, _index, _trust = _live_evidence_setup(tmp_path)
+
+    response = source.read(request)
+    payload = response.model_dump(mode="json")
+
+    assert response.prestage_record.command.command_id == (request.placement.prestage_command_id)
+    assert response.pin_evidence.pin_owners == (request.placement.pin_owner,)
+    assert response.pin_evidence.index_revision == response.placement_hint.index_revision
+    assert response.pin_evidence.observed_at == response.placement_hint.observed_at
+    assert response.placement_hint.residents[0].record_generation == (
+        request.placement.resident_record_generation
+    )
+    assert "artifact_path" not in str(payload)
+    assert "fill_result" not in payload["prestage_record"]
+    assert "failure" not in payload["prestage_record"]
+
+
+def test_local_live_evidence_rejects_missing_requested_owner(tmp_path: Path) -> None:
+    source, request, _store, index, _trust = _live_evidence_setup(tmp_path)
+    index.unpin(request.placement.manifest_digest, owner=request.placement.pin_owner)
+    index.pin(
+        request.placement.manifest_digest,
+        owner="prestage/production/cache-api-test/other-placement",
+        reason="other-placement",
+    )
+
+    with pytest.raises(NodeModelPrestageConflictError, match="does not match"):
+        source.read(request)
+
+
+def test_local_live_evidence_rejects_prestage_change_during_index_snapshot(
+    tmp_path: Path,
+) -> None:
+    _source, request, store, index, _trust = _live_evidence_setup(tmp_path)
+    current = store.get_record(request.placement.placement_id)
+    assert current is not None
+
+    class ChangingStore(InMemoryNodeModelPrestageStore):
+        def __init__(self) -> None:
+            super().__init__(node_id="gpu-node-00")
+            self.reads = 0
+
+        def get_record(self, placement_id: str):
+            assert placement_id == request.placement.placement_id
+            self.reads += 1
+            if self.reads == 1:
+                return current
+            return current.model_copy(update={"attempt": current.attempt + 1})
+
+    source = LocalNodeModelCacheLiveEvidenceSource(
+        node_id="gpu-node-00",
+        store=ChangingStore(),
+        index=index,
+        clock=lambda: _NOW + timedelta(seconds=3),
+    )
+
+    with pytest.raises(NodeModelPrestageConflictError, match="changed during"):
+        source.read(request)
+
+
+@pytest.mark.asyncio
+async def test_live_evidence_endpoint_is_authenticated_and_strict(tmp_path: Path) -> None:
+    source, request, store, _index, trust = _live_evidence_setup(tmp_path)
+    executor = FakeExecutor(store)
+    app = create_node_model_cache_agent_app(
+        node_id="gpu-node-00",
+        executor=executor,  # type: ignore[arg-type]
+        store=store,
+        trust_store=trust,
+        api_keys=(_TOKEN,),
+        readiness_check=lambda: None,
+        live_evidence_source=source,
+        request_body_limit_bytes=1024 * 1024,
+    )
+    payload = request.model_dump(mode="json")
+    headers = {"Authorization": f"Bearer {_TOKEN}"}
+    async with _client(app) as client:
+        unauthorized = await client.post("/v1/cache/live-evidence", json=payload)
+        wrong_type = await client.post(
+            "/v1/cache/live-evidence",
+            content=b"{}",
+            headers={**headers, "Content-Type": "text/plain"},
+        )
+        duplicate = await client.post(
+            "/v1/cache/live-evidence",
+            content=b'{"schema_version":"kairyu-node-model-cache-live-evidence-request-v1",'
+            b'"schema_version":"kairyu-node-model-cache-live-evidence-request-v1"}',
+            headers={**headers, "Content-Type": "application/json"},
+        )
+        authorized = await client.post(
+            "/v1/cache/live-evidence",
+            json=payload,
+            headers=headers,
+        )
+
+    assert unauthorized.status_code == 401
+    assert wrong_type.status_code == 415
+    assert duplicate.status_code == 400
+    assert authorized.status_code == 200
+    assert authorized.headers["cache-control"] == "no-store"
+    assert authorized.json()["pin_evidence"]["pin_owners"] == [request.placement.pin_owner]
+    assert "/cache/" not in authorized.text
+
+
+@pytest.mark.asyncio
+async def test_live_evidence_endpoint_fails_closed_on_invalid_source_output(
+    tmp_path: Path,
+) -> None:
+    source, request, store, _index, trust = _live_evidence_setup(tmp_path)
+    valid = source.read(request)
+    invalid = NodeModelCacheLiveEvidenceResponse.model_construct(
+        schema_version=valid.schema_version,
+        node_id="",
+        prestage_record=valid.prestage_record,
+        placement_hint=valid.placement_hint,
+        pin_evidence=valid.pin_evidence,
+    )
+
+    class InvalidSource:
+        def read(self, _request):
+            return invalid
+
+    app = create_node_model_cache_agent_app(
+        node_id="gpu-node-00",
+        executor=FakeExecutor(store),  # type: ignore[arg-type]
+        store=store,
+        trust_store=trust,
+        api_keys=(_TOKEN,),
+        readiness_check=lambda: None,
+        live_evidence_source=InvalidSource(),  # type: ignore[arg-type]
+    )
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://cache-agent.test",
+    ) as client:
+        response = await client.post(
+            "/v1/cache/live-evidence",
+            json=request.model_dump(mode="json"),
+            headers={"Authorization": f"Bearer {_TOKEN}"},
+        )
+
+    assert response.status_code == 500
+    assert "node_id" not in response.text
+    assert valid.node_id not in response.text
 
 
 @pytest.mark.asyncio
@@ -285,9 +509,7 @@ async def test_ensure_uses_server_trust_store_and_release_is_idempotent() -> Non
         ttl_seconds=60,
     )
     async with _client(app) as client:
-        ensured = await client.post(
-            "/v1/prestage/ensure", json=ensure_payload, headers=headers
-        )
+        ensured = await client.post("/v1/prestage/ensure", json=ensure_payload, headers=headers)
         records = await client.get("/v1/prestage/records", headers=headers)
         released = await client.post(
             "/v1/prestage/release",
@@ -349,9 +571,7 @@ async def test_invalid_signature_error_is_sanitized_and_trust_root_is_not_wire_i
 
     executor.execute = reject  # type: ignore[method-assign]
     async with _client(app) as client:
-        rejected = await client.post(
-            "/v1/prestage/ensure", json=payload, headers=headers
-        )
+        rejected = await client.post("/v1/prestage/ensure", json=payload, headers=headers)
         injected = await client.post(
             "/v1/prestage/ensure",
             json={**payload, "trust_store": trust.model_dump(mode="json")},
@@ -392,9 +612,7 @@ async def test_readiness_failure_and_body_limit_hide_internal_details() -> None:
 
 @pytest.mark.asyncio
 async def test_chunked_body_limit_is_enforced_without_content_length() -> None:
-    app, _executor, _store, _command_value, _signed, _trust, _admission = _app(
-        body_limit=128
-    )
+    app, _executor, _store, _command_value, _signed, _trust, _admission = _app(body_limit=128)
 
     async def chunks():
         yield b"x" * 65
@@ -442,14 +660,12 @@ async def test_records_use_bounded_keyset_pagination_and_validate_cursor() -> No
         )
 
     assert first.status_code == 200
-    assert [item["command"]["placement_id"] for item in first.json()["records"]] == [
-        "placement-00"
-    ]
+    assert [item["command"]["placement_id"] for item in first.json()["records"]] == ["placement-00"]
     assert cursor == "placement-00"
     assert "private" not in first.text
-    assert [
-        item["command"]["placement_id"] for item in second_page.json()["records"]
-    ] == ["placement-01"]
+    assert [item["command"]["placement_id"] for item in second_page.json()["records"]] == [
+        "placement-01"
+    ]
     assert second_page.json()["next_cursor"] is None
     assert invalid.status_code == 422
 
@@ -519,9 +735,7 @@ async def test_concurrency_gate_rejects_work_beyond_total_limit() -> None:
             client.post("/v1/prestage/ensure", json=payload, headers=headers)
         )
         assert await asyncio.to_thread(entered.wait, 1)
-        overloaded = await client.post(
-            "/v1/prestage/ensure", json=payload, headers=headers
-        )
+        overloaded = await client.post("/v1/prestage/ensure", json=payload, headers=headers)
         unblock.set()
         completed = await first
 

@@ -200,11 +200,7 @@ class NodeModelPrestageRecord(BaseModel):
     @field_validator("pin_record_generation", mode="before")
     @classmethod
     def validate_pin_record_generation(cls, value: object) -> int | None:
-        return (
-            None
-            if value is None
-            else _integer(value, name="pin_record_generation")
-        )
+        return None if value is None else _integer(value, name="pin_record_generation")
 
     @field_validator("claim_id")
     @classmethod
@@ -273,9 +269,7 @@ _RELEASE_IDENTITY_FIELDS = (
 
 
 def _release_identity_digest(command: NodeModelPrestageCommand) -> str:
-    return _canonical_digest(
-        {field: getattr(command, field) for field in _RELEASE_IDENTITY_FIELDS}
-    )
+    return _canonical_digest({field: getattr(command, field) for field in _RELEASE_IDENTITY_FIELDS})
 
 
 class NodeModelPrestageHighWaterMark(BaseModel):
@@ -412,6 +406,13 @@ class NodeModelPrestageStore(Protocol):
 
 
 @runtime_checkable
+class NodeModelPrestageLookupStore(NodeModelPrestageStore, Protocol):
+    """Optional exact-key lookup extension for latency-sensitive live reads."""
+
+    def get_record(self, placement_id: str) -> NodeModelPrestageRecord | None: ...
+
+
+@runtime_checkable
 class NodeModelPrestageCompactionStore(NodeModelPrestageStore, Protocol):
     """Optional lifecycle extension for stores that compact released records."""
 
@@ -544,14 +545,10 @@ class _NodeModelPrestageTransitions:
         if existing is None:
             if high_water is not None:
                 if command.command_id == high_water.command_id:
-                    raise NodeModelPrestageConflictError(
-                        "released command cannot be reactivated"
-                    )
+                    raise NodeModelPrestageConflictError("released command cannot be reactivated")
                 self._validate_high_water_successor(high_water, command)
             if record_count >= max_placements:
-                raise NodeModelPrestageCapacityError(
-                    "pre-stage placement capacity is exhausted"
-                )
+                raise NodeModelPrestageCapacityError("pre-stage placement capacity is exhausted")
             attempt = 1
         elif existing.command.command_id == command.command_id:
             if not self._same_command(existing, command):
@@ -560,9 +557,7 @@ class _NodeModelPrestageTransitions:
                 return _copy_prestage_record(existing)
             if existing.state is ModelCachePlacementState.FILLING:
                 if existing.claim_id != claim_id:
-                    raise NodeModelPrestageConflictError(
-                        "placement is claimed by another attempt"
-                    )
+                    raise NodeModelPrestageConflictError("placement is claimed by another attempt")
                 return _copy_prestage_record(existing)
             if existing.state is ModelCachePlacementState.ABSENT:
                 raise NodeModelPrestageConflictError("released command cannot be reactivated")
@@ -766,9 +761,7 @@ class InMemoryNodeModelPrestageStore:
         claim_id: str,
         now: datetime,
     ) -> NodeModelPrestageRecord:
-        command = self._transitions.validate_command(
-            command, now=now, require_active=False
-        )
+        command = self._transitions.validate_command(command, now=now, require_active=False)
         placement_id = command.placement_id
         with self._lock:
             record = self._transitions.claim(
@@ -792,9 +785,7 @@ class InMemoryNodeModelPrestageStore:
         pin_record_generation: int | None = None,
         now: datetime,
     ) -> NodeModelPrestageRecord:
-        command = self._transitions.validate_command(
-            command, now=now, require_active=False
-        )
+        command = self._transitions.validate_command(command, now=now, require_active=False)
         placement_id = command.placement_id
         with self._lock:
             record = self._transitions.complete(
@@ -816,9 +807,7 @@ class InMemoryNodeModelPrestageStore:
         failure: str,
         now: datetime,
     ) -> NodeModelPrestageRecord:
-        command = self._transitions.validate_command(
-            command, now=now, require_active=False
-        )
+        command = self._transitions.validate_command(command, now=now, require_active=False)
         placement_id = command.placement_id
         with self._lock:
             record = self._transitions.fail(
@@ -837,9 +826,7 @@ class InMemoryNodeModelPrestageStore:
         *,
         now: datetime,
     ) -> NodeModelPrestageRecord:
-        command = self._transitions.validate_command(
-            command, now=now, require_active=True
-        )
+        command = self._transitions.validate_command(command, now=now, require_active=True)
         placement_id = command.placement_id
         with self._lock:
             existing = self._records.get(placement_id)
@@ -865,9 +852,13 @@ class InMemoryNodeModelPrestageStore:
 
     def list_records(self) -> tuple[NodeModelPrestageRecord, ...]:
         with self._lock:
-            return tuple(
-                _copy_prestage_record(self._records[key]) for key in sorted(self._records)
-            )
+            return tuple(_copy_prestage_record(self._records[key]) for key in sorted(self._records))
+
+    def get_record(self, placement_id: str) -> NodeModelPrestageRecord | None:
+        placement_id = _text(placement_id, name="placement_id")
+        with self._lock:
+            record = self._records.get(placement_id)
+            return None if record is None else _copy_prestage_record(record)
 
     def list_records_page(
         self,
@@ -876,9 +867,7 @@ class InMemoryNodeModelPrestageStore:
         limit: int = 100,
     ) -> tuple[NodeModelPrestageRecord, ...]:
         if after_placement_id is not None:
-            after_placement_id = _text(
-                after_placement_id, name="after_placement_id"
-            )
+            after_placement_id = _text(after_placement_id, name="after_placement_id")
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise ValueError("limit must be an integer in [1, 1000]")
         with self._lock:

@@ -25,6 +25,12 @@ from kairyu.runners.cache_agent_api import (
     NodeModelPrestageStatus,
     create_node_model_cache_agent_app,
 )
+from kairyu.runners.cache_agent_live_evidence import (
+    LocalNodeModelCacheLiveEvidenceSource,
+    NodeModelCacheLiveEvidenceRequest,
+    NodeModelCacheLiveEvidenceResponse,
+    NodeModelCacheLiveEvidenceSource,
+)
 from kairyu.runners.cache_agent_runtime import (
     NodeModelCacheAgentAPIKeys,
     NodeModelCacheAgentRuntime,
@@ -110,6 +116,7 @@ from kairyu.runners.prestage import (
     NodeModelPrestageExecutor,
     NodeModelPrestageExpiredError,
     NodeModelPrestageHighWaterMark,
+    NodeModelPrestageLookupStore,
     NodeModelPrestageRecord,
     NodeModelPrestageStore,
     apply_node_model_prestage_records,
@@ -250,6 +257,7 @@ from kairyu.runners.startup_binding_live_authority import (
     RunnerCachePlacementBindingLiveState,
     RunnerCachePlacementBindingLiveStateSource,
     RunnerCachePlacementBindingPinEvidence,
+    RunnerCachePlacementBindingPrestageEvidence,
     RunnerCachePlacementBindingTargetState,
     ScalingControllerPlacementBindingAuthority,
 )
@@ -309,6 +317,10 @@ __all__ = [
     "InMemoryNodeModelPrestageStore",
     "NodeModelPrestageCapacityError",
     "NodeModelCacheAgentHealth",
+    "LocalNodeModelCacheLiveEvidenceSource",
+    "NodeModelCacheLiveEvidenceRequest",
+    "NodeModelCacheLiveEvidenceResponse",
+    "NodeModelCacheLiveEvidenceSource",
     "NodeModelCacheAgentAPIKeys",
     "NodeModelCacheAgentRuntime",
     "NodeModelCacheAgentRuntimeConfig",
@@ -319,6 +331,7 @@ __all__ = [
     "NodeModelPrestageExecutor",
     "NodeModelPrestageExpiredError",
     "NodeModelPrestageHighWaterMark",
+    "NodeModelPrestageLookupStore",
     "NodeModelPrestageEnsureRequest",
     "NodeModelPrestageRecord",
     "NodeModelPrestageRecordsResponse",
@@ -384,6 +397,7 @@ __all__ = [
     "RunnerCachePlacementBindingLiveState",
     "RunnerCachePlacementBindingLiveStateSource",
     "RunnerCachePlacementBindingPinEvidence",
+    "RunnerCachePlacementBindingPrestageEvidence",
     "RunnerCachePlacementBindingTargetState",
     "ScalingControllerPlacementBindingAuthority",
     "ComposedRunnerCachePlacementBindingLiveStateSource",

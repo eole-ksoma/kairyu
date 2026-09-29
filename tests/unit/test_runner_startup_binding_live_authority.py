@@ -23,6 +23,7 @@ from kairyu.runners import (
     RunnerCachePlacementBindingCacheState,
     RunnerCachePlacementBindingLiveState,
     RunnerCachePlacementBindingPinEvidence,
+    RunnerCachePlacementBindingPrestageEvidence,
     RunnerCachePlacementBindingTargetState,
     RunnerCacheStartupBinding,
     RunnerCacheStartupPlacement,
@@ -489,7 +490,7 @@ def _live_state(
         target=target or _target_state(decision, binding),
         quota_admission=quota_admission or _quota(observed_at=observed_at),
         prewarm_plan=prewarm_plan or _prewarm(observed_at=observed_at),
-        prestage_records=(record,),
+        prestage_records=(RunnerCachePlacementBindingPrestageEvidence.from_record(record),),
         placement_hints=(hint,),
         pin_evidence=(
             RunnerCachePlacementBindingPinEvidence(

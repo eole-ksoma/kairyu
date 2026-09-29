@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import ClientDisconnect
 
+from kairyu.artifacts.cache_index import NodeModelCacheIndexError
 from kairyu.artifacts.manifest import (
     InvalidModelArtifactError,
     ModelArtifactAdmissionRequest,
@@ -24,6 +25,11 @@ from kairyu.artifacts.manifest import (
 )
 from kairyu.artifacts.node_cache import NodeModelCacheError
 from kairyu.entrypoints.server.middleware import AuthMiddleware, ConcurrencyLimitMiddleware
+from kairyu.runners.cache_agent_live_evidence import (
+    NodeModelCacheLiveEvidenceRequest,
+    NodeModelCacheLiveEvidenceResponse,
+    NodeModelCacheLiveEvidenceSource,
+)
 from kairyu.runners.prestage import (
     NodeModelPrestageCapacityError,
     NodeModelPrestageCommand,
@@ -45,6 +51,7 @@ except ModuleNotFoundError:  # pragma: no cover - exercised by core-only packagi
 _ASGIApp = Callable[..., Awaitable[None]]
 _ENSURE_PATH = "/v1/prestage/ensure"
 _RELEASE_PATH = "/v1/prestage/release"
+_LIVE_EVIDENCE_PATH = "/v1/cache/live-evidence"
 
 
 class NodeModelPrestageEnsureRequest(BaseModel):
@@ -173,6 +180,12 @@ def _parse_release_request(body: bytes) -> NodeModelPrestageReleaseRequest:
     return value
 
 
+def _parse_live_evidence_request(body: bytes) -> NodeModelCacheLiveEvidenceRequest:
+    value = _parse_wire_model(body, NodeModelCacheLiveEvidenceRequest)
+    assert isinstance(value, NodeModelCacheLiveEvidenceRequest)
+    return value
+
+
 class _RequestBodyLimitMiddleware:
     """Reject oversized cache-agent commands before FastAPI materializes JSON."""
 
@@ -286,6 +299,7 @@ def create_node_model_cache_agent_app(
     trust_store: ModelArtifactTrustStore,
     api_keys: Iterable[str],
     readiness_check: Callable[[], None],
+    live_evidence_source: NodeModelCacheLiveEvidenceSource | None = None,
     request_body_limit_bytes: int = 64 * 1024 * 1024,
     active_request_limit: int = 2,
     total_request_limit: int = 8,
@@ -308,6 +322,10 @@ def create_node_model_cache_agent_app(
     keys = _validated_api_keys(api_keys)
     if not callable(readiness_check):
         raise TypeError("readiness_check must be callable")
+    if live_evidence_source is not None and not isinstance(
+        live_evidence_source, NodeModelCacheLiveEvidenceSource
+    ):
+        raise TypeError("live_evidence_source must implement NodeModelCacheLiveEvidenceSource")
     if (
         type(request_body_limit_bytes) is not int
         or not 1 <= request_body_limit_bytes <= 128 * 1024 * 1024
@@ -315,10 +333,7 @@ def create_node_model_cache_agent_app(
         raise ValueError("request_body_limit_bytes must be in [1, 134217728]")
     if type(active_request_limit) is not int or active_request_limit < 1:
         raise ValueError("active_request_limit must be a positive integer")
-    if (
-        type(total_request_limit) is not int
-        or total_request_limit < active_request_limit
-    ):
+    if type(total_request_limit) is not int or total_request_limit < active_request_limit:
         raise ValueError("total_request_limit must be at least active_request_limit")
     if (
         isinstance(queue_wait_timeout_s, bool)
@@ -338,7 +353,7 @@ def create_node_model_cache_agent_app(
     app.add_middleware(
         _RequestBodyLimitMiddleware,
         limit=request_body_limit_bytes,
-        paths=(_ENSURE_PATH, _RELEASE_PATH),
+        paths=(_ENSURE_PATH, _RELEASE_PATH, _LIVE_EVIDENCE_PATH),
     )
     app.add_middleware(
         ConcurrencyLimitMiddleware,
@@ -371,6 +386,10 @@ def create_node_model_cache_agent_app(
     async def cache_handler(_request: Request, _exc: Exception) -> JSONResponse:
         return _error(502, "cache_fill_failed", "verified model cache fill failed")
 
+    @app.exception_handler(NodeModelCacheIndexError)
+    async def cache_index_handler(_request: Request, _exc: Exception) -> JSONResponse:
+        return _backend_unavailable()
+
     @app.exception_handler(_InvalidCacheAgentRequest)
     async def invalid_request_handler(
         _request: Request, exc: _InvalidCacheAgentRequest
@@ -380,9 +399,7 @@ def create_node_model_cache_agent_app(
     if _psycopg is not None:
 
         @app.exception_handler(_psycopg.Error)
-        async def postgres_handler(
-            _request: Request, _exc: Exception
-        ) -> JSONResponse:
+        async def postgres_handler(_request: Request, _exc: Exception) -> JSONResponse:
             return _backend_unavailable()
 
     def require_node(command: NodeModelPrestageCommand) -> None:
@@ -411,9 +428,9 @@ def create_node_model_cache_agent_app(
         if not readiness_cached_result:
             return JSONResponse(
                 status_code=503,
-                content=NodeModelCacheAgentHealth(
-                    status="not_ready", node_id=node_id
-                ).model_dump(mode="json"),
+                content=NodeModelCacheAgentHealth(status="not_ready", node_id=node_id).model_dump(
+                    mode="json"
+                ),
             )
         return NodeModelCacheAgentHealth(status="ready", node_id=node_id)
 
@@ -476,5 +493,31 @@ def create_node_model_cache_agent_app(
         payload = await run_in_threadpool(_parse_release_request, await request.body())
         require_node(payload.command)
         return _public_status(await run_in_threadpool(executor.release, payload.command))
+
+    @app.post(
+        _LIVE_EVIDENCE_PATH,
+        response_model=NodeModelCacheLiveEvidenceResponse,
+    )
+    async def live_evidence(request: Request):
+        if live_evidence_source is None:
+            return _backend_unavailable()
+        if request.headers.get("content-type", "").partition(";")[0].lower() != (
+            "application/json"
+        ):
+            raise _InvalidCacheAgentRequest(
+                status_code=415, message="content type must be application/json"
+            )
+        payload = await run_in_threadpool(
+            _parse_live_evidence_request,
+            await request.body(),
+        )
+        result = await run_in_threadpool(live_evidence_source.read, payload)
+        if not isinstance(result, NodeModelCacheLiveEvidenceResponse):
+            raise TypeError("live evidence source returned an invalid response")
+        result = NodeModelCacheLiveEvidenceResponse.model_validate(result.model_dump())
+        return JSONResponse(
+            content=result.model_dump(mode="json"),
+            headers={"Cache-Control": "no-store"},
+        )
 
     return app

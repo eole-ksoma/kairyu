@@ -24,6 +24,9 @@ from kairyu.artifacts import (
     load_model_artifact_trust_store,
 )
 from kairyu.runners.cache_agent_api import create_node_model_cache_agent_app
+from kairyu.runners.cache_agent_live_evidence import (
+    LocalNodeModelCacheLiveEvidenceSource,
+)
 from kairyu.runners.postgres_prestage import PostgresNodeModelPrestageStore
 from kairyu.runners.prestage import NodeModelPrestageExecutor, _text
 
@@ -78,9 +81,7 @@ class NodeModelCacheAgentRuntimeConfig(BaseModel):
     postgres_store_prefix: str = "kairyu-model-cache-agent"
     initialize_postgres_schema: bool = Field(default=False, strict=True)
     max_placements: int = Field(default=100_000, ge=1, le=100_000, strict=True)
-    postgres_connect_timeout_s: float = Field(
-        default=10.0, gt=0, le=300, strict=True
-    )
+    postgres_connect_timeout_s: float = Field(default=10.0, gt=0, le=300, strict=True)
     artifact_timeout_s: float = Field(default=300.0, gt=0, le=3600, strict=True)
     fill_lock_timeout_s: float = Field(default=900.0, ge=0, le=3600, strict=True)
     request_body_limit_bytes: int = Field(
@@ -89,6 +90,7 @@ class NodeModelCacheAgentRuntimeConfig(BaseModel):
     active_request_limit: int = Field(default=2, ge=1, le=128, strict=True)
     total_request_limit: int = Field(default=8, ge=1, le=1024, strict=True)
     queue_wait_timeout_s: float = Field(default=1.0, gt=0, le=300, strict=True)
+    live_evidence_hint_ttl_seconds: int = Field(default=30, ge=1, le=300, strict=True)
     listen_host: str = "0.0.0.0"
     listen_port: int = Field(default=8081, ge=1, le=65535, strict=True)
 
@@ -131,9 +133,7 @@ class NodeModelCacheAgentRuntimeConfig(BaseModel):
         if self.cache_index_path.parent != expected_state:
             raise ValueError("cache_index_path must be directly below cache_root/state")
         if any(
-            character.isspace()
-            or ord(character) < 0x20
-            or 0x7F <= ord(character) <= 0x9F
+            character.isspace() or ord(character) < 0x20 or 0x7F <= ord(character) <= 0x9F
             for character in self.artifact_base_url
         ):
             raise ValueError("artifact_base_url must not contain whitespace or controls")
@@ -242,13 +242,7 @@ def _load_text_secret(path: Path, *, kind: str, max_bytes: int = 8192) -> str:
         raise ValueError(f"{kind} must be UTF-8") from exc
     if value.endswith("\n"):
         value = value[:-1]
-    if (
-        not value
-        or value != value.strip()
-        or "\x00" in value
-        or "\n" in value
-        or "\r" in value
-    ):
+    if not value or value != value.strip() or "\x00" in value or "\n" in value or "\r" in value:
         raise ValueError(f"{kind} must contain one non-empty line without NUL")
     return value
 
@@ -288,9 +282,7 @@ def build_node_model_cache_agent_runtime(
         max_length=253,
     )
     dsn = _load_text_secret(config.postgres_dsn_file, kind="PostgreSQL DSN")
-    key_value = _load_json_model(
-        config.api_keys_file, NodeModelCacheAgentAPIKeys, kind="API key"
-    )
+    key_value = _load_json_model(config.api_keys_file, NodeModelCacheAgentAPIKeys, kind="API key")
     assert isinstance(key_value, NodeModelCacheAgentAPIKeys)
     trust_store = load_model_artifact_trust_store(config.trust_store_path)
     headers: dict[str, str] = {}
@@ -304,9 +296,7 @@ def build_node_model_cache_agent_runtime(
             raise ValueError("artifact bearer token must be ASCII")
         headers["Authorization"] = f"Bearer {token}"
     verify: bool | str = (
-        str(config.artifact_ca_bundle)
-        if config.artifact_ca_bundle is not None
-        else True
+        str(config.artifact_ca_bundle) if config.artifact_ca_bundle is not None else True
     )
     http_client = httpx.Client(
         headers=headers,
@@ -351,6 +341,12 @@ def build_node_model_cache_agent_runtime(
             index=index,
             store=store,
         )
+        live_evidence_source = LocalNodeModelCacheLiveEvidenceSource(
+            node_id=node_id,
+            store=store,
+            index=index,
+            hint_ttl_seconds=config.live_evidence_hint_ttl_seconds,
+        )
 
         def readiness_check() -> None:
             agent.check_ready()
@@ -364,6 +360,7 @@ def build_node_model_cache_agent_runtime(
             trust_store=trust_store,
             api_keys=key_value.api_keys,
             readiness_check=readiness_check,
+            live_evidence_source=live_evidence_source,
             request_body_limit_bytes=config.request_body_limit_bytes,
             active_request_limit=config.active_request_limit,
             total_request_limit=config.total_request_limit,

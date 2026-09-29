@@ -673,6 +673,32 @@ class NodeModelCacheIndex:
         except sqlite3.Error as exc:
             raise NodeModelCacheIndexError("cannot snapshot cache residency") from exc
 
+    def snapshot_record(self, manifest_digest: str) -> NodeModelCacheIndexSnapshot:
+        """Read the global revision and one exact record from one SQLite snapshot."""
+
+        digest = self._validate_digest(manifest_digest)
+        try:
+            with self._read_transaction() as connection:
+                revision_row = connection.execute(
+                    "SELECT revision FROM cache_index_revision WHERE singleton = 1"
+                ).fetchone()
+                if revision_row is None:
+                    raise NodeModelCacheIndexIdentityError(
+                        "cache index revision metadata is absent"
+                    )
+                row = connection.execute(
+                    "SELECT * FROM cache_entries WHERE manifest_digest = ?",
+                    (digest,),
+                ).fetchone()
+                records = () if row is None else (self._record_from_row(connection, row),)
+                return NodeModelCacheIndexSnapshot(
+                    node_id=self._node_id,
+                    revision=revision_row["revision"],
+                    records=records,
+                )
+        except sqlite3.Error as exc:
+            raise NodeModelCacheIndexError("cannot snapshot cache residency") from exc
+
     @contextlib.contextmanager
     def fenced_eviction(
         self,

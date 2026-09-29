@@ -276,22 +276,17 @@ class NodeModelPrestageStore(Protocol):
     def list_records(self) -> tuple[NodeModelPrestageRecord, ...]: ...
 
 
-class InMemoryNodeModelPrestageStore:
-    """Thread-safe executable specification for pre-stage store semantics."""
+def _copy_prestage_record(record: NodeModelPrestageRecord) -> NodeModelPrestageRecord:
+    return NodeModelPrestageRecord.model_validate(record.model_dump())
 
-    def __init__(self, *, node_id: str, max_placements: int = 100_000) -> None:
-        self._node_id = _text(node_id, name="node_id", max_length=253)
-        if type(max_placements) is not int or not 1 <= max_placements <= 100_000:
-            raise ValueError("max_placements must be an integer in [1, 100000]")
-        self._max_placements = max_placements
-        self._records: dict[str, NodeModelPrestageRecord] = {}
-        self._lock = threading.Lock()
 
-    @staticmethod
-    def _copy(record: NodeModelPrestageRecord) -> NodeModelPrestageRecord:
-        return NodeModelPrestageRecord.model_validate(record.model_dump())
+class _NodeModelPrestageTransitions:
+    """Pure state machine shared by volatile and durable store adapters."""
 
-    def _validate_command(
+    def __init__(self, *, node_id: str) -> None:
+        self.node_id = _text(node_id, name="node_id", max_length=253)
+
+    def validate_command(
         self,
         command: NodeModelPrestageCommand,
         *,
@@ -302,7 +297,7 @@ class InMemoryNodeModelPrestageStore:
             raise TypeError("command must be a NodeModelPrestageCommand")
         command = NodeModelPrestageCommand.model_validate(command.model_dump())
         now = _aware(now, name="now")
-        if command.node_id != self._node_id:
+        if command.node_id != self.node_id:
             raise NodeModelPrestageConflictError("command targets another node")
         if require_active and not command.issued_at <= now < command.expires_at:
             raise NodeModelPrestageExpiredError("pre-stage command is not currently valid")
@@ -349,148 +344,140 @@ class InMemoryNodeModelPrestageStore:
 
     def claim(
         self,
-        command: NodeModelPrestageCommand,
+        existing: NodeModelPrestageRecord | None,
         *,
+        record_count: int,
+        max_placements: int,
+        command: NodeModelPrestageCommand,
         claim_id: str,
         now: datetime,
     ) -> NodeModelPrestageRecord:
-        command = self._validate_command(command, now=now, require_active=False)
+        command = self.validate_command(command, now=now, require_active=False)
         if command.action != "ensure":
             raise NodeModelPrestageConflictError("release command cannot claim a cache fill")
         claim_id = _digest(claim_id, name="claim_id")
         now = _aware(now, name="now")
-        with self._lock:
-            existing = self._records.get(command.placement_id)
-            if existing is None:
-                if len(self._records) >= self._max_placements:
-                    raise NodeModelPrestageCapacityError(
-                        "pre-stage placement capacity is exhausted"
-                    )
-                attempt = 1
-            elif existing.command.command_id == command.command_id:
-                if not self._same_command(existing, command):
-                    raise NodeModelPrestageConflictError("command ID payload conflict")
-                if existing.state is ModelCachePlacementState.READY:
-                    return self._copy(existing)
-                if existing.state is ModelCachePlacementState.FILLING:
-                    if existing.claim_id != claim_id:
-                        raise NodeModelPrestageConflictError(
-                            "placement is claimed by another attempt"
-                        )
-                    return self._copy(existing)
-                if existing.state is ModelCachePlacementState.ABSENT:
-                    raise NodeModelPrestageConflictError("released command cannot be reactivated")
-                if not command.issued_at <= now < command.expires_at:
-                    raise NodeModelPrestageExpiredError("pre-stage command is not currently valid")
-                self._require_monotonic_time(existing, now=now)
-                attempt = existing.attempt + 1
-            else:
-                if not command.issued_at <= now < command.expires_at:
-                    raise NodeModelPrestageExpiredError("pre-stage command is not currently valid")
-                if existing.state is not ModelCachePlacementState.ABSENT:
+        if existing is None:
+            if record_count >= max_placements:
+                raise NodeModelPrestageCapacityError(
+                    "pre-stage placement capacity is exhausted"
+                )
+            attempt = 1
+        elif existing.command.command_id == command.command_id:
+            if not self._same_command(existing, command):
+                raise NodeModelPrestageConflictError("command ID payload conflict")
+            if existing.state is ModelCachePlacementState.READY:
+                return _copy_prestage_record(existing)
+            if existing.state is ModelCachePlacementState.FILLING:
+                if existing.claim_id != claim_id:
                     raise NodeModelPrestageConflictError(
-                        "replacement ensure requires a released absent placement"
+                        "placement is claimed by another attempt"
                     )
-                self._validate_successor(existing, command)
-                self._require_monotonic_time(existing, now=now)
-                attempt = 1
-            if existing is None and not command.issued_at <= now < command.expires_at:
+                return _copy_prestage_record(existing)
+            if existing.state is ModelCachePlacementState.ABSENT:
+                raise NodeModelPrestageConflictError("released command cannot be reactivated")
+            if not command.issued_at <= now < command.expires_at:
                 raise NodeModelPrestageExpiredError("pre-stage command is not currently valid")
-            record = NodeModelPrestageRecord(
-                command=command,
-                state=ModelCachePlacementState.FILLING,
-                attempt=attempt,
-                claim_id=claim_id,
-                updated_at=now,
-            )
-            self._records[command.placement_id] = record
-            return self._copy(record)
+            self._require_monotonic_time(existing, now=now)
+            attempt = existing.attempt + 1
+        else:
+            if not command.issued_at <= now < command.expires_at:
+                raise NodeModelPrestageExpiredError("pre-stage command is not currently valid")
+            if existing.state is not ModelCachePlacementState.ABSENT:
+                raise NodeModelPrestageConflictError(
+                    "replacement ensure requires a released absent placement"
+                )
+            self._validate_successor(existing, command)
+            self._require_monotonic_time(existing, now=now)
+            attempt = 1
+        if existing is None and not command.issued_at <= now < command.expires_at:
+            raise NodeModelPrestageExpiredError("pre-stage command is not currently valid")
+        return NodeModelPrestageRecord(
+            command=command,
+            state=ModelCachePlacementState.FILLING,
+            attempt=attempt,
+            claim_id=claim_id,
+            updated_at=now,
+        )
 
     def complete(
         self,
-        command: NodeModelPrestageCommand,
+        existing: NodeModelPrestageRecord | None,
         *,
+        command: NodeModelPrestageCommand,
         claim_id: str,
         fill_result: NodeModelCacheFillResult,
         now: datetime,
     ) -> NodeModelPrestageRecord:
-        command = self._validate_command(command, now=now, require_active=False)
+        command = self.validate_command(command, now=now, require_active=False)
         claim_id = _digest(claim_id, name="claim_id")
         if not isinstance(fill_result, NodeModelCacheFillResult):
             raise TypeError("fill_result must be a NodeModelCacheFillResult")
         fill_result = NodeModelCacheFillResult.model_validate(fill_result.model_dump())
         now = _aware(now, name="now")
-        with self._lock:
-            existing = self._require_claim(command, claim_id=claim_id)
-            self._require_monotonic_time(existing, now=now)
-            record = NodeModelPrestageRecord(
-                command=command,
-                state=ModelCachePlacementState.READY,
-                attempt=existing.attempt,
-                fill_result=fill_result,
-                updated_at=now,
-            )
-            self._records[command.placement_id] = record
-            return self._copy(record)
+        existing = self._require_claim(existing, command=command, claim_id=claim_id)
+        self._require_monotonic_time(existing, now=now)
+        return NodeModelPrestageRecord(
+            command=command,
+            state=ModelCachePlacementState.READY,
+            attempt=existing.attempt,
+            fill_result=fill_result,
+            updated_at=now,
+        )
 
     def fail(
         self,
-        command: NodeModelPrestageCommand,
+        existing: NodeModelPrestageRecord | None,
         *,
+        command: NodeModelPrestageCommand,
         claim_id: str,
         failure: str,
         now: datetime,
     ) -> NodeModelPrestageRecord:
-        command = self._validate_command(command, now=now, require_active=False)
+        command = self.validate_command(command, now=now, require_active=False)
         claim_id = _digest(claim_id, name="claim_id")
         failure = _text(failure, name="failure", max_length=1024)
         now = _aware(now, name="now")
-        with self._lock:
-            existing = self._require_claim(command, claim_id=claim_id)
-            self._require_monotonic_time(existing, now=now)
-            record = NodeModelPrestageRecord(
-                command=command,
-                state=ModelCachePlacementState.FAILED,
-                attempt=existing.attempt,
-                failure=failure,
-                updated_at=now,
-            )
-            self._records[command.placement_id] = record
-            return self._copy(record)
+        existing = self._require_claim(existing, command=command, claim_id=claim_id)
+        self._require_monotonic_time(existing, now=now)
+        return NodeModelPrestageRecord(
+            command=command,
+            state=ModelCachePlacementState.FAILED,
+            attempt=existing.attempt,
+            failure=failure,
+            updated_at=now,
+        )
 
     def release(
         self,
-        command: NodeModelPrestageCommand,
+        existing: NodeModelPrestageRecord | None,
         *,
+        command: NodeModelPrestageCommand,
         now: datetime,
     ) -> NodeModelPrestageRecord:
-        command = self._validate_command(command, now=now, require_active=True)
+        command = self.validate_command(command, now=now, require_active=True)
         if command.action != "release":
             raise NodeModelPrestageConflictError("owner pin release requires a release command")
         now = _aware(now, name="now")
-        with self._lock:
-            existing = self._records.get(command.placement_id)
-            if existing is None:
-                raise NodeModelPrestageConflictError("release has no accepted placement")
-            if existing.command.command_id == command.command_id:
-                if not self._same_command(existing, command):
-                    raise NodeModelPrestageConflictError("release command ID payload conflict")
-                if existing.state is not ModelCachePlacementState.ABSENT:
-                    raise NodeModelPrestageConflictError("release replay has inconsistent state")
-                return self._copy(existing)
-            if existing.state is ModelCachePlacementState.FILLING:
-                raise NodeModelPrestageConflictError("cannot release an active fill claim")
-            self._validate_successor(existing, command)
-            self._validate_release_identity(existing.command, command)
-            self._require_monotonic_time(existing, now=now)
-            record = NodeModelPrestageRecord(
-                command=command,
-                state=ModelCachePlacementState.ABSENT,
-                attempt=existing.attempt,
-                updated_at=now,
-            )
-            self._records[command.placement_id] = record
-            return self._copy(record)
+        if existing is None:
+            raise NodeModelPrestageConflictError("release has no accepted placement")
+        if existing.command.command_id == command.command_id:
+            if not self._same_command(existing, command):
+                raise NodeModelPrestageConflictError("release command ID payload conflict")
+            if existing.state is not ModelCachePlacementState.ABSENT:
+                raise NodeModelPrestageConflictError("release replay has inconsistent state")
+            return _copy_prestage_record(existing)
+        if existing.state is ModelCachePlacementState.FILLING:
+            raise NodeModelPrestageConflictError("cannot release an active fill claim")
+        self._validate_successor(existing, command)
+        self._validate_release_identity(existing.command, command)
+        self._require_monotonic_time(existing, now=now)
+        return NodeModelPrestageRecord(
+            command=command,
+            state=ModelCachePlacementState.ABSENT,
+            attempt=existing.attempt,
+            updated_at=now,
+        )
 
     @staticmethod
     def _validate_release_identity(
@@ -514,17 +501,13 @@ class InMemoryNodeModelPrestageStore:
         if any(getattr(previous, field) != getattr(release, field) for field in fields):
             raise NodeModelPrestageConflictError("release identity does not match pinned placement")
 
-    def list_records(self) -> tuple[NodeModelPrestageRecord, ...]:
-        with self._lock:
-            return tuple(self._copy(self._records[key]) for key in sorted(self._records))
-
     def _require_claim(
         self,
-        command: NodeModelPrestageCommand,
+        existing: NodeModelPrestageRecord | None,
         *,
+        command: NodeModelPrestageCommand,
         claim_id: str,
     ) -> NodeModelPrestageRecord:
-        existing = self._records.get(command.placement_id)
         if (
             existing is None
             or not self._same_command(existing, command)
@@ -533,6 +516,112 @@ class InMemoryNodeModelPrestageStore:
         ):
             raise NodeModelPrestageConflictError("pre-stage completion claim is stale")
         return existing
+
+
+class InMemoryNodeModelPrestageStore:
+    """Thread-safe executable specification for pre-stage store semantics."""
+
+    def __init__(self, *, node_id: str, max_placements: int = 100_000) -> None:
+        if type(max_placements) is not int or not 1 <= max_placements <= 100_000:
+            raise ValueError("max_placements must be an integer in [1, 100000]")
+        self._transitions = _NodeModelPrestageTransitions(node_id=node_id)
+        self._max_placements = max_placements
+        self._records: dict[str, NodeModelPrestageRecord] = {}
+        self._lock = threading.Lock()
+
+    def claim(
+        self,
+        command: NodeModelPrestageCommand,
+        *,
+        claim_id: str,
+        now: datetime,
+    ) -> NodeModelPrestageRecord:
+        command = self._transitions.validate_command(
+            command, now=now, require_active=False
+        )
+        placement_id = command.placement_id
+        with self._lock:
+            record = self._transitions.claim(
+                self._records.get(placement_id),
+                record_count=len(self._records),
+                max_placements=self._max_placements,
+                command=command,
+                claim_id=claim_id,
+                now=now,
+            )
+            self._records[placement_id] = record
+            return _copy_prestage_record(record)
+
+    def complete(
+        self,
+        command: NodeModelPrestageCommand,
+        *,
+        claim_id: str,
+        fill_result: NodeModelCacheFillResult,
+        now: datetime,
+    ) -> NodeModelPrestageRecord:
+        command = self._transitions.validate_command(
+            command, now=now, require_active=False
+        )
+        placement_id = command.placement_id
+        with self._lock:
+            record = self._transitions.complete(
+                self._records.get(placement_id),
+                command=command,
+                claim_id=claim_id,
+                fill_result=fill_result,
+                now=now,
+            )
+            self._records[placement_id] = record
+            return _copy_prestage_record(record)
+
+    def fail(
+        self,
+        command: NodeModelPrestageCommand,
+        *,
+        claim_id: str,
+        failure: str,
+        now: datetime,
+    ) -> NodeModelPrestageRecord:
+        command = self._transitions.validate_command(
+            command, now=now, require_active=False
+        )
+        placement_id = command.placement_id
+        with self._lock:
+            record = self._transitions.fail(
+                self._records.get(placement_id),
+                command=command,
+                claim_id=claim_id,
+                failure=failure,
+                now=now,
+            )
+            self._records[placement_id] = record
+            return _copy_prestage_record(record)
+
+    def release(
+        self,
+        command: NodeModelPrestageCommand,
+        *,
+        now: datetime,
+    ) -> NodeModelPrestageRecord:
+        command = self._transitions.validate_command(
+            command, now=now, require_active=True
+        )
+        placement_id = command.placement_id
+        with self._lock:
+            record = self._transitions.release(
+                self._records.get(placement_id),
+                command=command,
+                now=now,
+            )
+            self._records[placement_id] = record
+            return _copy_prestage_record(record)
+
+    def list_records(self) -> tuple[NodeModelPrestageRecord, ...]:
+        with self._lock:
+            return tuple(
+                _copy_prestage_record(self._records[key]) for key in sorted(self._records)
+            )
 
 
 class NodeModelPrestageExecutor:

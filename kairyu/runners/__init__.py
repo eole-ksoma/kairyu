@@ -240,6 +240,12 @@ from kairyu.runners.startup_binding_authority import (
 from kairyu.runners.startup_binding_authority_api import (
     create_runner_cache_placement_binding_authority_app,
 )
+from kairyu.runners.startup_binding_authority_runtime import (
+    RunnerCachePlacementBindingAuthorityRuntime,
+    RunnerCachePlacementBindingAuthorityRuntimeConfig,
+    build_runner_cache_placement_binding_authority_runtime,
+    load_runner_cache_placement_binding_authority_runtime_config,
+)
 from kairyu.runners.startup_scheduling import (
     RUNNER_CACHE_STARTUP_BINDING_ANNOTATION,
     RUNNER_CACHE_STARTUP_BINDING_ID_ANNOTATION,
@@ -351,6 +357,8 @@ __all__ = [
     "RunnerCachePlacementAdmissionRuntime",
     "RunnerCachePlacementAdmissionRuntimeConfig",
     "RunnerCachePlacementBindingAuthorityReadiness",
+    "RunnerCachePlacementBindingAuthorityRuntime",
+    "RunnerCachePlacementBindingAuthorityRuntimeConfig",
     "RunnerCachePlacementBindingAuthorizationDeniedError",
     "RunnerCachePlacementBindingAuthorizationError",
     "RunnerCachePlacementBindingAuthorizationRequest",
@@ -358,8 +366,10 @@ __all__ = [
     "RunnerCachePlacementBindingAuthorizer",
     "RunnerCachePlacementBindingLiveAuthority",
     "create_runner_cache_placement_binding_authority_app",
+    "build_runner_cache_placement_binding_authority_runtime",
     "build_runner_cache_placement_admission_runtime",
     "load_runner_cache_placement_admission_runtime_config",
+    "load_runner_cache_placement_binding_authority_runtime_config",
     "RUNNER_CACHE_STARTUP_BINDING_ANNOTATION",
     "RUNNER_CACHE_STARTUP_BINDING_ID_ANNOTATION",
     "RUNNER_CACHE_STARTUP_BINDING_LABEL",

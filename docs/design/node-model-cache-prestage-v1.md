@@ -15,9 +15,11 @@ claim store required by a replicated admission service. D3.7 adds the strict
 Kubernetes AdmissionReview v1 HTTP boundary and deterministic JSON Patch
 mutation. D3.8 adds the executable TLS webhook runtime, shared-store assembly,
 and authenticated nonce-bound binding reauthorization client. D3.9 adds the
-authenticated scaling-authority HTTP boundary that serves that client.
-Scheduling compaction, authority runtime assembly, and Kubernetes deployment
-wiring remain deployment tasks.
+authenticated scaling-authority HTTP boundary that serves that client. D3.10
+adds its embedded process-boundary assembly with strict configuration,
+file-backed credentials, TLS material validation, bounded budgets, and owned
+shutdown. Concrete live-authority integration, scheduling compaction, and
+Kubernetes deployment wiring remain deployment tasks.
 
 ## Purpose
 
@@ -490,6 +492,29 @@ cannot stop a worker thread that ignores the callback contract. The live
 callback remains responsible for leader, target revision, quota, prewarm,
 binding lifetime, and cache-freshness reauthorization.
 
+D3.10 assembles that endpoint at the scaling-controller process boundary. Its
+versioned, unknown-field-rejecting configuration carries only non-secret
+settings and absolute paths. The builder loads a bounded bearer-token file,
+validates bounded TLS certificate/private-key files, rejects overly broad
+token/key permissions, and applies independently bounded queue, request,
+backend, request-body, response-body, and concurrency budgets to the D3.9 app.
+The configuration declares the D3.8 client authorization timeout and reserves
+an explicit transport margin; validation requires authority queue wait plus
+authority request plus that margin to remain strictly below the client timeout.
+D3.8 separately requires that client timeout to remain below its overall
+admission deadline. Deployments must set the declared value equal to D3.8's
+actual `authorization_timeout_s`.
+
+The builder adopts the supplied resource closer after validating its arguments.
+It invokes the closer exactly once on any later assembly failure, or registers
+it as an idempotent application-shutdown hook after success. It returns the app
+together with the validated listen/TLS configuration. The hosting
+scaling controller must run that app with the returned TLS/listen settings and
+provide deadline-aware reauthorization/readiness callbacks backed by its own
+live leader, target, quota, prewarm, and binding state. This deliberately does
+not dynamically import callbacks or create a standalone placeholder authority:
+the process that owns the live scaling state also owns service startup.
+
 ## Deployment boundary
 
 `private-ai-cloud-iac` must still provide:
@@ -501,8 +526,9 @@ binding lifetime, and cache-freshness reauthorization.
 - reconciliation that replays desired ensure/release commands after restart;
 - a scheduled caller for the implemented bounded compaction contract, with a
   documented retirement cutoff and monitoring of per-placement high-water rows;
-- runtime assembly and deployment for the implemented scaling-authority
-  reauthorization/readiness endpoint consumed by D3.8, plus a highly available
+- live scaling-controller callback integration and deployment for the assembled
+  scaling-authority reauthorization/readiness endpoint consumed by D3.8, plus a
+  highly available
   Deployment/Service/MutatingWebhookConfiguration, TLS
   certificate issuance/rotation and trust, ingress restriction, orchestration
   that registers the plan before the D3.2 scale write, and fail-closed webhook

@@ -10,8 +10,9 @@ to a scale-from-zero workload Pod template and replica count. D3.3 requires an
 exact Runner-side startup proof before readiness. D3.4 adds the library-side
 CREATE admission and linearizable claim contract for incremental per-Pod
 placement. D3.5 adds bounded-batch released-placement compaction into durable
-per-placement fencing high-water marks. Scheduling that compaction and production
-webhook wiring remain deployment tasks.
+per-placement fencing high-water marks. D3.6 adds the shared PostgreSQL plan and
+claim store required by a replicated admission service. Scheduling compaction and
+production AdmissionReview/webhook wiring remain deployment tasks.
 
 ## Purpose
 
@@ -378,6 +379,32 @@ window must exceed the admission request/response timeout. Thus old placement
 nodes stay reserved until no prior allowed response can plausibly persist; an
 unclaimed plan may rotate immediately after binding expiry.
 
+`PostgresRunnerCachePlacementAdmissionStore` is the D3.6 shared implementation.
+One registry row fixes the store ID, schema version, target capacity, and replay
+safety window. Every register, claim, replay-protection, and rollback mutation
+locks that row with `FOR UPDATE`, so webhook replicas serialize placement
+allocation before a unique `(store, target, placement)` database constraint is
+reached. Plans and claims retain their full canonical JSON beside projected
+identity/time columns. A canonical full-plan SHA-256 also covers release,
+namespace, owner, and creator authorization that is not individually projected;
+any disagreement fails closed on read. A claim replay
+atomically makes the claim rollback-protected before returning the original
+allocation, so a concurrently failing creator request cannot free a placement
+already observed by another API-server retry.
+
+Plan replacement preserves the in-memory replay boundary: an unclaimed plan can
+rotate at binding expiry, while a claimed plan retains every node through
+`valid_until + replay_safety_window`. Replacement deletes the old binding's
+claims only after that boundary. The PostgreSQL authoritative clock must cross
+that boundary and must independently see a binding as live for registration and
+claim; future caller timestamps cannot rotate a plan early and backdated request
+timestamps cannot claim an expired binding. Store capacity and replay configuration are
+durably fixed, validate-only startup is supported for explicit schema
+provisioning, and schema/table/constraint plus JSON-projection checks reject a
+replaced or corrupted PostgreSQL namespace. The initial implementation uses one
+coarse lock per admission store, prioritizing cross-replica correctness over
+parallel target throughput.
+
 ## Deployment boundary
 
 `private-ai-cloud-iac` must still provide:
@@ -389,9 +416,9 @@ unclaimed plan may rotate immediately after binding expiry.
 - reconciliation that replays desired ensure/release commands after restart;
 - a scheduled caller for the implemented bounded compaction contract, with a
   documented retirement cutoff and monitoring of per-placement high-water rows;
-- a highly available mutating admission webhook, shared linearizable D3.4 plan
-  and claim store, orchestration that registers the plan before the D3.2 scale
-  write, and fail-closed webhook policy;
+- a highly available mutating admission webhook using the implemented shared
+  D3.6 store, orchestration that registers the plan before the D3.2 scale write,
+  and fail-closed webhook policy;
 - metrics and audit export for command latency, bytes, attempts, failures, and
   pin reconciliation; and
 - live node-pool acceptance with real S3, NVMe, Kueue, and Runner startup.
@@ -418,3 +445,7 @@ Scheduling tests cover affinity preservation, exact replay/rebinding, malformed
 managed state, decision and model mismatch, scale-from-zero-only enforcement,
 binding expiry, atomic template/replica CAS, response tampering, and retry-time
 template integrity.
+Real PostgreSQL admission tests cover cross-instance plan visibility, concurrent
+unique claims, same-name retry protection, safe creator rollback, target
+capacity, replay-window plan rotation, fixed configuration, validate-only
+startup, and plan/claim projection corruption.

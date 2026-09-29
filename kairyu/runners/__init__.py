@@ -97,6 +97,9 @@ from kairyu.runners.observation import (
 from kairyu.runners.postgres_leadership import PostgresRunnerLeaderLeaseStore
 from kairyu.runners.postgres_prestage import PostgresNodeModelPrestageStore
 from kairyu.runners.postgres_scaling_log import PostgresScalingDecisionLog
+from kairyu.runners.postgres_startup_admission import (
+    PostgresRunnerCachePlacementAdmissionStore,
+)
 from kairyu.runners.prestage import (
     InMemoryNodeModelPrestageStore,
     NodeModelPrestageCapacityError,
@@ -226,6 +229,7 @@ __all__ = [
     "OPTIONAL_RUNNER_STARTUP_PHASES",
     "PostgresRunnerLeaderLeaseStore",
     "PostgresNodeModelPrestageStore",
+    "PostgresRunnerCachePlacementAdmissionStore",
     "PostgresScalingDecisionLog",
     "InvalidRunnerStartupReportError",
     "InvalidRunnerTransitionError",

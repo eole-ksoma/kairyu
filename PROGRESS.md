@@ -147,8 +147,10 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
   rewriting the shared workload template. D3.5 adds bounded-batch compaction of
   released placement rows into durable generation, leader-fence, target-revision,
   and release-identity high-water marks without consuming active placement
-  capacity. Production webhook/shared claim-store wiring, scheduled compaction,
-  and live environment acceptance remain.
+  capacity. D3.6 adds a shared PostgreSQL admission plan/claim store with
+  cross-replica linearizable allocation, retry-safe rollback protection, and
+  replay-window plan rotation. Production AdmissionReview/webhook wiring,
+  scheduled compaction, and live environment acceptance remain.
 - Qwen3.8-Flash-Next MTP speculative decoding stays off in `qwen3.8-flash-next-dp2-8gpu` until upstream fixes vllm#53912 (prefix caching + MTP output corruption on hybrid GDN); single-stream decode 104 vs 175 tok/s
 - DTO-D15 (2026-08-26) changed the served tiered-example config: verify.sh coding/generic gates and the digest re-pin are pending before the example status can be claimed green again
 - Human sign-off pending on M2–M4 design reviews
@@ -157,6 +159,19 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
+
+### 2026-09-29 — [progress] Shared incremental placement admission state
+- What: added a strict PostgreSQL plan/claim store for D3.4 with cross-replica
+  serialization, unique placement constraints, same-name replay protection,
+  bounded target capacity, durable replay-window configuration, validate-only
+  startup, authoritative database-clock expiry/safety gates, and canonical
+  full-plan JSON corruption checks.
+- Why: a highly available admission webhook must not allocate one cache
+  placement to two Pods or let a failed creator request undo a claim already
+  observed by an API-server retry.
+- Refs: docs/design/node-model-cache-prestage-v1.md;
+  kairyu/runners/postgres_startup_admission.py;
+  tests/unit/test_postgres_runner_startup_admission.py
 
 ### 2026-09-29 — [progress] Safe pre-stage fencing-tombstone compaction
 - What: added a minimal per-placement high-water contract, bounded/cutoff-driven

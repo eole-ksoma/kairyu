@@ -189,6 +189,13 @@ from kairyu.runners.startup_binding import (
     RunnerCacheStartupPlacement,
     build_runner_cache_startup_binding,
 )
+from kairyu.runners.startup_scheduling import (
+    RUNNER_CACHE_STARTUP_BINDING_ANNOTATION,
+    RUNNER_CACHE_STARTUP_BINDING_ID_ANNOTATION,
+    RUNNER_CACHE_STARTUP_BINDING_LABEL,
+    RunnerCacheSchedulingError,
+    bind_runner_cache_to_pod_template,
+)
 
 __all__ = [
     "RUNNER_STARTUP_PHASES",
@@ -264,6 +271,10 @@ __all__ = [
     "RunnerCacheStartupBinding",
     "RunnerCacheStartupBindingError",
     "RunnerCacheStartupPlacement",
+    "RUNNER_CACHE_STARTUP_BINDING_ANNOTATION",
+    "RUNNER_CACHE_STARTUP_BINDING_ID_ANNOTATION",
+    "RUNNER_CACHE_STARTUP_BINDING_LABEL",
+    "RunnerCacheSchedulingError",
     "RunnerDispatchFence",
     "RunnerDrainActivityObservation",
     "RunnerDrainController",
@@ -296,6 +307,7 @@ __all__ = [
     "build_node_model_prestage_release_command",
     "build_runner_cache_startup_binding",
     "build_runner_start_prestage_commands",
+    "bind_runner_cache_to_pod_template",
     "create_node_model_cache_agent_app",
     "build_node_model_cache_agent_runtime",
     "KueueScalingAdmission",

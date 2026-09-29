@@ -134,9 +134,12 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
   durable status without accepting trust roots over the wire. D3.1 adds
   deployment-owned pin commands for ready cache hits and a hash-bound Runner
   startup binding that joins the scaling decision, scheduler node, exact
-  artifact, completed pin, and later fresh/pinned residency hint. Kubernetes
-  Pod-template mutation/startup attestation, safe fencing-tombstone compaction,
-  and live environment acceptance remain.
+  artifact, completed pin, and later fresh/pinned residency hint. D3.2 CASes a
+  live binding and the scale-from-zero replica update into one workload write,
+  carrying the full evidence into the Pod template with required node affinity
+  and binding-scoped node anti-affinity. Incremental per-Pod placement, startup
+  attestation, safe fencing-tombstone compaction, and live environment
+  acceptance remain.
 - Qwen3.8-Flash-Next MTP speculative decoding stays off in `qwen3.8-flash-next-dp2-8gpu` until upstream fixes vllm#53912 (prefix caching + MTP output corruption on hybrid GDN); single-stream decode 104 vs 175 tok/s
 - DTO-D15 (2026-08-26) changed the served tiered-example config: verify.sh coding/generic gates and the digest re-pin are pending before the example status can be claimed green again
 - Human sign-off pending on M2–M4 design reviews
@@ -145,6 +148,17 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
+
+### 2026-09-29 — [progress] Atomic cache-bound cold-start scheduling
+- What: added an idempotent Pod-template binding, exact node affinity,
+  binding-scoped node anti-affinity, and a single Kubernetes CAS that commits
+  the template evidence with the scale-from-zero replica update.
+- Why: new Pods must not appear before the scheduler constraint and full
+  decision/pin/hint evidence are visible, while a shared-template update with
+  existing replicas must not trigger an unsafe rollout.
+- Refs: docs/design/node-model-cache-prestage-v1.md;
+  kairyu/runners/{startup_scheduling,scale_actuator}.py;
+  tests/unit/test_runner_{startup_scheduling,cache_scheduling_actuator}.py
 
 ### 2026-09-29 — [progress] Runner cache startup binding
 - What: added fenced pin commands for cache-ready placements and a canonical

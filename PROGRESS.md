@@ -159,9 +159,11 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
   response bytes plus secret-file permissions are bounded before use. D3.9 adds
   the authenticated, strict, size/concurrency-bounded scaling-authority HTTP
   boundary with nonce echo, exact-binding authorization, sanitized fail-closed
-  errors, and protected empty-body readiness. Authority runtime assembly,
-  Kubernetes TLS and admission resources, scheduled compaction, and live
-  environment acceptance remain.
+  errors, and protected empty-body readiness. D3.10 adds embedded authority
+  runtime assembly with strict bounded config, file-backed bearer/TLS material,
+  explicit timeout/concurrency budgets, and idempotent caller-resource shutdown.
+  Live scaling-controller callback integration, Kubernetes TLS and admission
+  resources, scheduled compaction, and live environment acceptance remain.
 - Qwen3.8-Flash-Next MTP speculative decoding stays off in `qwen3.8-flash-next-dp2-8gpu` until upstream fixes vllm#53912 (prefix caching + MTP output corruption on hybrid GDN); single-stream decode 104 vs 175 tok/s
 - DTO-D15 (2026-08-26) changed the served tiered-example config: verify.sh coding/generic gates and the digest re-pin are pending before the example status can be claimed green again
 - Human sign-off pending on M2–M4 design reviews
@@ -170,6 +172,18 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
+
+### 2026-09-30 — [progress] Placement-binding authority runtime assembly
+- What: added the embedded D3.10 authority runtime with a strict versioned
+  config, bounded regular-file loading for bearer and TLS material, secret-file
+  permission checks, cross-service timeout headroom, app assembly, failed-build
+  cleanup, and idempotent shutdown of adopted live-authority resources.
+- Why: the D3.9 protocol boundary needs a fail-closed process assembly contract
+  without inventing a second source of scaling truth or dynamically importing
+  privileged callbacks.
+- Refs: docs/design/node-model-cache-prestage-v1.md;
+  kairyu/runners/startup_binding_authority_runtime.py;
+  tests/unit/test_runner_startup_binding_authority_runtime.py
 
 ### 2026-09-29 — [progress] Live placement-binding authority API
 - What: added the authenticated D3.9 scaling-authority HTTP boundary with strict

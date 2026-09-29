@@ -11,6 +11,105 @@ header (above the existing entries), keeping their original order.
 
 <!-- ARCHIVE-INSERT-POINT: new trimmed entries go directly below this line -->
 
+### 2026-09-29 — [progress] Safe pre-stage fencing-tombstone compaction
+- What: added a minimal per-placement high-water contract, bounded/cutoff-driven
+  in-memory and PostgreSQL compaction, schema-v1-to-v2 migration, exact release
+  replay, active-capacity reclamation, and successor validation against retained
+  generation, election/holder fence, target revision, and release identity.
+- Why: released full command rows must stop exhausting the bounded active ledger
+  without allowing an expired or stale controller lineage to re-enter as new.
+- Refs: docs/design/node-model-cache-prestage-v1.md;
+  kairyu/runners/{prestage,postgres_prestage}.py;
+  tests/unit/test_{runner_prestage,postgres_node_model_prestage}.py
+
+### 2026-09-29 — [progress] Incremental cache-bound Pod placement
+- What: added a gated Pod CREATE admission controller, canonical per-Pod
+  placement claims, workload/creator authorization, replay-safe claim rollback
+  and cross-generation node reservations, exact node-affinity injection, end-to-end selected-placement
+  attestation, strict binding replay, and a thread-safe executable store contract
+  for production shared-store wiring.
+- Why: increasing replicas on a live workload must assign every new Pod to one
+  unique ready cache placement without changing its shared template and rolling
+  existing Pods.
+- Refs: docs/design/node-model-cache-prestage-v1.md;
+  kairyu/runners/{startup_admission,startup_scheduling,startup_metadata}.py;
+  tests/unit/test_runner_startup_admission.py
+
+### 2026-09-29 — [progress] Atomic cache-bound cold-start scheduling
+- What: added an idempotent Pod-template binding, exact node affinity,
+  binding-scoped node anti-affinity, and a single Kubernetes CAS that commits
+  the template evidence with the scale-from-zero replica update.
+- Why: new Pods must not appear before the scheduler constraint and full
+  decision/pin/hint evidence are visible, while a shared-template update with
+  existing replicas must not trigger an unsafe rollout.
+- Refs: docs/design/node-model-cache-prestage-v1.md;
+  kairyu/runners/{startup_scheduling,scale_actuator}.py;
+  tests/unit/test_runner_{startup_scheduling,cache_scheduling_actuator}.py
+
+### 2026-09-29 — [progress] Runner cache startup binding
+- What: added fenced pin commands for cache-ready placements and a canonical
+  startup binding that requires exact decision/node/artifact identity, completed
+  deployment-owned pins, and later fresh pinned residency evidence.
+- Why: a `READY` hint alone must not let Kubernetes start a Runner on another
+  node or after its artifact retention proof has disappeared.
+- Refs: docs/design/node-model-cache-prestage-v1.md;
+  kairyu/runners/{prestage,startup_binding}.py;
+  tests/unit/test_runner_startup_binding.py
+
+### 2026-09-29 — [progress] Authenticated model cache-agent API
+- What: added API-key-protected, node-bound ensure/release/status endpoints with
+  local-only artifact trust roots, bounded request/concurrency admission,
+  readiness checks, and sanitized failure responses.
+- Refs: docs/design/node-model-cache-prestage-v1.md;
+  kairyu/runners/cache_agent_api.py;
+  tests/unit/test_node_model_cache_agent_api.py
+
+### 2026-09-29 — [progress] Executable model cache-agent runtime
+- What: added a fail-closed `cache-agent serve` process assembly with file-based
+  identity/credentials, explicit NVMe state/index binding, durable store
+  validation, resource cleanup, and strict versioned JSON configuration.
+- Refs: kairyu/runners/cache_agent_runtime.py; kairyu/entrypoints/cli.py;
+  tests/unit/test_node_model_cache_agent_runtime.py
+
+### 2026-09-29 — [progress] Durable node pre-stage placement store
+- What: added a node-scoped PostgreSQL store with shared capacity locking,
+  exact replay, fenced CAS transitions, strict schema/configuration checks,
+  and real cross-instance database tests.
+- Refs: docs/design/node-model-cache-prestage-v1.md;
+  kairyu/runners/postgres_prestage.py;
+  tests/unit/test_postgres_node_model_prestage.py
+
+### 2026-09-28 — [progress] Fenced model pre-staging
+- What: added exact controller commands, node claim/CAS, verified fill/pin,
+  fresh fenced release, retry, and monotonic placement-state projection.
+- Refs: docs/design/node-model-cache-prestage-v1.md; kairyu/runners/prestage.py;
+  tests/unit/test_runner_prestage.py
+
+### 2026-09-28 — [progress] Fail-closed model-cache corruption recovery
+- What: added full-digest startup verification, atomic quarantine, mandatory audit, verified refill, and generation-fenced retry.
+- Why: same-size bit rot and incomplete audit evidence must block Runner startup.
+- Refs: docs/design/node-model-cache-corruption-recovery-v1.md; kairyu/artifacts/node_cache.py; tests/unit/test_node_model_cache.py
+
+### 2026-09-28 — [progress] Fenced node model-cache eviction
+- What: added high/low watermarks, unpinned LRU, revision/generation fences, digest locks, atomic detach, and crash recovery.
+- Why: NVMe pressure must never remove active, rollback, or manually pinned artifacts.
+- Refs: docs/design/node-model-cache-eviction-v1.md; kairyu/artifacts/eviction.py; tests/unit/test_node_model_cache_eviction.py
+
+### 2026-09-28 — [progress] Verified model-cache placement hints
+- What: added monotonic node-index snapshots, verified-only TTL publications,
+  and an exact digest/revision join into WP3.6 cache-aware placement inputs.
+- Why: locality may improve startup only as a bounded hint below health/quota gates.
+- Refs: docs/design/node-model-cache-placement-hints-v1.md; kairyu/artifacts/placement_hint.py; tests/unit/test_node_model_cache_placement_hint.py
+
+### 2026-09-26 — [progress] Durable node model-cache index
+- What: added a node-bound WAL/FULL SQLite residency index, immutable digest
+  identity checks, monotonic access records, generations, and composable
+  owner-scoped pins; successful WP4.2 fill/hit paths now update it.
+- Why: placement and eviction need durable node/model/bytes/verified/access/pin
+  evidence without treating mutable filesystem paths as authority.
+- Refs: docs/design/node-model-cache-index-v1.md;
+  kairyu/artifacts/cache_index.py; tests/unit/test_node_model_cache_index.py
+
 ### 2026-09-26 — [progress] Verified node-local model cache fill
 - What: added digest-scoped file locking, HTTP Range/local blob sources,
   resumable staging, strict size/SHA-256 verification, durable completion

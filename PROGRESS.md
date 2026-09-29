@@ -50,123 +50,45 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 
 ### Formal gates
 
-- G2 A1: complete — TP1/2 logprob-agreement closure on Llama-3.1-8B
-- G2 A2: complete — TP2/4/8 closure on Llama-3.3-70B FP8-dynamic
-- G2 A6 (perf vs vLLM): **open** — TP4 ShareGPT 0.466× SLO-goodput HTTP; matrix deferred while gap closes
-- G2 A7: closed — >80% KV cache-hit rates on Qwen3-32B TP4/TP8, direct and gateway
-- G2 A8 (DP scaling): `passed: false` (1.7993× vs 1.9× threshold); owner accepted as explicit closure deviation
-- G2 A9: closed — DP=2×TP4 vs TP8 production-topology report on Qwen3-32B
-- A12 (batch-invariance determinism, #360): closed — exact-match verdict passed on Qwen3-32B TP8
-- #356 real-checkpoint quant parity: evidence complete — INT8 PASS; AWQ/GPTQ formal FAIL retained with SHA-bound same-GPU oracle replay isolating checkpoint quantization loss
-- B7 (KV answer-equivalence, #373): operator implemented and portable-validated; additive over F2/F4
-- G4 MoE: M-A1 formal FAIL retained; M-A2 complete; M-A3 scope-closed by owner deviation (perf gate stays FAIL); dense BF16 MoE uses sort-by-expert grouped GEMM and fixed-capacity EP transport, then combines returned rows in fixed FP32 order before one model-dtype cast
-- G4 E-KV: unit-scale and calibrated per-layer K/V FP8-E4M3 re-bakes **FAIL** retained; calibrated cache metrics/logprobs pass but 16K/32K exact tokens and decode envelope do not; `fp8_e4m3` startup rejected
-- G5: F1a–F1d, F2a–F2d, F4a, F4b all closed; F4c decided (keep per-replica RadixKV + F2 routing, thresholded revisit)
-- F5a/b/c (priority, noisy-neighbor, SLO admission): closed
-- G6: P-A, P-B1–P-B4, P-C2/C3/C4 green (incl. Open WebUI P-B3 browser gate); remaining P-C gates continue
-- #150 TP8 long-generation stability gate: passed after deadlock fix; #364 `logits_dtype`: valid negative, withdrawn
+- G2 A1/A2/A7/A9 and A12 are closed; A8 is an accepted deviation; A6 remains
+  open at 0.466× vLLM SLO-goodput.
+- Quant evidence is retained: INT8 passes; AWQ/GPTQ quality and FP8-E4M3 KV
+  exact-output/decode gates fail closed.
+- G4 M-A2 is complete; M-A1 remains a retained failure and M-A3 an accepted
+  scope deviation. G5 F1/F2/F4a/F4b and F5a/b/c are closed.
+- G6 P-A, P-B1–P-B4, and P-C2/C3/C4 are green; remaining P-C gates continue.
+- TP8 long-generation stability passed after the deadlock fix.
 
 ### What works today
 
-- `kairyu serve --tp N` on real hardware: Qwen3-32B TP8, Llama-3.1-8B, Llama-3.3-70B FP8, Qwen3-VL-32B (via vLLM replica)
-- Attention backends: `auto`/torch/FlashInfer/FA3/FA4 with `/backends` reporting; capable CUDA models pre-capture decode graphs before readiness
-- Quantized serving: FP8/INT8/AWQ/GPTQ/NVFP4 without full dequantization; opt-in FP8 EAGLE/MTP draft loading
-- Incremental architecture-state paths for Qwen3.6 and DeepSeek V4 plus an explicit recompute diagnostic mode; DeepSeek EP2/4/8 Attention-DP and direct packed-FP4 execution are implemented, with SM120 single-kernel and two-rank NCCL smokes green
-- Device-side sampling, penalties, spec verification, page-table caching; TP step headers sleep on Gloo while fixed-layout delta payloads use the bounded NCCL model group and rare controls remain Gloo objects; structured masks stay on CUDA with only selected IDs returned to the host matcher; deterministic n-gram/EAGLE-3/MTP drafts preserve T>0 and penalized sampling
-- Hardened gateway: auth, tenancy metering/invoicing, priority + SLO admission, batch API, embeddings/RAG, Responses API
-- Orchestration (Conductor/MoA) with streaming, usage accounting, trace v2; assistant history round-trips typed `reasoning_content` while assistant-only LiteLLM provider objects and nullable legacy function calls are ignored before rendering and other extras remain fail-closed; MoA keeps the original response contract distinct from untrusted candidate drafts, with configured completion delimiters and the multi-stage boundary withholding private synthesis reasoning; prefix-aware replica placement obeys the configured queue-depth overload valve; Codex CLI and IDE tool-calling work end-to-end, including AUTO models over /v1/responses (#530)
-- Fleet: 3-gateway HA with PostgreSQL BatchStore, KV-aware prefix routing, DRAM KV tiering; Helm supports immutable images, split-role labels, safe rollout/drain, hardened Pods, and ServiceMonitor plus the kind CI drill
-- Checkout-only eval tooling retains explicit Core, Quantization, Structured Output, and Long Context suites with hash-chained quality history, config A/B comparisons, and quantization sweeps; Kairyu correctness and performance gates are owned by `verification/`, not evals
-- The tiered RTX PRO example (DTO-D13, 2026-08-22) puts a bounded Qwen non-thinking route judge in front of five profiles — four single-call direct routes (Qwen non-thinking, Qwen thinking-medium, DeepSeek non-thinking on the re-added `tier2-direct` pool, DeepSeek thinking at the L3 effort; official per-mode sampling fixed on the final unit, vendor-official caps 131072/393216) and the ensemble — selecting per request with fallback to the ensemble; the L2 DSL now has N named `profiles` + a judge with spec-defined `choices`, final-unit sampling overrides (caps min()'d with the caller), and route-aware serving gates. The ensemble (`primary`) profile is the dual-track policy-ensemble L2 DAG (DTO-D1..D12, amended by DTO-D14) over four Qwen3.8 TP1 vLLM workers (no MTP pending c16/c32 evidence) + the measured DeepSeek TP4/EP4 DSpark worker: a Qwen head streams the public opening from t=0 (semantic-TTFT gate ≤2× DeepSeek-direct, inherited); one thinking DeepSeek call writes 4 maximally different policies fanned out to 4 policy-bound Qwen answers in parallel while thinking DeepSeek critically refines a quick Qwen draft; thinking DeepSeek `synthesis` weighs the 5 candidates as peers and writes one better answer, and an inline Qwen thinking-medium (DTO-D14) `audit` (PASS/FAIL, ≤2 refinements, last attempt published on exhaustion) gates the streamed remainder (DTO-D10); a Qwen `image_description` stage runs on image requests only and feeds the text-only DeepSeek roles (DTO-D11); DeepSeek budgets halved to 8192/32768/65536 with a 65536 ceiling and Chat UI default for the Terminal-Bench 900 s turn envelope (DTO-D12). The sandbox executor stays deployed but unreferenced. Last green verify.sh runs 20260825T161729Z (coding) and 20260825T173343Z (generic) on the DTO-D8..D14 served config: coding TTFT rows all not_applicable (the judge routes every coding request to the ungated qwen_think_medium route), generic route-aware stage validation green. Composed L1 workers remain vLLM-backed until the native full-checkpoint gate closes
-- Replica-pool scale-out examples (FN-D9, 2026-09-01): Qwen3.8 TP1 x 8 and DeepSeek TP4+EP4 x 2 behind one public model each; `verify.sh serving` proves the even per-replica split from the pool placement log and `verify.sh tool-calling` proves OpenAI tool calls on every replica (see their MEASUREMENTS.md); two vision replica examples (FN-D9 amendment 2026-09-04: DeepSeek-V4-Flash-Vision-Exp TP4+EP4 x 2, Qwen3.8-Flash-Next-FP8 TP4 x 2 on a shared upstream-main SM120 overlay image, Chat UI reasoning-effort dropdown, `verify.sh vision`) are GPU-verified (2026-09-04: pins locked, serving/tool-calling/vision gates PASS, MEASUREMENTS.md written); the Qwen example serves without the recipe's MTP k=3 because prefix caching + MTP corrupts batched output on this vLLM revision (vllm#53912)
-- DeepSeek V4.1 Flash single-replica example (FN-D9 amendment, 2026-09-11) is GPU-verified on TP8/EP8 SM120 with the V4 ReplicaPool/API/UI structure and official thinking-high default; bounded L1 comparisons select DSpark 5, 16K batching and NCCL. The 320-request matrix, reasoning/tool/vision/cancellation, normal restart and retrieval through 1,039,909 prompt tokens pass; exact evidence and limitations are in its `MEASUREMENTS.md`.
-- Process-split backend (`kairyu-proc`) with delta wire, TP group attestation, graceful lifecycle
-- CPU suite green (thousands of tests, no selected skips); CPU microbenchmark smoke + nightly regression series in CI
+- Native and vLLM-backed serving cover the accepted dense, vision, Qwen3.8, and
+  DeepSeek V4/V4.1 profiles; exact hardware evidence is indexed under `bench/results/`.
+- Engine paths include TP/DP/EP, device sampling, speculative decoding, CUDA
+  graphs, structured masks, production quant dispatch, and process-split transport.
+- The gateway provides auth, tenancy/metering, priority/SLO admission, batch,
+  embeddings/RAG, Responses, tool calling, and trace-v2 accounting.
+- Fleet support includes 3-gateway HA, PostgreSQL stores, prefix routing, DRAM KV
+  tiering, immutable Helm deployments, safe rollout/drain, and monitoring.
+- Tiered orchestration and replica-pool examples are GPU-verified; their exact
+  policy, measurements, limitations, and run IDs remain in example documentation.
+- The CPU suite, microbenchmark smoke, and nightly regression series are green.
 
 ### Open items / blockers
 
-- G2 A6 performance gap vs vLLM is the open hard gate; full TP4/8 HTTP matrix deferred until closed
-- Issue #333 verdict: process-split is not the A6 cause (`no_material_reduction`, ratio 0.92 vs ≤0.90 line)
-- Issue #318 verdict: depth beyond the two-step admission horizon is not an A6 fix (`no_measured_benefit_depth_gt_2`)
-- Production stage-sharded pipeline parallelism is a separate roadmap dependency (current PP report is not it)
-- Learned-draft real-checkpoint acceptance/performance evidence remains open; FP8-E4M3 KV remains disabled after its calibrated re-bake failed exact-output and decode-envelope checks
-- Frontier full-checkpoint 262K/1M correctness/performance evidence, DeepSeek EP4/EP8 topology lock, CUDA Graph pointer stability, MTP/DSpark selection, 30-minute soak, and failure recovery remain open
-- NVLink-profile gates blocked on H100/A100-class hardware; PCIe-switch chassis and ≥400 Gb/s RDMA NICs gate E4/E5
-- G6 remaining P-C gates still in progress
-- AsyncRequest v1 has a PostgreSQL-backed non-streaming Chat API, tenant-scoped
-  state/result/cancel routes, a lease-fenced worker, shared queue telemetry,
-  bounded request/audit retention, and multi-gateway CPU evidence. The current
-  retention-expanded Kind rerun remains pending on Docker registry access.
-- Runner State v1 includes Kubernetes observation/reconciliation, fenced
-  drain/termination, failure-domain backoff/quarantine, and a lease-fenced
-  single-writer gate with a PostgreSQL shared lease backend. WP3.1 adds bounded,
-  model-class scaling policy schemas. WP3.2 adds source-timestamped observation
-  windows and an append-only PostgreSQL decision log with stale-input safety.
-  WP3.3 adds idempotent Deployment/StatefulSet scale-subresource actuation with
-  resourceVersion conflict detection. WP3.4 adds claim-before-observe leader-token
-  fencing, durable per-model decision generations, full decision fingerprints,
-  and parent-workload JSON Patch CAS. WP3.5 adds fail-closed Kueue admission
-  parsing, Kueue-owned atomic GPU reservations projected across nested
-  cluster/model-family/tenant-model budgets, and final freshness reauthorization
-  durably bound to one scale target in scale-up decisions. WP3.6 adds
-  cache-aware staged scale-out: durable placement-level cache intent/Runner-start
-  plans, Kueue ResourceFlavor and deployment placement binding, and final cache
-  freshness plus quota/prewarm consistency reauthorization. WP3.7 adds exact
-  drain-authorized StatefulSet scale-down with final freshness/revision checks;
-  Deployment scale-down fails closed because its victim choice is not exact.
-  Unfenced scale writes and quota/cache/drain revision rollbacks are rejected by
-  default. Deployment wiring, durable Runner status, runtime instrumentation,
-  and live environment acceptance remain open.
-- Model artifact manifest v1 binds immutable upstream, tokenizer, license, blob
-  tree, hardware/resource, environment, and signer metadata into a canonical
-  digest. Ed25519 trust verification and file-backed GitOps deployment-intent
-  admission are available offline. WP4.2 adds digest-locked, resumable blob
-  transfer into a private staging tree, per-blob SHA-256 verification, and
-  atomic node-cache publication. WP4.3 adds a node-bound durable SQLite index
-  for model revision, bytes, verification/access time, generation, and
-  owner-scoped pins. WP4.4 adds bounded verified placement hints and exact WP3.6
-  controller joins without overriding health/quota gates. WP4.5 adds watermarked,
-  generation/pin-fenced LRU eviction. WP4.6 adds full-digest Runner-start
-  verification and fail-closed recovery. WP4.7 adds fenced pre-stage commands,
-  claim/CAS, verified fill/pin, release, status projection, and a shared
-  PostgreSQL store with cross-process linearizable capacity/fencing CAS.
-  An authenticated bounded node-agent HTTP API now exposes ensure/release and
-  durable status without accepting trust roots over the wire. D3.1 adds
-  deployment-owned pin commands for ready cache hits and a hash-bound Runner
-  startup binding that joins the scaling decision, scheduler node, exact
-  artifact, completed pin, and later fresh/pinned residency hint. D3.2 CASes a
-  live binding and the scale-from-zero replica update into one workload write,
-  carrying the full evidence into the Pod template with required node affinity
-  and binding-scoped node anti-affinity. D3.3 parses that inherited binding,
-  binds the actual scheduled Pod UID/node to a Runner-side WP4.6 full-digest
-  proof, and blocks cache-bound readiness until the hash-bound proof exactly
-  matches the decision, artifact, pre-stage generation, and resident record.
-  D3.4 adds a Pod CREATE admission contract with workload/creator-bound,
-  linearizable per-name claims, exact per-placement node affinity, replay
-  safety-window reservations, retry idempotency, and concurrent placement uniqueness without
-  rewriting the shared workload template. D3.5 adds bounded-batch compaction of
-  released placement rows into durable generation, leader-fence, target-revision,
-  and release-identity high-water marks without consuming active placement
-  capacity. D3.6 adds a shared PostgreSQL admission plan/claim store with
-  cross-replica linearizable allocation, retry-safe rollback protection, and
-  replay-window plan rotation. D3.7 adds a strict AdmissionReview v1 HTTP
-  boundary with UID-bound decisions, Pod identity checks, bounded input and
-  concurrency, sanitized fail-closed errors, and deterministic JSON Patch
-  mutation. D3.8 adds a TLS-serving runtime/CLI which assembles the D3.6 store
-  and D3.7 app, validates bounded secret/config files, and performs
-  authenticated nonce-bound final binding reauthorization without redirects or
-  environment proxies. Plaintext authority URLs are rejected; request and
-  response bytes plus secret-file permissions are bounded before use. D3.9 adds
-  the authenticated, strict, size/concurrency-bounded scaling-authority HTTP
-  boundary with nonce echo, exact-binding authorization, sanitized fail-closed
-  errors, and protected empty-body readiness. D3.10 adds embedded authority
-  runtime assembly with strict bounded config, file-backed bearer/TLS material,
-  explicit timeout/concurrency budgets, and idempotent caller-resource shutdown.
-  Live scaling-controller callback integration, Kubernetes TLS and admission
-  resources, scheduled compaction, and live environment acceptance remain.
-- Qwen3.8-Flash-Next MTP speculative decoding stays off in `qwen3.8-flash-next-dp2-8gpu` until upstream fixes vllm#53912 (prefix caching + MTP output corruption on hybrid GDN); single-stream decode 104 vs 175 tok/s
-- DTO-D15 (2026-08-26) changed the served tiered-example config: verify.sh coding/generic gates and the digest re-pin are pending before the example status can be claimed green again
-- Human sign-off pending on M2–M4 design reviews
+- G2 A6 remains the hard performance gate; #333 excluded process split and #318
+  excluded admission depth beyond two as material fixes.
+- Production stage-sharded PP, learned-draft evidence, frontier long-context and
+  recovery gates, and remaining G6 P-C gates remain open.
+- NVLink gates require H100/A100-class hardware; E4/E5 require the planned PCIe
+  switch and ≥400 Gb/s RDMA environment.
+- AsyncRequest retention-expanded Kind evidence awaits registry access.
+- Runner autoscaling WP3.1–WP3.7 is fail-closed and CPU-tested; deployment wiring,
+  durable runtime status, instrumentation, and live acceptance remain.
+- Model-cache WP4.1–WP4.7 and D3.1–D3.10 provide signed identity, verified cache,
+  fenced pre-stage/startup/admission, PostgreSQL authority, and TLS HTTP runtime.
+  Live controller callbacks, scheduled compaction, deployment, and acceptance remain.
+- Qwen3.8 MTP stays disabled pending vllm#53912; DTO-D15 verification/re-pin and
+  human sign-off for M2–M4 remain pending.
 
 ## Change Log
 
@@ -235,102 +157,3 @@ in `.claude/rules/progress-log.md`).
 - Refs: docs/design/node-model-cache-prestage-v1.md;
   kairyu/runners/postgres_startup_admission.py;
   tests/unit/test_postgres_runner_startup_admission.py
-
-### 2026-09-29 — [progress] Safe pre-stage fencing-tombstone compaction
-- What: added a minimal per-placement high-water contract, bounded/cutoff-driven
-  in-memory and PostgreSQL compaction, schema-v1-to-v2 migration, exact release
-  replay, active-capacity reclamation, and successor validation against retained
-  generation, election/holder fence, target revision, and release identity.
-- Why: released full command rows must stop exhausting the bounded active ledger
-  without allowing an expired or stale controller lineage to re-enter as new.
-- Refs: docs/design/node-model-cache-prestage-v1.md;
-  kairyu/runners/{prestage,postgres_prestage}.py;
-  tests/unit/test_{runner_prestage,postgres_node_model_prestage}.py
-
-### 2026-09-29 — [progress] Incremental cache-bound Pod placement
-- What: added a gated Pod CREATE admission controller, canonical per-Pod
-  placement claims, workload/creator authorization, replay-safe claim rollback
-  and cross-generation node reservations, exact node-affinity injection, end-to-end selected-placement
-  attestation, strict binding replay, and a thread-safe executable store contract
-  for production shared-store wiring.
-- Why: increasing replicas on a live workload must assign every new Pod to one
-  unique ready cache placement without changing its shared template and rolling
-  existing Pods.
-- Refs: docs/design/node-model-cache-prestage-v1.md;
-  kairyu/runners/{startup_admission,startup_scheduling,startup_metadata}.py;
-  tests/unit/test_runner_startup_admission.py
-
-### 2026-09-29 — [progress] Atomic cache-bound cold-start scheduling
-- What: added an idempotent Pod-template binding, exact node affinity,
-  binding-scoped node anti-affinity, and a single Kubernetes CAS that commits
-  the template evidence with the scale-from-zero replica update.
-- Why: new Pods must not appear before the scheduler constraint and full
-  decision/pin/hint evidence are visible, while a shared-template update with
-  existing replicas must not trigger an unsafe rollout.
-- Refs: docs/design/node-model-cache-prestage-v1.md;
-  kairyu/runners/{startup_scheduling,scale_actuator}.py;
-  tests/unit/test_runner_{startup_scheduling,cache_scheduling_actuator}.py
-
-### 2026-09-29 — [progress] Runner cache startup binding
-- What: added fenced pin commands for cache-ready placements and a canonical
-  startup binding that requires exact decision/node/artifact identity, completed
-  deployment-owned pins, and later fresh pinned residency evidence.
-- Why: a `READY` hint alone must not let Kubernetes start a Runner on another
-  node or after its artifact retention proof has disappeared.
-- Refs: docs/design/node-model-cache-prestage-v1.md;
-  kairyu/runners/{prestage,startup_binding}.py;
-  tests/unit/test_runner_startup_binding.py
-
-### 2026-09-29 — [progress] Authenticated model cache-agent API
-- What: added API-key-protected, node-bound ensure/release/status endpoints with
-  local-only artifact trust roots, bounded request/concurrency admission,
-  readiness checks, and sanitized failure responses.
-- Refs: docs/design/node-model-cache-prestage-v1.md;
-  kairyu/runners/cache_agent_api.py;
-  tests/unit/test_node_model_cache_agent_api.py
-
-### 2026-09-29 — [progress] Executable model cache-agent runtime
-- What: added a fail-closed `cache-agent serve` process assembly with file-based
-  identity/credentials, explicit NVMe state/index binding, durable store
-  validation, resource cleanup, and strict versioned JSON configuration.
-- Refs: kairyu/runners/cache_agent_runtime.py; kairyu/entrypoints/cli.py;
-  tests/unit/test_node_model_cache_agent_runtime.py
-
-### 2026-09-29 — [progress] Durable node pre-stage placement store
-- What: added a node-scoped PostgreSQL store with shared capacity locking,
-  exact replay, fenced CAS transitions, strict schema/configuration checks,
-  and real cross-instance database tests.
-- Refs: docs/design/node-model-cache-prestage-v1.md;
-  kairyu/runners/postgres_prestage.py;
-  tests/unit/test_postgres_node_model_prestage.py
-
-### 2026-09-28 — [progress] Fenced model pre-staging
-- What: added exact controller commands, node claim/CAS, verified fill/pin,
-  fresh fenced release, retry, and monotonic placement-state projection.
-- Refs: docs/design/node-model-cache-prestage-v1.md; kairyu/runners/prestage.py;
-  tests/unit/test_runner_prestage.py
-
-### 2026-09-28 — [progress] Fail-closed model-cache corruption recovery
-- What: added full-digest startup verification, atomic quarantine, mandatory audit, verified refill, and generation-fenced retry.
-- Why: same-size bit rot and incomplete audit evidence must block Runner startup.
-- Refs: docs/design/node-model-cache-corruption-recovery-v1.md; kairyu/artifacts/node_cache.py; tests/unit/test_node_model_cache.py
-
-### 2026-09-28 — [progress] Fenced node model-cache eviction
-- What: added high/low watermarks, unpinned LRU, revision/generation fences, digest locks, atomic detach, and crash recovery.
-- Why: NVMe pressure must never remove active, rollback, or manually pinned artifacts.
-- Refs: docs/design/node-model-cache-eviction-v1.md; kairyu/artifacts/eviction.py; tests/unit/test_node_model_cache_eviction.py
-
-### 2026-09-28 — [progress] Verified model-cache placement hints
-- What: added monotonic node-index snapshots, verified-only TTL publications,
-  and an exact digest/revision join into WP3.6 cache-aware placement inputs.
-- Why: locality may improve startup only as a bounded hint below health/quota gates.
-- Refs: docs/design/node-model-cache-placement-hints-v1.md; kairyu/artifacts/placement_hint.py; tests/unit/test_node_model_cache_placement_hint.py
-
-### 2026-09-26 — [progress] Durable node model-cache index
-- What: added a node-bound WAL/FULL SQLite residency index, immutable digest
-  identity checks, monotonic access records, generations, and composable
-  owner-scoped pins; successful WP4.2 fill/hit paths now update it.
-- Why: placement and eviction need durable node/model/bytes/verified/access/pin
-  evidence without treating mutable filesystem paths as authority.
-- Refs: docs/design/node-model-cache-index-v1.md;
-  kairyu/artifacts/cache_index.py; tests/unit/test_node_model_cache_index.py

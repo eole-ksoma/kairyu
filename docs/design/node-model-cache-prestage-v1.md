@@ -18,8 +18,10 @@ and authenticated nonce-bound binding reauthorization client. D3.9 adds the
 authenticated scaling-authority HTTP boundary that serves that client. D3.10
 adds its embedded process-boundary assembly with strict configuration,
 file-backed credentials, TLS material validation, bounded budgets, and owned
-shutdown. Concrete live-authority integration, scheduling compaction, and
-Kubernetes deployment wiring remain deployment tasks.
+shutdown. D3.11 adds leader-fenced validation of the live binding, durable
+decision, target, quota, prewarm capacity, cache freshness, and lifetime.
+Concrete live-state source construction, scheduling compaction, and Kubernetes
+deployment wiring remain deployment tasks.
 
 ## Purpose
 
@@ -515,6 +517,48 @@ live leader, target, quota, prewarm, and binding state. This deliberately does
 not dynamically import callbacks or create a standalone placeholder authority:
 the process that owns the live scaling state also owns service startup.
 
+D3.11 supplies `ScalingControllerPlacementBindingAuthority` as the callback
+adapter for that process. Every authorization executes under
+`LeaderFencedRunnerController`, reads one deadline-bounded
+`RunnerCachePlacementBindingLiveState` from the controller-owned source, and
+then re-authorizes leadership after the read. The candidate must remain the
+source's exact current binding and be inside its validity window. Its durable
+decision must still be a fenced, generated scale-up whose target, fingerprint,
+model revision, artifact, placement set, and original prewarm identity match.
+
+The refreshed quota may advance its source revision but must retain the Kueue
+and tenant/model identity, stay within the policy freshness window, and still
+admit the decided replica count. The refreshed prewarm view may likewise
+advance, but each originally selected placement must remain healthy,
+schedulable, unassigned, cache-ready, identity-equivalent, and live at the
+leader store's authoritative validation time. The binding's original hint
+observation, expiry, and index revision must exactly match the durable decision.
+The live source must also return the current pre-stage record and physical node
+hint for every selected placement, plus owner-scoped pin evidence derived from
+the same node-index revision and observation as that hint. Command
+identity/generation, the binding owner remaining in the current pin set,
+resident generation, pinned state, and artifact identity must still match;
+refreshed hint time/revision may advance but cannot roll back, and its exact
+values must agree with the refreshed prewarm view. This prevents unpin and
+evict/refill ABA from laundering an old binding through a merely READY cache
+state. State snapshots that predate the binding, exceed the decision freshness
+limit, or claim a different current binding are denied.
+
+Time freshness is evaluated only after the source read, using the leader
+store's refreshed authority time. A snapshot legitimately observed between the
+initial authority check and final reauthorization is therefore accepted, while
+a tenure change during the read is denied. The absolute deadline is checked
+both around the read and after the final full validation. Backend failures and
+loss of leadership remain dependency failures; HTTP sanitization is owned by
+D3.9.
+
+The source protocol intentionally requires both `read` and `readiness` to
+receive the absolute request deadline and per-backend timeout. The concrete
+scaling-controller process must apply that timeout to every PostgreSQL,
+Kubernetes, Kueue, and cache-state call. D3.11 does not create an echo source
+from the admission plan store: the live source must be independently backed by
+the process's durable decision and current controller state.
+
 ## Deployment boundary
 
 `private-ai-cloud-iac` must still provide:
@@ -526,9 +570,9 @@ the process that owns the live scaling state also owns service startup.
 - reconciliation that replays desired ensure/release commands after restart;
 - a scheduled caller for the implemented bounded compaction contract, with a
   documented retirement cutoff and monitoring of per-placement high-water rows;
-- live scaling-controller callback integration and deployment for the assembled
-  scaling-authority reauthorization/readiness endpoint consumed by D3.8, plus a
-  highly available
+- a concrete deadline-bounded D3.11 live-state source and deployment for the
+  assembled scaling-authority reauthorization/readiness endpoint consumed by
+  D3.8, plus a highly available
   Deployment/Service/MutatingWebhookConfiguration, TLS
   certificate issuance/rotation and trust, ingress restriction, orchestration
   that registers the plan before the D3.2 scale write, and fail-closed webhook

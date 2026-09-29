@@ -144,9 +144,11 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
   D3.4 adds a Pod CREATE admission contract with workload/creator-bound,
   linearizable per-name claims, exact per-placement node affinity, replay
   safety-window reservations, retry idempotency, and concurrent placement uniqueness without
-  rewriting the shared workload template. Production webhook
-  and shared claim-store wiring, safe fencing-tombstone compaction, and live
-  environment acceptance remain.
+  rewriting the shared workload template. D3.5 adds bounded-batch compaction of
+  released placement rows into durable generation, leader-fence, target-revision,
+  and release-identity high-water marks without consuming active placement
+  capacity. Production webhook/shared claim-store wiring, scheduled compaction,
+  and live environment acceptance remain.
 - Qwen3.8-Flash-Next MTP speculative decoding stays off in `qwen3.8-flash-next-dp2-8gpu` until upstream fixes vllm#53912 (prefix caching + MTP output corruption on hybrid GDN); single-stream decode 104 vs 175 tok/s
 - DTO-D15 (2026-08-26) changed the served tiered-example config: verify.sh coding/generic gates and the digest re-pin are pending before the example status can be claimed green again
 - Human sign-off pending on M2–M4 design reviews
@@ -155,6 +157,17 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
+
+### 2026-09-29 — [progress] Safe pre-stage fencing-tombstone compaction
+- What: added a minimal per-placement high-water contract, bounded/cutoff-driven
+  in-memory and PostgreSQL compaction, schema-v1-to-v2 migration, exact release
+  replay, active-capacity reclamation, and successor validation against retained
+  generation, election/holder fence, target revision, and release identity.
+- Why: released full command rows must stop exhausting the bounded active ledger
+  without allowing an expired or stale controller lineage to re-enter as new.
+- Refs: docs/design/node-model-cache-prestage-v1.md;
+  kairyu/runners/{prestage,postgres_prestage}.py;
+  tests/unit/test_{runner_prestage,postgres_node_model_prestage}.py
 
 ### 2026-09-29 — [progress] Incremental cache-bound Pod placement
 - What: added a gated Pod CREATE admission controller, canonical per-Pod

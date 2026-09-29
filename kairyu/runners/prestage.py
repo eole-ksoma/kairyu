@@ -256,6 +256,110 @@ class NodeModelPrestageRecord(BaseModel):
         return self
 
 
+_RELEASE_IDENTITY_FIELDS = (
+    "target_id",
+    "deployment_id",
+    "placement_binding_id",
+    "placement_id",
+    "node_id",
+    "resource_flavor",
+    "profile_id",
+    "compatibility_approval_id",
+    "model_id",
+    "model_revision",
+    "manifest_digest",
+    "pin_owner",
+)
+
+
+def _release_identity_digest(command: NodeModelPrestageCommand) -> str:
+    return _canonical_digest(
+        {field: getattr(command, field) for field in _RELEASE_IDENTITY_FIELDS}
+    )
+
+
+class NodeModelPrestageHighWaterMark(BaseModel):
+    """Minimal durable fence retained after an absent record is compacted."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
+
+    schema_version: Literal["kairyu-node-model-prestage-high-water-v1"] = (
+        "kairyu-node-model-prestage-high-water-v1"
+    )
+    placement_id: str = Field(max_length=255)
+    command_id: str = Field(min_length=64, max_length=64)
+    command_generation: int = Field(ge=1, le=_MAX_SIGNED_BIGINT)
+    election_id: str = Field(max_length=255)
+    holder_id: str = Field(max_length=255)
+    fencing_token: int = Field(ge=1, le=_MAX_SIGNED_BIGINT)
+    target_id: str = Field(max_length=255)
+    target_revision: int = Field(ge=1, le=_MAX_SIGNED_BIGINT)
+    release_identity_digest: str = Field(min_length=64, max_length=64)
+    attempt: int = Field(ge=0, le=_MAX_SIGNED_BIGINT)
+    updated_at: datetime
+    compacted_at: datetime
+
+    @field_validator("placement_id", "election_id", "holder_id", "target_id")
+    @classmethod
+    def validate_text(cls, value: str, info) -> str:
+        return _text(value, name=info.field_name)
+
+    @field_validator("command_id", "release_identity_digest")
+    @classmethod
+    def validate_digest(cls, value: str, info) -> str:
+        return _digest(value, name=info.field_name)
+
+    @field_validator(
+        "command_generation",
+        "fencing_token",
+        "target_revision",
+        "attempt",
+        mode="before",
+    )
+    @classmethod
+    def validate_integer(cls, value: object, info) -> int:
+        return _integer(value, name=info.field_name)
+
+    @field_validator("updated_at", "compacted_at")
+    @classmethod
+    def validate_timestamp(cls, value: datetime, info) -> datetime:
+        return _aware(value, name=info.field_name)
+
+    @model_validator(mode="after")
+    def validate_compaction_time(self) -> NodeModelPrestageHighWaterMark:
+        if self.compacted_at < self.updated_at:
+            raise ValueError("compacted_at cannot predate the retired record")
+        return self
+
+    @classmethod
+    def from_absent_record(
+        cls,
+        record: NodeModelPrestageRecord,
+        *,
+        compacted_at: datetime,
+    ) -> NodeModelPrestageHighWaterMark:
+        record = NodeModelPrestageRecord.model_validate(record.model_dump())
+        if record.state is not ModelCachePlacementState.ABSENT:
+            raise ValueError("only absent pre-stage records can be compacted")
+        command = record.command
+        if command.action != "release":
+            raise ValueError("compacted absent record must contain a release command")
+        return cls(
+            placement_id=command.placement_id,
+            command_id=command.command_id,
+            command_generation=command.command_generation,
+            election_id=command.authority.election_id,
+            holder_id=command.authority.holder_id,
+            fencing_token=command.authority.fencing_token,
+            target_id=command.target_id,
+            target_revision=command.target_revision,
+            release_identity_digest=_release_identity_digest(command),
+            attempt=record.attempt,
+            updated_at=record.updated_at,
+            compacted_at=_aware(compacted_at, name="compacted_at"),
+        )
+
+
 @runtime_checkable
 class NodeModelPrestageStore(Protocol):
     """Atomic placement claim/CAS contract for a durable production backend."""
@@ -307,8 +411,29 @@ class NodeModelPrestageStore(Protocol):
     ) -> tuple[NodeModelPrestageRecord, ...]: ...
 
 
+@runtime_checkable
+class NodeModelPrestageCompactionStore(NodeModelPrestageStore, Protocol):
+    """Optional lifecycle extension for stores that compact released records."""
+
+    def compact_absent_records(
+        self,
+        *,
+        retired_before: datetime,
+        compacted_at: datetime,
+        limit: int = 100,
+    ) -> tuple[NodeModelPrestageHighWaterMark, ...]: ...
+
+    def list_high_water_marks(self) -> tuple[NodeModelPrestageHighWaterMark, ...]: ...
+
+
 def _copy_prestage_record(record: NodeModelPrestageRecord) -> NodeModelPrestageRecord:
     return NodeModelPrestageRecord.model_validate(record.model_dump())
+
+
+def _copy_high_water_mark(
+    mark: NodeModelPrestageHighWaterMark,
+) -> NodeModelPrestageHighWaterMark:
+    return NodeModelPrestageHighWaterMark.model_validate(mark.model_dump())
 
 
 class _NodeModelPrestageTransitions:
@@ -373,10 +498,38 @@ class _NodeModelPrestageTransitions:
         ):
             raise NodeModelPrestageConflictError("target revision regressed")
 
+    @staticmethod
+    def _validate_high_water_successor(
+        mark: NodeModelPrestageHighWaterMark,
+        command: NodeModelPrestageCommand,
+    ) -> None:
+        if command.command_generation <= mark.command_generation:
+            raise NodeModelPrestageConflictError("command generation did not advance")
+        if command.authority.election_id != mark.election_id:
+            raise NodeModelPrestageConflictError("leader election identity changed")
+        if command.authority.fencing_token < mark.fencing_token:
+            raise NodeModelPrestageConflictError("leader fencing token regressed")
+        if (
+            command.authority.fencing_token == mark.fencing_token
+            and command.authority.holder_id != mark.holder_id
+        ):
+            raise NodeModelPrestageConflictError("leader holder changed without a new fence")
+        if command.target_id == mark.target_id and command.target_revision < mark.target_revision:
+            raise NodeModelPrestageConflictError("target revision regressed")
+
+    @staticmethod
+    def _validate_high_water_identity(
+        mark: NodeModelPrestageHighWaterMark,
+        command: NodeModelPrestageCommand,
+    ) -> None:
+        if _release_identity_digest(command) != mark.release_identity_digest:
+            raise NodeModelPrestageConflictError("release identity does not match pinned placement")
+
     def claim(
         self,
         existing: NodeModelPrestageRecord | None,
         *,
+        high_water: NodeModelPrestageHighWaterMark | None = None,
         record_count: int,
         max_placements: int,
         command: NodeModelPrestageCommand,
@@ -389,6 +542,12 @@ class _NodeModelPrestageTransitions:
         claim_id = _digest(claim_id, name="claim_id")
         now = _aware(now, name="now")
         if existing is None:
+            if high_water is not None:
+                if command.command_id == high_water.command_id:
+                    raise NodeModelPrestageConflictError(
+                        "released command cannot be reactivated"
+                    )
+                self._validate_high_water_successor(high_water, command)
             if record_count >= max_placements:
                 raise NodeModelPrestageCapacityError(
                     "pre-stage placement capacity is exhausted"
@@ -492,6 +651,7 @@ class _NodeModelPrestageTransitions:
         self,
         existing: NodeModelPrestageRecord | None,
         *,
+        high_water: NodeModelPrestageHighWaterMark | None = None,
         command: NodeModelPrestageCommand,
         now: datetime,
     ) -> NodeModelPrestageRecord:
@@ -500,7 +660,43 @@ class _NodeModelPrestageTransitions:
             raise NodeModelPrestageConflictError("owner pin release requires a release command")
         now = _aware(now, name="now")
         if existing is None:
-            raise NodeModelPrestageConflictError("release has no accepted placement")
+            if high_water is None:
+                raise NodeModelPrestageConflictError("release has no accepted placement")
+            self._validate_high_water_identity(high_water, command)
+            if command.command_id == high_water.command_id:
+                expected = (
+                    command.command_generation,
+                    command.authority.election_id,
+                    command.authority.holder_id,
+                    command.authority.fencing_token,
+                    command.target_id,
+                    command.target_revision,
+                )
+                observed = (
+                    high_water.command_generation,
+                    high_water.election_id,
+                    high_water.holder_id,
+                    high_water.fencing_token,
+                    high_water.target_id,
+                    high_water.target_revision,
+                )
+                if expected != observed:
+                    raise NodeModelPrestageConflictError("release command ID payload conflict")
+                return NodeModelPrestageRecord(
+                    command=command,
+                    state=ModelCachePlacementState.ABSENT,
+                    attempt=high_water.attempt,
+                    updated_at=high_water.updated_at,
+                )
+            self._validate_high_water_successor(high_water, command)
+            if now < high_water.updated_at:
+                raise NodeModelPrestageConflictError("pre-stage record time regressed")
+            return NodeModelPrestageRecord(
+                command=command,
+                state=ModelCachePlacementState.ABSENT,
+                attempt=high_water.attempt,
+                updated_at=now,
+            )
         if existing.command.command_id == command.command_id:
             if not self._same_command(existing, command):
                 raise NodeModelPrestageConflictError("release command ID payload conflict")
@@ -524,21 +720,10 @@ class _NodeModelPrestageTransitions:
         previous: NodeModelPrestageCommand,
         release: NodeModelPrestageCommand,
     ) -> None:
-        fields = (
-            "target_id",
-            "deployment_id",
-            "placement_binding_id",
-            "placement_id",
-            "node_id",
-            "resource_flavor",
-            "profile_id",
-            "compatibility_approval_id",
-            "model_id",
-            "model_revision",
-            "manifest_digest",
-            "pin_owner",
-        )
-        if any(getattr(previous, field) != getattr(release, field) for field in fields):
+        if any(
+            getattr(previous, field) != getattr(release, field)
+            for field in _RELEASE_IDENTITY_FIELDS
+        ):
             raise NodeModelPrestageConflictError("release identity does not match pinned placement")
 
     def _require_claim(
@@ -567,6 +752,7 @@ class InMemoryNodeModelPrestageStore:
         self._transitions = _NodeModelPrestageTransitions(node_id=node_id)
         self._max_placements = max_placements
         self._records: dict[str, NodeModelPrestageRecord] = {}
+        self._high_water_marks: dict[str, NodeModelPrestageHighWaterMark] = {}
         self._lock = threading.Lock()
 
     @property
@@ -587,6 +773,7 @@ class InMemoryNodeModelPrestageStore:
         with self._lock:
             record = self._transitions.claim(
                 self._records.get(placement_id),
+                high_water=self._high_water_marks.get(placement_id),
                 record_count=len(self._records),
                 max_placements=self._max_placements,
                 command=command,
@@ -655,12 +842,25 @@ class InMemoryNodeModelPrestageStore:
         )
         placement_id = command.placement_id
         with self._lock:
+            existing = self._records.get(placement_id)
             record = self._transitions.release(
-                self._records.get(placement_id),
+                existing,
+                high_water=self._high_water_marks.get(placement_id),
                 command=command,
                 now=now,
             )
-            self._records[placement_id] = record
+            if existing is None:
+                self._high_water_marks[placement_id] = (
+                    NodeModelPrestageHighWaterMark.from_absent_record(
+                        record,
+                        compacted_at=max(
+                            now,
+                            self._high_water_marks[placement_id].compacted_at,
+                        ),
+                    )
+                )
+            else:
+                self._records[placement_id] = record
             return _copy_prestage_record(record)
 
     def list_records(self) -> tuple[NodeModelPrestageRecord, ...]:
@@ -689,6 +889,50 @@ class InMemoryNodeModelPrestageStore:
             )
             selected = tuple(islice(keys, limit))
             return tuple(_copy_prestage_record(self._records[key]) for key in selected)
+
+    def compact_absent_records(
+        self,
+        *,
+        retired_before: datetime,
+        compacted_at: datetime,
+        limit: int = 100,
+    ) -> tuple[NodeModelPrestageHighWaterMark, ...]:
+        retired_before = _aware(retired_before, name="retired_before")
+        compacted_at = _aware(compacted_at, name="compacted_at")
+        if compacted_at < retired_before:
+            raise ValueError("compacted_at cannot predate retired_before")
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("limit must be an integer in [1, 1000]")
+        with self._lock:
+            candidates = sorted(
+                (
+                    record
+                    for record in self._records.values()
+                    if record.state is ModelCachePlacementState.ABSENT
+                    and record.updated_at <= retired_before
+                ),
+                key=lambda record: (record.updated_at, record.command.placement_id),
+            )[:limit]
+            compacted: list[NodeModelPrestageHighWaterMark] = []
+            for record in candidates:
+                mark = NodeModelPrestageHighWaterMark.from_absent_record(
+                    record,
+                    compacted_at=compacted_at,
+                )
+                previous = self._high_water_marks.get(mark.placement_id)
+                if previous is not None and previous.command_generation >= mark.command_generation:
+                    raise RuntimeError("pre-stage high-water mark would not advance")
+                self._high_water_marks[mark.placement_id] = mark
+                del self._records[mark.placement_id]
+                compacted.append(_copy_high_water_mark(mark))
+            return tuple(compacted)
+
+    def list_high_water_marks(self) -> tuple[NodeModelPrestageHighWaterMark, ...]:
+        with self._lock:
+            return tuple(
+                _copy_high_water_mark(self._high_water_marks[key])
+                for key in sorted(self._high_water_marks)
+            )
 
 
 class NodeModelPrestageExecutor:

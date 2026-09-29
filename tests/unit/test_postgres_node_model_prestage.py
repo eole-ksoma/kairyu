@@ -206,6 +206,59 @@ def test_cross_instance_claim_complete_release_and_replay(store_factory) -> None
     assert first.release(release, now=_NOW + timedelta(seconds=6)) == absent
 
 
+def test_cross_instance_compaction_reclaims_capacity_without_losing_fences(
+    store_factory,
+) -> None:
+    create, _store_id = store_factory
+    first = create(max_placements=1)
+    second = create(max_placements=1)
+    command = _command()
+    first.claim(command, claim_id="b" * 64, now=_NOW + timedelta(seconds=1))
+    first.fail(
+        command,
+        claim_id="b" * 64,
+        failure="retired",
+        now=_NOW + timedelta(seconds=2),
+    )
+    release = build_node_model_prestage_release_command(
+        command,
+        authority=_authority(token=5),
+        decision_id="scale-decision-21",
+        decision_fingerprint="e" * 64,
+        target_revision=9,
+        command_generation=21,
+        issued_at=_NOW + timedelta(seconds=3),
+        ttl_seconds=60,
+    )
+    absent = second.release(release, now=_NOW + timedelta(seconds=4))
+
+    marks = first.compact_absent_records(
+        retired_before=_NOW + timedelta(seconds=4),
+        compacted_at=_NOW + timedelta(seconds=5),
+    )
+
+    assert first.list_records() == ()
+    assert second.list_high_water_marks() == marks
+    assert marks[0].command_generation == 21
+    assert marks[0].fencing_token == 5
+    assert marks[0].target_revision == 9
+    assert second.release(release, now=_NOW + timedelta(seconds=6)) == absent
+    assert second.list_records() == ()
+    with pytest.raises(NodeModelPrestageConflictError, match="generation did not advance"):
+        second.claim(
+            command,
+            claim_id="c" * 64,
+            now=_NOW + timedelta(seconds=6),
+        )
+
+    other = _command("placement-01", generation=30)
+    assert second.claim(
+        other,
+        claim_id="d" * 64,
+        now=_NOW + timedelta(seconds=6),
+    ).command == other
+
+
 def test_concurrent_cross_instance_claim_has_one_winner(store_factory) -> None:
     create, _store_id = store_factory
     stores = (create(), create())
@@ -305,6 +358,56 @@ def test_startup_without_initialization_rejects_missing_schema(isolated_database
     with pytest.raises(RuntimeError, match="missing required tables"):
         store.startup()
     store.close()
+
+
+def test_initialization_migrates_schema_v1_registry_and_adds_high_water_table(
+    isolated_database,
+) -> None:
+    for store_id, node_id in (
+        ("migrate-v1-a", "gpu-node-00"),
+        ("migrate-v1-b", "gpu-node-01"),
+    ):
+        store = PostgresNodeModelPrestageStore(
+            isolated_database,
+            store_id=store_id,
+            node_id=node_id,
+        )
+        store.close()
+    with psycopg.connect(isolated_database, autocommit=True) as connection:
+        connection.execute("DROP TABLE public.node_model_prestage_high_water_marks")
+        connection.execute(
+            """
+            UPDATE public.node_model_prestage_store_registry
+            SET schema_version = 1
+            """
+        )
+
+    migrated = PostgresNodeModelPrestageStore(
+        isolated_database,
+        store_id="migrate-v1-a",
+        node_id="gpu-node-00",
+    )
+
+    assert migrated.check_ready() is None
+    assert migrated.list_high_water_marks() == ()
+    with psycopg.connect(isolated_database, autocommit=True) as connection:
+        row = connection.execute(
+            """
+            SELECT store_id, schema_version
+            FROM public.node_model_prestage_store_registry
+            ORDER BY store_id
+            """
+        ).fetchall()
+    assert row == [("migrate-v1-a", 2), ("migrate-v1-b", 1)]
+    migrated.close()
+
+    second = PostgresNodeModelPrestageStore(
+        isolated_database,
+        store_id="migrate-v1-b",
+        node_id="gpu-node-01",
+    )
+    assert second.check_ready() is None
+    second.close()
 
 
 def test_startup_rejects_changed_state_constraint(isolated_database) -> None:

@@ -9,8 +9,9 @@ residency hint on the exact scheduler node. D3.2 atomically applies that binding
 to a scale-from-zero workload Pod template and replica count. D3.3 requires an
 exact Runner-side startup proof before readiness. D3.4 adds the library-side
 CREATE admission and linearizable claim contract for incremental per-Pod
-placement. Safe released-placement tombstone compaction and production webhook
-wiring remain separate deployment/store-lifecycle tasks.
+placement. D3.5 adds bounded-batch released-placement compaction into durable
+per-placement fencing high-water marks. Scheduling that compaction and production
+webhook wiring remain deployment tasks.
 
 ## Purpose
 
@@ -108,11 +109,30 @@ node. A later sharded design may replace the coarse lock only if it preserves
 the same transition and capacity semantics.
 
 Released `absent` records remain durable fencing tombstones and count against
-`max_placements`. The store fails closed at that bound. They must not be deleted
-merely because their command expired: doing so would discard the last accepted
-generation, leader fence, and target revision, allowing an older lineage to be
-treated as a new placement. Safe compaction therefore remains deployment work
-and must retain an equivalent durable high-water mark before reclaiming a row.
+`max_placements` until explicitly compacted. The store fails closed at that
+bound. They must not be deleted merely because their command expired: doing so
+would discard the last accepted generation, leader fence, and target revision,
+allowing an older lineage to be treated as a new placement.
+
+`compact_absent_records()` moves only absent rows at or before an explicit
+operator-selected retirement cutoff, in batches of at most 1,000. Under the
+same node-scoped linearization lock it first upserts a minimal, schema-validated
+`NodeModelPrestageHighWaterMark`, then deletes the full active row. The mark
+retains placement and release-command identity, generation, election/holder and
+fencing token, target/revision, attempt, and source/compaction times. A compacted
+release replays exactly without recreating an active row; a successor ensure or
+release must still advance the retained fences. Release identity is retained as
+a canonical digest so a changed artifact, workload, node, profile, or pin owner
+cannot inherit the lineage. High-water rows do not consume active placement
+capacity and are one bounded record per placement ID.
+
+PostgreSQL schema version 2 adds the high-water table. Initialization creates it
+under the existing advisory schema lock and upgrades only the initializing
+store's version-1 registry row after strict table validation. Other node/store
+rows remain at version 1 until their own agent upgrades, allowing a rolling
+deployment; startup without schema initialization fails closed on the old
+layout. In-memory and PostgreSQL adapters expose the same optional compaction
+extension without expanding the runtime-checked execution-store protocol.
 
 ## Node agent HTTP boundary
 
@@ -367,8 +387,8 @@ unclaimed plan may rotate immediately after binding expiry.
 - a node DaemonSet/service invoking the implemented `cache-agent serve`
   entrypoint;
 - reconciliation that replays desired ensure/release commands after restart;
-- bounded tombstone retention/compaction that durably preserves each retired
-  placement's generation, leader fence, and target-revision high-water marks;
+- a scheduled caller for the implemented bounded compaction contract, with a
+  documented retirement cutoff and monitoring of per-placement high-water rows;
 - a highly available mutating admission webhook, shared linearizable D3.4 plan
   and claim store, orchestration that registers the plan before the D3.2 scale
   write, and fail-closed webhook policy;
@@ -385,9 +405,11 @@ production autoscaling.
 Tests cover deterministic command hashing, exact generation allocation,
 admission and node binding, claim concurrency, expiry, verified fill and pin,
 idempotent replay, failure/retry, fresh fenced release, preservation of other
-pin owners, and exact monotonic status projection. Real PostgreSQL tests add
-cross-instance claim races, completion/release replay, shared capacity, store
-configuration mismatch, and projected-metadata corruption detection.
+pin owners, bounded compaction, post-compaction replay and successor fencing,
+and exact monotonic status projection. Real PostgreSQL tests add cross-instance
+claim races, completion/release replay, shared capacity reclamation, durable
+high-water visibility, store configuration mismatch, and projected-metadata
+corruption detection.
 HTTP tests cover API-key protection, local-only trust roots, node binding,
 ensure/release replay, path/failure-detail redaction, readiness sanitization,
 bounded cursor pagination, error mappings, concurrent admission, and declared

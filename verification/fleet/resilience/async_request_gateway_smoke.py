@@ -78,11 +78,23 @@ def find_takeover(
     original_worker: str,
     original_fence: int,
 ) -> dict[str, Any] | None:
+    """Return the event where another worker took over with a higher fence.
+
+    A crashed owner's claim is reclaimed after lease expiry (``reclaim``); an
+    owner that shuts down releases its claim (``defer``) and another gateway
+    claims it immediately (m10 A39).
+    """
+    released = False
     for event in events:
-        if (
-            event.get("event") == "reclaim"
-            and event.get("worker_id") != original_worker
-            and int(event.get("fencing_token", 0)) > original_fence
+        worker_id = event.get("worker_id")
+        fence = int(event.get("fencing_token", 0))
+        if fence <= original_fence:
+            continue
+        if worker_id == original_worker:
+            released = released or event.get("event") == "defer"
+            continue
+        if event.get("event") == "reclaim" or (
+            released and event.get("event") == "claim"
         ):
             return event
     return None
@@ -554,6 +566,7 @@ class Smoke:
                     "request_id": request_id,
                     "failed_gateway": owner_gateway,
                     "original_worker": original_worker,
+                    "takeover_event": takeover["event"],
                     "takeover_worker": takeover["worker_id"],
                     "original_fence": original_fence,
                     "takeover_fence": int(takeover["fencing_token"]),

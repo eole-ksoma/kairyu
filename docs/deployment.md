@@ -508,9 +508,10 @@ bash scripts/kind_async_request_gate.sh
 
 It runs the existing F1c shared-store gate before checking cross-gateway
 idempotency and reads, remote cancellation, deadline expiry, a concurrent
-768 KiB submit and responsiveness probe, lease-fenced takeover after killing
-the active owner, and persistence plus new work after a PostgreSQL process
-restart. The registered live smoke entrypoint is
+768 KiB submit and responsiveness probe, fenced takeover after the active
+owner is scaled away (its shutdown releases the claim; a crashed owner's claim
+is reclaimed after lease expiry), and persistence plus new work after a
+PostgreSQL process restart. The registered live smoke entrypoint is
 `verification/fleet/resilience/async_request_gateway_smoke.py`. Use
 `--keep-cluster` only for inspection; the default collects the
 report, claim audit, Kubernetes state/events, and service logs before bounded

@@ -11,8 +11,10 @@ exact Runner-side startup proof before readiness. D3.4 adds the library-side
 CREATE admission and linearizable claim contract for incremental per-Pod
 placement. D3.5 adds bounded-batch released-placement compaction into durable
 per-placement fencing high-water marks. D3.6 adds the shared PostgreSQL plan and
-claim store required by a replicated admission service. Scheduling compaction and
-production AdmissionReview/webhook wiring remain deployment tasks.
+claim store required by a replicated admission service. D3.7 adds the strict
+Kubernetes AdmissionReview v1 HTTP boundary and deterministic JSON Patch
+mutation. Scheduling compaction, executable webhook runtime configuration, and
+Kubernetes deployment wiring remain deployment tasks.
 
 ## Purpose
 
@@ -405,6 +407,24 @@ replaced or corrupted PostgreSQL namespace. The initial implementation uses one
 coarse lock per admission store, prioritizing cross-replica correctness over
 parallel target throughput.
 
+The D3.7 HTTP boundary accepts only strict `admission.k8s.io/v1` JSON for a
+core/v1 Pod CREATE at `/v1/admit`. It binds the response UID to the request,
+checks the request and embedded Pod name/namespace identities, rejects
+subresources, `oldObject`, and side-effectful dry runs, and supplies a
+server-owned UTC observation time to D3.4. A successful decision is encoded as
+a deterministic RFC 6902 JSON Patch; an exact replay omits empty patch fields.
+Semantic denials remain HTTP 200 AdmissionReview responses, while malformed
+JSON, unsupported media, oversized bodies, and local overload fail at the HTTP
+boundary. Conflict, authorization, scheduling, and backend details are reduced
+to bounded public messages. The service exposes only low-disclosure `/health`
+and `/readyz` probes and bounds both request size and in-process concurrency.
+
+The AdmissionReview `userInfo` is trustworthy only when the endpoint is
+reachable exclusively through the Kubernetes API-server webhook path. D3.7
+does not make that wire object a client-authentication mechanism. The deployed
+Service therefore requires TLS trust, ingress restriction (NetworkPolicy and,
+where available, authenticated mTLS), and a fail-closed webhook policy.
+
 ## Deployment boundary
 
 `private-ai-cloud-iac` must still provide:
@@ -416,9 +436,11 @@ parallel target throughput.
 - reconciliation that replays desired ensure/release commands after restart;
 - a scheduled caller for the implemented bounded compaction contract, with a
   documented retirement cutoff and monitoring of per-placement high-water rows;
-- a highly available mutating admission webhook using the implemented shared
-  D3.6 store, orchestration that registers the plan before the D3.2 scale write,
-  and fail-closed webhook policy;
+- an executable webhook runtime that joins the implemented D3.7 HTTP transport
+  to the D3.6 store and binding reauthorization, plus a highly available
+  Deployment/Service/MutatingWebhookConfiguration, TLS trust, ingress
+  restriction, orchestration that registers the plan before the D3.2 scale
+  write, and fail-closed webhook policy;
 - metrics and audit export for command latency, bytes, attempts, failures, and
   pin reconciliation; and
 - live node-pool acceptance with real S3, NVMe, Kueue, and Runner startup.
@@ -449,3 +471,7 @@ Real PostgreSQL admission tests cover cross-instance plan visibility, concurrent
 unique claims, same-name retry protection, safe creator rollback, target
 capacity, replay-window plan rotation, fixed configuration, validate-only
 startup, and plan/claim projection corruption.
+AdmissionReview tests cover strict v1 envelope parsing, request/Pod identity,
+UID-bound allow and deny responses, deterministic patch application, exact
+replay, dry-run/subresource rejection, request-size bounds, readiness, and
+failure-detail redaction.

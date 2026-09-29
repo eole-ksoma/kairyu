@@ -13,8 +13,10 @@ placement. D3.5 adds bounded-batch released-placement compaction into durable
 per-placement fencing high-water marks. D3.6 adds the shared PostgreSQL plan and
 claim store required by a replicated admission service. D3.7 adds the strict
 Kubernetes AdmissionReview v1 HTTP boundary and deterministic JSON Patch
-mutation. Scheduling compaction, executable webhook runtime configuration, and
-Kubernetes deployment wiring remain deployment tasks.
+mutation. D3.8 adds the executable TLS webhook runtime, shared-store assembly,
+and authenticated nonce-bound binding reauthorization client. Scheduling
+compaction, the scaling-authority endpoint, and Kubernetes deployment wiring
+remain deployment tasks.
 
 ## Purpose
 
@@ -425,6 +427,29 @@ does not make that wire object a client-authentication mechanism. The deployed
 Service therefore requires TLS trust, ingress restriction (NetworkPolicy and,
 where available, authenticated mTLS), and a fail-closed webhook policy.
 
+D3.8 exposes the runtime as `kairyu placement-admission serve <config>`. The
+versioned JSON config supplies only absolute secret/certificate paths and
+bounded process settings; the PostgreSQL DSN and binding-authority bearer token
+are loaded separately from regular files. Secret files reject group write or
+execute and every other-user permission while allowing owner access and an
+optional group read for Kubernetes `fsGroup`; deployments must mount them with
+mode `0640` or stricter. The process validates these permissions from the open
+file descriptor, serves one Uvicorn worker with the configured certificate/key,
+opens the D3.6 store, and requires both PostgreSQL and the authority to pass
+readiness before serving.
+
+Final binding reauthorization is an authenticated HTTPS POST to the configured
+scaling-authority HTTPS origin; no plaintext opt-in exists. The request includes
+the complete candidate binding and a fresh 256-bit nonce. Both serialized
+request and response are independently size-bounded before network send or
+JSON validation, and the strict response must echo that nonce and return a
+complete binding. D3.4 then requires the returned binding to be
+byte-equivalent to the plan. Redirect following, environment proxy inheritance,
+duplicate keys, non-finite numbers, cross-origin readiness, unbounded response
+bodies, and cached responses are rejected. The authority readiness endpoint
+must return an empty HTTP 204 response. The bearer token authenticates this
+internal client; it does not replace API-server-to-webhook TLS and NetworkPolicy.
+
 ## Deployment boundary
 
 `private-ai-cloud-iac` must still provide:
@@ -436,11 +461,11 @@ where available, authenticated mTLS), and a fail-closed webhook policy.
 - reconciliation that replays desired ensure/release commands after restart;
 - a scheduled caller for the implemented bounded compaction contract, with a
   documented retirement cutoff and monitoring of per-placement high-water rows;
-- an executable webhook runtime that joins the implemented D3.7 HTTP transport
-  to the D3.6 store and binding reauthorization, plus a highly available
-  Deployment/Service/MutatingWebhookConfiguration, TLS trust, ingress
-  restriction, orchestration that registers the plan before the D3.2 scale
-  write, and fail-closed webhook policy;
+- the scaling-authority reauthorization/readiness endpoint consumed by D3.8,
+  plus a highly available Deployment/Service/MutatingWebhookConfiguration, TLS
+  certificate issuance/rotation and trust, ingress restriction, orchestration
+  that registers the plan before the D3.2 scale write, and fail-closed webhook
+  policy;
 - metrics and audit export for command latency, bytes, attempts, failures, and
   pin reconciliation; and
 - live node-pool acceptance with real S3, NVMe, Kueue, and Runner startup.
@@ -475,3 +500,7 @@ AdmissionReview tests cover strict v1 envelope parsing, request/Pod identity,
 UID-bound allow and deny responses, deterministic patch application, exact
 replay, dry-run/subresource rejection, request-size bounds, readiness, and
 failure-detail redaction.
+Runtime tests cover strict bounded config/secrets, HTTPS/same-origin policy,
+nonce and full-binding request/response integrity, redirect/proxy suppression,
+response-size and non-finite-number rejection, TLS key permissions, dependency
+readiness, resource cleanup, end-to-end admission, and TLS CLI arguments.

@@ -14,6 +14,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from kairyu.deploy.builder import build_app_from_spec
 from kairyu.deploy.spec import load_deployment_spec
 from kairyu.dsl.loader import build_orchestrator, load_spec
 from kairyu.engine.openai_backend import OpenAICompatBackend
@@ -96,6 +97,28 @@ def _orchestrator(verdict: str, seen: list[dict]):
         }
     )
     return build_orchestrator(spec, engine_refs=engines)
+
+
+def test_gateway_builds_from_the_example_configs(tmp_path: Path, monkeypatch) -> None:
+    # The gateway once crash-looped at startup on this config (a pool model
+    # without a supported chat policy), which the loader alone accepted.
+    monkeypatch.setenv("KAIRYU_RESPONSES_COMPACTION_SECRET", "0" * 64)
+    spec_path = tmp_path / "auto-max.yaml"
+    spec_path.write_text(
+        (EXAMPLE / "auto-max.yaml")
+        .read_text()
+        .replace("/etc/kairyu/router.json", str(EXAMPLE / "router.json"))
+    )
+    raw = (EXAMPLE / "kairyu.yaml").read_text().replace(
+        "/etc/kairyu/auto-max.yaml", str(spec_path)
+    )
+    deployment = load_deployment_spec(raw, resolve_credentials=False)
+    # The embedding bundle exists only inside the Kairyu image.
+    deployment = deployment.model_copy(
+        update={"embeddings": {}, "public_models": ["kairyu-auto-max"]}
+    )
+
+    build_app_from_spec(deployment, EXAMPLE)
 
 
 def _image_call() -> OrchestrationRequest:

@@ -758,7 +758,12 @@ def rendering_errors(render: Callable[..., str]) -> list[str]:
     if not default.endswith("<｜Assistant｜><think>") or "Reasoning Effort: 75 " not in default:
         errors.append(f"default is not thinking high: {default[-160:]!r}")
     for effort, budget in budgets.items():
-        prompt = render(messages=user, reasoning_effort=effort)
+        # /tokenize has no top-level reasoning_effort; these are the template
+        # arguments vLLM's chat completion derives from it.
+        prompt = render(
+            messages=user,
+            chat_template_kwargs={"reasoning_effort": effort, "enable_thinking": True},
+        )
         if f"Reasoning Effort: {budget} " not in prompt:
             errors.append(f"reasoning_effort {effort} does not render budget {budget}")
     chat = render(messages=user, chat_template_kwargs={"enable_thinking": False})

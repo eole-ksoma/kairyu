@@ -120,4 +120,4 @@ orchestrators:
 # remain deployment-owned runtime resources and are not public model IDs.
 public_models: [kairyu-auto-max, embed-small]
 
-legacy_chat_models: [qwen3.8-27b]
+legacy_chat_models: [qwen3.8-27b, deepseek-v4.1-flash]

@@ -259,6 +259,15 @@ from kairyu.runners.startup_binding_authority import (
 from kairyu.runners.startup_binding_authority_api import (
     create_runner_cache_placement_binding_authority_app,
 )
+from kairyu.runners.startup_binding_authority_production import (
+    RunnerAuthorityKubernetesConfig,
+    RunnerAuthorityNodeEvidenceConfig,
+    RunnerAuthorityPostgresConfig,
+    RunnerCachePlacementBindingProductionRuntime,
+    RunnerCachePlacementBindingProductionRuntimeConfig,
+    build_runner_cache_placement_binding_production_runtime,
+    load_runner_cache_placement_binding_production_runtime_config,
+)
 from kairyu.runners.startup_binding_authority_reconciler import (
     AUTHORITY_API_VERSION,
     AUTHORITY_HOLDER_ID_ANNOTATION,
@@ -455,6 +464,8 @@ __all__ = [
     "RunnerCachePlacementBindingAuthorityReadiness",
     "RunnerCachePlacementBindingAuthorityRuntime",
     "RunnerCachePlacementBindingAuthorityRuntimeConfig",
+    "RunnerCachePlacementBindingProductionRuntime",
+    "RunnerCachePlacementBindingProductionRuntimeConfig",
     "RunnerCachePlacementBindingAuthorizationDeniedError",
     "RunnerCachePlacementBindingAuthorizationError",
     "RunnerCachePlacementBindingAuthorizationRequest",
@@ -477,11 +488,16 @@ __all__ = [
     "RunnerCachePlacementBindingDecisionReader",
     "RunnerCachePlacementBindingQuotaReader",
     "RunnerCachePlacementBindingTargetReader",
+    "RunnerAuthorityKubernetesConfig",
+    "RunnerAuthorityNodeEvidenceConfig",
+    "RunnerAuthorityPostgresConfig",
     "create_runner_cache_placement_binding_authority_app",
+    "build_runner_cache_placement_binding_production_runtime",
     "build_runner_cache_placement_binding_authority_runtime",
     "build_runner_cache_placement_admission_runtime",
     "load_runner_cache_placement_admission_runtime_config",
     "load_runner_cache_placement_binding_authority_runtime_config",
+    "load_runner_cache_placement_binding_production_runtime_config",
     "RUNNER_CACHE_STARTUP_BINDING_ANNOTATION",
     "RUNNER_CACHE_STARTUP_BINDING_ID_ANNOTATION",
     "RUNNER_CACHE_STARTUP_BINDING_LABEL",

@@ -175,6 +175,26 @@ def test_worker_retries_backend_failures_then_becomes_ready() -> None:
     assert not runtime.status().ready
 
 
+def test_controller_allows_same_thread_nested_reauthorization() -> None:
+    runtime = RunnerLeaderElectionRuntime(
+        store=InMemoryRunnerLeaderLeaseStore(clock=lambda: NOW),
+        config=_config(),
+        clock=lambda: NOW,
+    )
+    runtime.start()
+    _wait_until(lambda: runtime.status().ready)
+    try:
+        authority = runtime.controller.mutate_autoscaler(
+            lambda initial: runtime.controller.mutate_autoscaler(
+                lambda refreshed: (initial, refreshed)
+            )
+        )
+        assert authority[0].tenure == authority[1].tenure
+        assert runtime.status().active_mutations == 0
+    finally:
+        runtime.close()
+
+
 def test_follower_stays_unready_and_can_take_over_after_release() -> None:
     store = InMemoryRunnerLeaderLeaseStore(clock=lambda: NOW)
     incumbent = RunnerLeaderElector(

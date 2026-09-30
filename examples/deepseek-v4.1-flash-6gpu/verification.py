@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GPU verification for DeepSeek-V4.1-Flash on six GPUs (TP2 x DP3 / EP6).
+"""GPU verification for DeepSeek-V4.1-Flash on six GPUs (DP6 / EP6).
 
 ``l1`` is the correctness gate every L1 candidate must pass before it is
 measured: rendered efforts, exact finite answers from all three DP ranks,
@@ -186,7 +186,8 @@ def _startup_evidence() -> dict:
         "kv_cache_tokens": r"GPU KV cache size: ([0-9,]+) tokens",
         "max_concurrency": r"Maximum concurrency for [0-9,]+ tokens per request: ([0-9.]+)x",
         "sampling_defaults": (
-            r"(Using default chat sampling params[^\n]*|Default sampling parameters[^\n]*)"
+            r"(Default vLLM sampling parameters have been overridden[^\n]*"
+            r"|Using default chat sampling params[^\n]*)"
         ),
     }
     return {name: re.findall(pattern, text) for name, pattern in patterns.items()}
@@ -226,15 +227,23 @@ def l1(run_dir: Path) -> int:
 
     probes = int(SPEC["verification"]["l1"]["probes_per_variant"])
     for variant in SPEC["verification"]["l1"]["variants"]:
-        before = engine_success_counts(l1_call("GET", "/metrics")[1])
-        with concurrent.futures.ThreadPoolExecutor(max_workers=probes) as pool:
-            results = list(pool.map(_l1_probe, [variant] * probes))
-        after = engine_success_counts(l1_call("GET", "/metrics")[1])
+        # vLLM's DP balancer decides placement, so a round may miss a rank.
+        # Send further rounds (at most four) until every rank has answered;
+        # every answer of every round must be correct.
+        results: list[dict] = []
+        engines: set[str] = set()
+        for _ in range(4):
+            before = engine_success_counts(l1_call("GET", "/metrics")[1])
+            with concurrent.futures.ThreadPoolExecutor(max_workers=probes) as pool:
+                results += list(pool.map(_l1_probe, [variant] * probes))
+            after = engine_success_counts(l1_call("GET", "/metrics")[1])
+            engines |= served_engines(before, after)
+            if len(engines) == DP_RANKS:
+                break
         errors = [row["error"] for row in results if row["error"]]
-        engines = served_engines(before, after)
-        detail = {"engines": sorted(engines), "errors": errors[:3]}
+        detail = {"engines": sorted(engines), "requests": len(results), "errors": errors[:3]}
         (run_dir / f"probes-{variant}.json").write_text(json.dumps(results, indent=2) + "\n")
-        error = f"{len(errors)}/{probes} probes failed" if errors else None
+        error = f"{len(errors)}/{len(results)} probes failed" if errors else None
         if error is None and len(engines) != DP_RANKS:
             error = f"only engines {sorted(engines)} served; expected {DP_RANKS} DP ranks"
         record(f"probes_{variant}", error, detail)
@@ -604,6 +613,72 @@ def vision(run_dir: Path) -> int:
     (run_dir / "vision.json").write_text(json.dumps(report, indent=2) + "\n")
     print(f"vision: {'PASS' if not errors else 'FAIL'} {answers}")
     return int(bool(errors))
+
+
+def _noise_png(seed: int, side: int = 1024) -> str:
+    """A deterministic RGB noise PNG (no compressible structure) as base64."""
+    import base64
+    import random
+    import struct
+    import zlib
+
+    rng = random.Random(seed)
+    raw = b"".join(b"\x00" + rng.randbytes(side * 3) for _ in range(side))
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        body = kind + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body))
+
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", side, side, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(raw, 1))
+        + chunk(b"IEND", b"")
+    )
+    return base64.b64encode(png).decode()
+
+
+def image_ttft(run_dir: Path, *, images: int = 8, trials: int = 5) -> dict:
+    """Multi-image time to first model output (the ViT runs before prefill)."""
+    rows = []
+    for trial in range(trials):
+        content = [
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{_noise_png(trial * 100 + i)}"},
+            }
+            for i in range(images)
+        ]
+        content.append({"type": "text", "text": f"Trial {trial}: how many images are there?"})
+        start = time.monotonic()
+        request = urllib.request.Request(
+            f"{_api_url()}/v1/chat/completions",
+            data=json.dumps(
+                {
+                    "model": SERVED_MODEL,
+                    "stream": True,
+                    "max_tokens": 16,
+                    "messages": [{"role": "user", "content": content}],
+                }
+            ).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        first = None
+        with urllib.request.urlopen(request, timeout=1800) as response:
+            for line in response:
+                if line.startswith(b"data: ") and line[6:].strip() != b"[DONE]":
+                    delta = (json.loads(line[6:]).get("choices") or [{}])[0].get("delta", {})
+                    if first is None and (delta.get("content") or delta.get("reasoning_content")):
+                        first = time.monotonic() - start
+        rows.append({"trial": trial, "ttft_s": first})
+    values = sorted(row["ttft_s"] for row in rows if row["ttft_s"] is not None)
+    report = {
+        "images": images,
+        "trials": rows,
+        "p50_s": values[len(values) // 2] if values else None,
+    }
+    (run_dir / "image-ttft.json").write_text(json.dumps(report, indent=2) + "\n")
+    return report
 
 
 def _stream(payload: dict, *, timeout_s: float = 1800) -> dict:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-command lifecycle for DeepSeek-V4.1-Flash as one TP2 x DP3 / EP6 replica on six GPUs."""
+"""One-command lifecycle for DeepSeek-V4.1-Flash as one DP6 / EP6 replica on six GPUs."""
 
 from __future__ import annotations
 
@@ -256,7 +256,7 @@ def _preflight(env: dict[str, str]) -> None:
     layout = dp_rank_numa_layout(nodes, DP_RANK_GPU_IDS)
     env["DEEPSEEK_CPUSET"] = ",".join(_node_cpulist(node) for node in dict.fromkeys(layout))
     ranks = "; ".join(
-        f"DP{rank}=GPUs {group[0]},{group[1]} (NUMA {layout[rank]})"
+        f"DP{rank}=GPU {','.join(map(str, group))} (NUMA {layout[rank]})"
         for rank, group in enumerate(DP_RANK_GPU_IDS)
     )
     print(f"hardware: {len(GPU_IDS)} x {expected['product']}; {ranks}", flush=True)
@@ -744,7 +744,7 @@ def up() -> None:
     print(f"Chat UI:    http://{ui_host}:{env['CHAT_UI_PORT']} (no authentication)")
     print(
         f"Chat model: {SPEC['model']['served_name']} "
-        "(one TP2 x DP3 / EP6 replica on GPUs 0-5; text + image input; thinking high)"
+        "(one DP6 / EP6 replica on GPUs 0-5; text + image input; thinking high)"
     )
     print(
         "Reasoning effort: Chat Controls -> Valves -> Reasoning Effort "

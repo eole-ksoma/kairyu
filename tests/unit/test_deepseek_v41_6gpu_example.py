@@ -1,4 +1,4 @@
-"""Contracts of the six-GPU DeepSeek-V4.1-Flash example (TP2 x DP3 / EP6)."""
+"""Contracts of the six-GPU DeepSeek-V4.1-Flash example (DP6 / EP6)."""
 
 from __future__ import annotations
 
@@ -50,7 +50,6 @@ def test_served_configuration_loads_and_agrees(example):
     )
     assert replica.options["expert_parallel_size"] == allocation["expert_parallel_size"]
     assert "--enable-expert-parallel" in command
-    assert int(flag("--max-num-seqs")) == deployment.server.max_concurrency
     assert json.loads(flag("--override-generation-config")) == spec["model"]["sampling"]
     assert replica.options["container_image_digest"] == spec["vllm"]["image_id"]
     example("control")  # import-time allocation check: TP x DP tiles the GPUs

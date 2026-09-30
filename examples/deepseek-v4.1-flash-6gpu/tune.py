@@ -28,6 +28,9 @@ SPARSE_ATTENTION = '{"backend":"FLASHINFER_MLA_SPARSE_DSV41","indexer_kv_dtype":
 # Flag -> value (None removes the flag, True adds a bare flag).
 CANDIDATES: dict[str, dict[str, object]] = {
     "baseline": {},
+    # The committed command after a fresh restart: run-to-run variation of a
+    # single trial, measured the same way as every other candidate.
+    "baseline-repeat": {},
     # Official memory-bound (8 x H100) levers.
     "batch-8k": {"--max-num-batched-tokens": "8192"},
     "batch-4k": {"--max-num-batched-tokens": "4096"},
@@ -56,8 +59,25 @@ CANDIDATES: dict[str, dict[str, object]] = {
         "--moe-backend": None,
         "--engram-config": '{"embedding_across_dp":true}',
     },
-    # DEP6 with this example's SM120 backends and Engram offload.
-    "dep6": {"--tensor-parallel-size": "1", "--data-parallel-size": "6"},
+    # The official Blackwell TP degree: TP2 pairs on NUMA-local GPUs, DP3.
+    "tp2-dp3": {"--tensor-parallel-size": "2", "--data-parallel-size": "3"},
+    # Official NVIDIA DSpark (5-token block, adaptive verification on), and the
+    # same block verified in full. The drafter's 128 experts do not divide EP6;
+    # the fused-MoE path distributes the remainder (only mega MoE asserts it).
+    "dspark": {
+        "--speculative-config": (
+            '{"method":"dspark","num_speculative_tokens":5,'
+            '"draft_sample_method":"probabilistic","rejection_sample_method":"block",'
+            '"enable_adaptive_verification":true}'
+        )
+    },
+    "dspark-full-verify": {
+        "--speculative-config": (
+            '{"method":"dspark","num_speculative_tokens":5,'
+            '"draft_sample_method":"probabilistic","rejection_sample_method":"block",'
+            '"enable_adaptive_verification":false}'
+        )
+    },
 }
 CANDIDATE_ENVIRONMENT = {"v2-runner": {"VLLM_USE_V2_MODEL_RUNNER": "1"}}
 BARE_FLAGS = {"--enable-expert-parallel", "--enable-prefix-caching", "--trust-remote-code"}
@@ -111,6 +131,7 @@ def main() -> None:
     parser.add_argument("--requests", type=int, default=32)
     parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 8, 32])
     parser.add_argument("--startup-timeout", type=int, default=5400)
+    parser.add_argument("--image-ttft", action="store_true", help="also time 8-image prompts")
     args = parser.parse_args()
     if args.requests < max(args.concurrency):
         parser.error("requests must cover every concurrency")
@@ -153,6 +174,8 @@ def main() -> None:
                 control.validate_tool_calling(api)
                 control.validate_vision(api)
                 report["startup"] = verification._startup_evidence()
+                if args.image_ttft:
+                    report["image_ttft"] = verification.image_ttft(row_dir)
                 for level in args.concurrency:
                     dataset = row_dir / f"c{level}.json"
                     verification.fixed_dataset(

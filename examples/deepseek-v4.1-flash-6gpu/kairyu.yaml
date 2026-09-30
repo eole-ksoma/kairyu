@@ -34,11 +34,11 @@ pools:
         cache_descriptor:
           family: deepseek-v41-swa-csa-engram
           block_size: 64
-        tensor_parallel_size: 2
+        tensor_parallel_size: 1
         expert_parallel_size: 6
-        attention_data_parallel_size: 3
+        attention_data_parallel_size: 6
         dspark_enabled: false
-        container_image_digest: PENDING
+        container_image_digest: sha256:0a209afd6593376cb9d6d0b670ade745ce69e6ebd558f140696f249ed612ba77
     unhealthy_after: 1
     queue_depth_threshold: 0
     prefix_index: true

@@ -6,6 +6,8 @@ import hashlib
 import json
 import math
 import threading
+import time
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta
 from types import TracebackType
 from typing import Literal, Self
@@ -27,6 +29,7 @@ except ModuleNotFoundError:  # pragma: no cover - core-only installation.
 _SCHEMA_VERSION = 1
 _SCHEMA_NAME = "public"
 _SCHEMA_LOCK = (1_261_587_810, 10)
+_MAX_POSTGRES_TIMEOUT_MS = 2_147_483_647
 _EXPECTED_COLUMNS = {
     "runner_cache_placement_admission_store_registry": (
         ("store_id", "text", True),
@@ -138,11 +141,7 @@ _SCHEMA_STATEMENTS = (
 def _timedelta_microseconds(value: timedelta) -> int:
     if not isinstance(value, timedelta) or value <= timedelta(0):
         raise ValueError("replay_safety_window must be positive")
-    microseconds = (
-        value.days * 86_400_000_000
-        + value.seconds * 1_000_000
-        + value.microseconds
-    )
+    microseconds = value.days * 86_400_000_000 + value.seconds * 1_000_000 + value.microseconds
     if microseconds > 9_223_372_036_854_775_807:
         raise ValueError("replay_safety_window exceeds PostgreSQL BIGINT capacity")
     return microseconds
@@ -157,6 +156,88 @@ def _plan_digest(plan: RunnerCachePlacementAdmissionPlan) -> str:
         allow_nan=False,
     ).encode()
     return hashlib.sha256(payload).hexdigest()
+
+
+def _timeout_seconds(value: float, *, name: str = "timeout_s") -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{name} must be a number")
+    timeout = float(value)
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError(f"{name} must be finite and greater than zero")
+    if math.ceil(timeout * 1000) > _MAX_POSTGRES_TIMEOUT_MS:
+        raise ValueError(f"{name} exceeds the PostgreSQL timeout limit")
+    return timeout
+
+
+def _remaining_timeout(started_at: float, timeout_s: float) -> float:
+    remaining = timeout_s - (time.monotonic() - started_at)
+    if remaining <= 0:
+        raise TimeoutError("Runner cache placement admission PostgreSQL read timed out")
+    return remaining
+
+
+def _set_local_timeout(cursor, timeout_s: float) -> None:
+    timeout_ms = max(1, math.ceil(timeout_s * 1000))
+    value = f"{timeout_ms}ms"
+    cursor.execute(
+        "SELECT set_config('statement_timeout', %s, true), set_config('lock_timeout', %s, true)",
+        (value, value),
+    )
+    cursor.fetchone()
+
+
+class _DeadlineCursor:
+    def __init__(self, cursor, *, started_at: float, timeout_s: float) -> None:
+        self._cursor = cursor
+        self._started_at = started_at
+        self._timeout_s = timeout_s
+
+    def execute(self, query, params=None):
+        _set_local_timeout(
+            self._cursor,
+            _remaining_timeout(self._started_at, self._timeout_s),
+        )
+        if params is None:
+            return self._cursor.execute(query)
+        return self._cursor.execute(query, params)
+
+    def __getattr__(self, name: str):
+        return getattr(self._cursor, name)
+
+
+@contextmanager
+def _deadline_lock(lock, *, started_at: float, timeout_s: float):
+    if not lock.acquire(timeout=_remaining_timeout(started_at, timeout_s)):
+        raise TimeoutError("Runner cache placement admission PostgreSQL lock budget expired")
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+@contextmanager
+def _cancel_connection_at_deadline(
+    connection,
+    *,
+    started_at: float,
+    timeout_s: float,
+):
+    def cancel() -> None:
+        try:
+            connection.cancel_safe(timeout=0.1)
+        except BaseException:
+            # Server timeouts and TCP keepalives remain the fallback if the
+            # auxiliary PostgreSQL cancellation connection cannot be made.
+            pass
+
+    timer = threading.Timer(_remaining_timeout(started_at, timeout_s), cancel)
+    timer.daemon = True
+    timer.start()
+    try:
+        yield
+    finally:
+        timer.cancel()
+        timer.join()
 
 
 class PostgresRunnerCachePlacementAdmissionStore:
@@ -184,9 +265,7 @@ class PostgresRunnerCachePlacementAdmissionStore:
         if type(max_targets) is not int or not 1 <= max_targets <= 100_000:
             raise ValueError("max_targets must be an integer in [1, 100000]")
         replay_window_us = _timedelta_microseconds(replay_safety_window)
-        if isinstance(connect_timeout_s, bool) or not isinstance(
-            connect_timeout_s, (int, float)
-        ):
+        if isinstance(connect_timeout_s, bool) or not isinstance(connect_timeout_s, (int, float)):
             raise ValueError("connect_timeout_s must be a number")
         timeout = float(connect_timeout_s)
         if not math.isfinite(timeout) or timeout <= 0:
@@ -208,23 +287,29 @@ class PostgresRunnerCachePlacementAdmissionStore:
     def store_id(self) -> str:
         return self._store_id
 
+    @property
+    def connect_timeout_s(self) -> int:
+        """Return the hard libpq reconnect timeout used by this store."""
+
+        return self._connect_timeout
+
     def _connect(self):
         assert psycopg is not None
+        connect_timeout = self._connect_timeout
         timeout_ms = self._connect_timeout * 1000
         parameters = psycopg.conninfo.conninfo_to_dict(self._dsn)
         configured_options = parameters.pop("options", "")
         options = (
-            f"{configured_options} -c statement_timeout={timeout_ms} "
-            f"-c lock_timeout={timeout_ms}"
+            f"{configured_options} -c statement_timeout={timeout_ms} -c lock_timeout={timeout_ms}"
         ).strip()
         return psycopg.connect(
             psycopg.conninfo.make_conninfo(**parameters),
             autocommit=True,
-            connect_timeout=self._connect_timeout,
+            connect_timeout=connect_timeout,
             options=options,
             keepalives=1,
-            keepalives_idle=self._connect_timeout,
-            keepalives_interval=self._connect_timeout,
+            keepalives_idle=connect_timeout,
+            keepalives_interval=connect_timeout,
             keepalives_count=1,
         )
 
@@ -232,13 +317,17 @@ class PostgresRunnerCachePlacementAdmissionStore:
         if self._closed:
             raise RuntimeError("PostgresRunnerCachePlacementAdmissionStore is closed")
         if not allow_unstarted and self._connection is None:
-            raise RuntimeError(
-                "PostgresRunnerCachePlacementAdmissionStore has not started"
-            )
+            raise RuntimeError("PostgresRunnerCachePlacementAdmissionStore has not started")
 
-    def _ensure_connection(self) -> None:
+    def _ensure_connection(
+        self,
+        *,
+        allow_reconnect: bool = True,
+    ) -> None:
         assert self._connection is not None
         if self._connection.closed or self._connection.broken:
+            if not allow_reconnect:
+                raise TimeoutError("timed Runner cache placement admission reads do not reconnect")
             self._connection.close()
             self._connection = self._connect()
             try:
@@ -324,19 +413,23 @@ class PostgresRunnerCachePlacementAdmissionStore:
             with self._connection.cursor() as cursor:
                 cursor.execute("SET LOCAL search_path = public")
                 namespace_oid = self._validate_schema_objects_cursor(cursor)
-                if (
-                    expected_namespace_oid is not None
-                    and namespace_oid != expected_namespace_oid
-                ):
+                if expected_namespace_oid is not None and namespace_oid != expected_namespace_oid:
                     raise RuntimeError(
-                        "Runner cache placement admission PostgreSQL namespace "
-                        "identity changed"
+                        "Runner cache placement admission PostgreSQL namespace identity changed"
                     )
                 self._validate_registry_cursor(cursor)
                 return namespace_oid
 
-    def _validate_registry_cursor(self, cursor, *, for_update: bool = False) -> None:
-        lock = " FOR UPDATE" if for_update else ""
+    def _validate_registry_cursor(
+        self,
+        cursor,
+        *,
+        for_update: bool = False,
+        for_key_share: bool = False,
+    ) -> None:
+        if for_update and for_key_share:
+            raise ValueError("registry lock modes are mutually exclusive")
+        lock = " FOR UPDATE" if for_update else " FOR KEY SHARE" if for_key_share else ""
         cursor.execute(
             """
             SELECT schema_version, max_targets, replay_safety_window_us
@@ -348,9 +441,7 @@ class PostgresRunnerCachePlacementAdmissionStore:
         )
         row = cursor.fetchone()
         if row is None:
-            raise RuntimeError(
-                f"unknown Runner cache placement admission store {self._store_id!r}"
-            )
+            raise RuntimeError(f"unknown Runner cache placement admission store {self._store_id!r}")
         expected = (
             _SCHEMA_VERSION,
             self._max_targets,
@@ -387,9 +478,7 @@ class PostgresRunnerCachePlacementAdmissionStore:
         )
         objects = cursor.fetchone()
         if objects is None:
-            raise RuntimeError(
-                "Runner cache placement admission schema is missing required tables"
-            )
+            raise RuntimeError("Runner cache placement admission schema is missing required tables")
         (
             registry_oid,
             plans_oid,
@@ -412,8 +501,7 @@ class PostgresRunnerCachePlacementAdmissionStore:
             )
         if kinds != ["r", "r", "r", "p", "p", "p"]:
             raise RuntimeError(
-                "Runner cache placement admission schema objects must be permanent "
-                "ordinary tables"
+                "Runner cache placement admission schema objects must be permanent ordinary tables"
             )
         for table_name, table_oid in (
             ("runner_cache_placement_admission_store_registry", registry_oid),
@@ -562,15 +650,12 @@ class PostgresRunnerCachePlacementAdmissionStore:
             )
         if claim.placement_id not in placement_ids:
             raise RuntimeError(
-                "stored Runner cache placement admission claim references an unknown "
-                "placement"
+                "stored Runner cache placement admission claim references an unknown placement"
             )
 
     @staticmethod
     def _plan_columns() -> str:
-        return (
-            "target_id, binding_id, plan_digest, valid_until, registered_at, plan"
-        )
+        return "target_id, binding_id, plan_digest, valid_until, registered_at, plan"
 
     @staticmethod
     def _database_now_cursor(cursor) -> datetime:
@@ -615,19 +700,13 @@ class PostgresRunnerCachePlacementAdmissionStore:
                     ):
                         if previous != plan:
                             raise RunnerCachePlacementAdmissionConflictError(
-                                "binding ID is already registered with different plan "
-                                "evidence"
+                                "binding ID is already registered with different plan evidence"
                             )
                         return
                     database_now = self._database_now_cursor(cursor)
-                    if not (
-                        plan.binding.bound_at
-                        <= database_now
-                        < plan.binding.valid_until
-                    ):
+                    if not (plan.binding.bound_at <= database_now < plan.binding.valid_until):
                         raise RunnerCachePlacementAdmissionConflictError(
-                            "cache placement admission binding is not live at the "
-                            "database clock"
+                            "cache placement admission binding is not live at the database clock"
                         )
                     cursor.execute(
                         """
@@ -642,21 +721,16 @@ class PostgresRunnerCachePlacementAdmissionStore:
                     prior_claim_count = count_row[0]
                     if previous is not None:
                         database_elapsed = database_now - previous.binding.valid_until
-                        registered_elapsed = (
-                            plan.registered_at - previous.binding.valid_until
-                        )
+                        registered_elapsed = plan.registered_at - previous.binding.valid_until
                         required_elapsed = (
-                            self._replay_safety_window
-                            if prior_claim_count
-                            else timedelta(0)
+                            self._replay_safety_window if prior_claim_count else timedelta(0)
                         )
                         if (
                             database_elapsed < required_elapsed
                             or registered_elapsed < required_elapsed
                         ):
                             raise RunnerCachePlacementAdmissionConflictError(
-                                "admission plan cannot be replaced before its replay "
-                                "safety window"
+                                "admission plan cannot be replaced before its replay safety window"
                             )
                     else:
                         cursor.execute(
@@ -705,15 +779,45 @@ class PostgresRunnerCachePlacementAdmissionStore:
                         ),
                     )
 
-    def resolve(self, target_id: str) -> RunnerCachePlacementAdmissionPlan:
+    def _resolve(
+        self,
+        target_id: str,
+        *,
+        timeout_s: float | None,
+    ) -> RunnerCachePlacementAdmissionPlan:
         target_id = _text(target_id, name="target_id")
-        with self._lock:
+        started_at = time.monotonic()
+        lock_context = (
+            _deadline_lock(
+                self._lock,
+                started_at=started_at,
+                timeout_s=timeout_s,
+            )
+            if timeout_s is not None
+            else self._lock
+        )
+        with lock_context:
             self._require_open()
-            self._ensure_connection()
+            self._ensure_connection(allow_reconnect=timeout_s is None)
             assert self._connection is not None
-            with self._connection.transaction():
+            cancellation = (
+                _cancel_connection_at_deadline(
+                    self._connection,
+                    started_at=started_at,
+                    timeout_s=timeout_s,
+                )
+                if timeout_s is not None
+                else nullcontext()
+            )
+            with cancellation, self._connection.transaction():
                 with self._connection.cursor() as cursor:
-                    self._validate_registry_cursor(cursor)
+                    if timeout_s is not None:
+                        cursor = _DeadlineCursor(
+                            cursor,
+                            started_at=started_at,
+                            timeout_s=timeout_s,
+                        )
+                    self._validate_registry_cursor(cursor, for_key_share=True)
                     cursor.execute(
                         f"""
                         SELECT {self._plan_columns()}
@@ -730,6 +834,22 @@ class PostgresRunnerCachePlacementAdmissionStore:
                     return RunnerCachePlacementAdmissionPlan.model_validate(
                         self._plan(row).model_dump()
                     )
+
+    def resolve(self, target_id: str) -> RunnerCachePlacementAdmissionPlan:
+        return self._resolve(target_id, timeout_s=None)
+
+    def resolve_with_timeout(
+        self,
+        target_id: str,
+        *,
+        timeout_s: float,
+    ) -> RunnerCachePlacementAdmissionPlan:
+        """Resolve one current plan under a caller-supplied backend budget."""
+
+        return self._resolve(
+            target_id,
+            timeout_s=_timeout_seconds(timeout_s),
+        )
 
     def claim(
         self,
@@ -768,14 +888,8 @@ class PostgresRunnerCachePlacementAdmissionStore:
                         )
                     database_now = self._database_now_cursor(cursor)
                     if not (
-                        plan.binding.bound_at
-                        <= database_now
-                        < plan.binding.valid_until
-                    ) or not (
-                        plan.binding.bound_at
-                        <= claimed_at
-                        < plan.binding.valid_until
-                    ):
+                        plan.binding.bound_at <= database_now < plan.binding.valid_until
+                    ) or not (plan.binding.bound_at <= claimed_at < plan.binding.valid_until):
                         raise RunnerCachePlacementAdmissionConflictError(
                             "cache placement admission binding is not live"
                         )
@@ -908,16 +1022,13 @@ class PostgresRunnerCachePlacementAdmissionStore:
                     )
                     plan_row = cursor.fetchone()
                     if plan_row is None:
-                        raise RuntimeError(
-                            "stored admission claim has no parent admission plan"
-                        )
+                        raise RuntimeError("stored admission claim has no parent admission plan")
                     plan = self._plan(plan_row)
                     self._validate_claim_binding(
                         current,
                         binding_id=plan.binding.binding_id,
                         placement_ids=frozenset(
-                            placement.placement_id
-                            for placement in plan.binding.placements
+                            placement.placement_id for placement in plan.binding.placements
                         ),
                     )
                     if current == claim and not protected:
@@ -938,3 +1049,37 @@ class PostgresRunnerCachePlacementAdmissionStore:
             with self._connection.transaction():
                 with self._connection.cursor() as cursor:
                     self._validate_registry_cursor(cursor)
+
+    def check_ready_with_timeout(self, *, timeout_s: float) -> None:
+        """Validate readiness under a caller-supplied backend budget."""
+
+        timeout_s = _timeout_seconds(timeout_s)
+        started_at = time.monotonic()
+        with _deadline_lock(
+            self._lock,
+            started_at=started_at,
+            timeout_s=timeout_s,
+        ):
+            self._require_open()
+            self._ensure_connection(allow_reconnect=False)
+            assert self._connection is not None
+            with (
+                _cancel_connection_at_deadline(
+                    self._connection,
+                    started_at=started_at,
+                    timeout_s=timeout_s,
+                ),
+                self._connection.transaction(),
+            ):
+                with self._connection.cursor() as cursor:
+                    deadline_cursor = _DeadlineCursor(
+                        cursor,
+                        started_at=started_at,
+                        timeout_s=timeout_s,
+                    )
+                    namespace_oid = self._validate_schema_objects_cursor(deadline_cursor)
+                    if namespace_oid != self._namespace_oid:
+                        raise RuntimeError(
+                            "Runner cache placement admission PostgreSQL namespace identity changed"
+                        )
+                    self._validate_registry_cursor(deadline_cursor)

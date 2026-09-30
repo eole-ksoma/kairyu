@@ -449,6 +449,7 @@ def test_postgres_integration_uses_one_local_reproducible_script() -> None:
     assert "--fail-on-skip" in script
     assert "-m postgres" in script
     assert "tests/unit/test_postgres_batch_store.py" in script
+    assert "tests/unit/test_postgres_runner_startup_admission.py" in script
     assert "tests/unit/test_postgres_request_store.py" in script
 
 

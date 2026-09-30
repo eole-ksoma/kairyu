@@ -84,10 +84,10 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 - AsyncRequest retention-expanded Kind evidence awaits registry access.
 - Runner autoscaling WP3.1–WP3.7 is fail-closed and CPU-tested; deployment wiring,
   durable runtime status, instrumentation, and live acceptance remain.
-- Model-cache WP4.1–WP4.7 and D3.1–D3.14 provide signed identity, verified cache,
+- Model-cache WP4.1–WP4.7 and D3.1–D3.15 provide signed identity, verified cache,
   fenced pre-stage/startup/admission, PostgreSQL authority, and TLS HTTP runtime.
-  PostgreSQL/Kubernetes/Kueue live readers, scheduled compaction, deployment,
-  and acceptance remain.
+  Kubernetes/Kueue live readers, scheduled compaction, deployment, and acceptance
+  remain.
 - Qwen3.8 MTP stays disabled pending vllm#53912; DTO-D15 verification/re-pin and
   human sign-off for M2–M4 remain pending.
 
@@ -95,6 +95,15 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
+
+### 2026-09-30 — [progress] Deadline-bounded PostgreSQL live readers
+- What: added the D3.15 current-binding and exact durable-decision adapter plus
+  transaction-local PostgreSQL statement/lock budgets and readiness reads.
+- Why: D3.12 must consume shared durable authority without treating missing
+  rows as generic outages or allowing database waits to ignore its deadline.
+- Refs: docs/design/node-model-cache-prestage-v1.md;
+  kairyu/runners/startup_binding_live_postgres.py;
+  tests/unit/test_runner_startup_binding_live_authority.py
 
 ### 2026-09-30 — [progress] Authenticated node-evidence aggregation
 - What: added the D3.14 strict HTTPS node-agent client and bounded controller

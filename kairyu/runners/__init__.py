@@ -269,6 +269,9 @@ from kairyu.runners.startup_binding_live_cache import (
     RunnerCachePlacementBindingInventory,
     RunnerCachePlacementBindingInventoryReader,
 )
+from kairyu.runners.startup_binding_live_postgres import (
+    PostgresRunnerCachePlacementBindingReader,
+)
 from kairyu.runners.startup_binding_live_source import (
     ComposedRunnerCachePlacementBindingLiveStateSource,
     RunnerCachePlacementBindingCacheReader,
@@ -299,6 +302,7 @@ __all__ = [
     "PostgresRunnerLeaderLeaseStore",
     "PostgresNodeModelPrestageStore",
     "PostgresRunnerCachePlacementAdmissionStore",
+    "PostgresRunnerCachePlacementBindingReader",
     "PostgresScalingDecisionLog",
     "InvalidRunnerStartupReportError",
     "InvalidRunnerTransitionError",

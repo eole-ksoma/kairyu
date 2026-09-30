@@ -51,9 +51,7 @@ def _binding(
             compatibility_approval_id="compat-qwen-h100",
             manifest_digest=_DIGEST,
             pin_owner=f"prestage/model-serving/qwen/placement-{index}-{suffix}",
-            prestage_command_id=hashlib.sha256(
-                f"command-{index}-{suffix}".encode()
-            ).hexdigest(),
+            prestage_command_id=hashlib.sha256(f"command-{index}-{suffix}".encode()).hexdigest(),
             prestage_command_generation=index + 1,
             hint_index_revision=10 + index,
             resident_record_generation=20 + index,
@@ -65,9 +63,7 @@ def _binding(
     payload = {
         "schema_version": "runner-cache-startup-binding-v1",
         "decision_id": f"decision-{suffix}",
-        "decision_fingerprint": hashlib.sha256(
-            f"decision-{suffix}".encode()
-        ).hexdigest(),
+        "decision_fingerprint": hashlib.sha256(f"decision-{suffix}".encode()).hexdigest(),
         "target_id": target_id,
         "target_revision": 7,
         "deployment_id": "model-serving/qwen",
@@ -312,6 +308,74 @@ def test_validate_only_startup_and_projection_corruption_fail_closed(
         )
     with pytest.raises(RuntimeError, match="metadata is inconsistent"):
         validate_only.resolve(_TARGET)
+
+
+def test_deadline_bounded_resolve_and_readiness(store_factory) -> None:
+    create, _store_id = store_factory
+    store = create()
+    plan = _plan(_binding())
+    store.register(plan)
+
+    assert store.connect_timeout_s == 10
+    assert store.resolve_with_timeout(_TARGET, timeout_s=0.5) == plan
+    assert store.check_ready_with_timeout(timeout_s=0.5) is None
+
+    namespace_oid = store._namespace_oid
+    assert namespace_oid is not None
+    store._namespace_oid = -1
+    with pytest.raises(RuntimeError, match="namespace identity changed"):
+        store.check_ready_with_timeout(timeout_s=0.5)
+    store._namespace_oid = namespace_oid
+
+    with pytest.raises(
+        RunnerCachePlacementAdmissionConflictError,
+        match="no active",
+    ):
+        store.resolve_with_timeout("deployment/model-serving/missing", timeout_s=0.5)
+    with pytest.raises(ValueError, match="greater than zero"):
+        store.resolve_with_timeout(_TARGET, timeout_s=0)
+
+    assert store._connection is not None
+    store._connection.close()
+    with pytest.raises(TimeoutError, match="do not reconnect"):
+        store.resolve_with_timeout(_TARGET, timeout_s=0.5)
+    assert store.check_ready() is None
+    assert store.resolve_with_timeout(_TARGET, timeout_s=2.0) == plan
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with store._lock:
+            blocked = pool.submit(
+                store.resolve_with_timeout,
+                _TARGET,
+                timeout_s=0.05,
+            )
+            with pytest.raises(TimeoutError, match="lock budget"):
+                blocked.result(timeout=1)
+
+    with psycopg.connect(_POSTGRES_DSN) as blocker:
+        with blocker.transaction():
+            blocker.execute(
+                "LOCK TABLE public.runner_cache_placement_admission_plans IN ACCESS EXCLUSIVE MODE"
+            )
+            started_at = time.monotonic()
+            with pytest.raises(psycopg.Error):
+                store.resolve_with_timeout(_TARGET, timeout_s=0.05)
+            assert time.monotonic() - started_at < 0.5
+
+    with psycopg.connect(_POSTGRES_DSN) as blocker:
+        with blocker.transaction():
+            blocker.execute(
+                "LOCK TABLE public.runner_cache_placement_admission_store_registry "
+                "IN ACCESS EXCLUSIVE MODE"
+            )
+            assert store._connection is not None
+            store._connection.close()
+            started_at = time.monotonic()
+            with pytest.raises(TimeoutError, match="do not reconnect"):
+                store.resolve_with_timeout(_TARGET, timeout_s=1.25)
+            assert time.monotonic() - started_at < 0.5
+    assert store.check_ready() is None
+    assert store.resolve_with_timeout(_TARGET, timeout_s=2.0) == plan
 
 
 def test_claim_from_another_binding_fails_closed(store_factory) -> None:

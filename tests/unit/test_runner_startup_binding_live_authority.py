@@ -27,6 +27,9 @@ from kairyu.runners import (
     NodeModelCacheAgentEndpoint,
     NodeModelCacheLiveEvidenceRequest,
     NodeModelCacheLiveEvidenceResponse,
+    PostgresRunnerCachePlacementBindingReader,
+    RunnerCachePlacementAdmissionConflictError,
+    RunnerCachePlacementAdmissionPlan,
     RunnerCachePlacementBindingAuthorizationDeniedError,
     RunnerCachePlacementBindingAuthorizationError,
     RunnerCachePlacementBindingCacheState,
@@ -471,6 +474,68 @@ class _ComponentReaders:
         self._record("ready", deadline_monotonic, backend_timeout_s)
 
 
+class _TimedAdmissionPlanStore:
+    def __init__(self, plan: RunnerCachePlacementAdmissionPlan) -> None:
+        self.plan = plan
+        self.error: BaseException | None = None
+        self.calls: list[tuple[str, object, float]] = []
+        self.on_call = None
+
+    def resolve_with_timeout(self, target_id: str, *, timeout_s: float):
+        self.calls.append(("resolve", target_id, timeout_s))
+        if self.on_call is not None:
+            self.on_call()
+        if self.error is not None:
+            raise self.error
+        return self.plan
+
+    def check_ready_with_timeout(self, *, timeout_s: float) -> None:
+        self.calls.append(("ready", None, timeout_s))
+        if self.on_call is not None:
+            self.on_call()
+        if self.error is not None:
+            raise self.error
+
+
+class _TimedDecisionLog:
+    def __init__(self, decision: ScalingDecisionRecord) -> None:
+        self.decision = decision
+        self.error: BaseException | None = None
+        self.calls: list[tuple[str, object, float]] = []
+        self.on_call = None
+
+    def get_with_timeout(self, decision_id: str, *, timeout_s: float):
+        self.calls.append(("get", decision_id, timeout_s))
+        if self.on_call is not None:
+            self.on_call()
+        if self.error is not None:
+            raise self.error
+        return self.decision
+
+    def check_ready_with_timeout(self, *, timeout_s: float) -> None:
+        self.calls.append(("ready", None, timeout_s))
+        if self.on_call is not None:
+            self.on_call()
+        if self.error is not None:
+            raise self.error
+
+
+def _admission_plan(
+    binding: RunnerCacheStartupBinding,
+) -> RunnerCachePlacementAdmissionPlan:
+    return RunnerCachePlacementAdmissionPlan(
+        binding=binding,
+        release_id="release-a",
+        namespace="model-serving",
+        owner_api_version="apps/v1",
+        owner_kind="Deployment",
+        owner_name="qwen-runners",
+        owner_uid="workload-uid",
+        creator_username="system:serviceaccount:kairyu:statefulset-controller",
+        registered_at=binding.bound_at,
+    )
+
+
 def _live_state(
     decision: ScalingDecisionRecord,
     binding: RunnerCacheStartupBinding,
@@ -874,6 +939,114 @@ def test_composed_live_source_checks_deadline_after_snapshot_validation() -> Non
         composed.read(
             binding,
             deadline_monotonic=20.0,
+            backend_timeout_s=1.0,
+        )
+
+
+def test_postgres_live_reader_reads_current_decision_and_readiness() -> None:
+    decision = _decision()
+    command = _prestage_command(decision)
+    binding = _binding(decision, command_id=command.command_id)
+    admission = _TimedAdmissionPlanStore(_admission_plan(binding))
+    decisions = _TimedDecisionLog(decision)
+    reader = PostgresRunnerCachePlacementBindingReader(
+        admission,
+        decisions,
+        monotonic_clock=lambda: 10.0,
+    )
+
+    assert (
+        reader.read_current(
+            binding,
+            deadline_monotonic=20.0,
+            backend_timeout_s=2.0,
+        )
+        == binding
+    )
+    assert (
+        reader.read_decision(
+            binding,
+            deadline_monotonic=20.0,
+            backend_timeout_s=2.0,
+        )
+        == decision
+    )
+    reader.readiness(deadline_monotonic=20.0, backend_timeout_s=2.0)
+
+    assert admission.calls == [
+        ("resolve", binding.target_id, 2.0),
+        ("ready", None, 2.0),
+    ]
+    assert decisions.calls == [
+        ("get", binding.decision_id, 2.0),
+        ("ready", None, 2.0),
+    ]
+
+
+def test_postgres_live_reader_maps_missing_authority_to_denial() -> None:
+    decision = _decision()
+    command = _prestage_command(decision)
+    binding = _binding(decision, command_id=command.command_id)
+    admission = _TimedAdmissionPlanStore(_admission_plan(binding))
+    decisions = _TimedDecisionLog(decision)
+    reader = PostgresRunnerCachePlacementBindingReader(
+        admission,
+        decisions,
+        monotonic_clock=lambda: 10.0,
+    )
+
+    admission.error = RunnerCachePlacementAdmissionConflictError("missing")
+    with pytest.raises(
+        RunnerCachePlacementBindingAuthorizationDeniedError,
+        match="current placement binding",
+    ):
+        reader.read_current(
+            binding,
+            deadline_monotonic=20.0,
+            backend_timeout_s=1.0,
+        )
+
+    admission.error = None
+    decisions.error = KeyError("missing")
+    with pytest.raises(
+        RunnerCachePlacementBindingAuthorizationDeniedError,
+        match="durable scaling decision",
+    ):
+        reader.read_decision(
+            binding,
+            deadline_monotonic=20.0,
+            backend_timeout_s=1.0,
+        )
+
+
+def test_postgres_live_reader_caps_timeout_and_rejects_late_result() -> None:
+    decision = _decision()
+    command = _prestage_command(decision)
+    binding = _binding(decision, command_id=command.command_id)
+    admission = _TimedAdmissionPlanStore(_admission_plan(binding))
+    decisions = _TimedDecisionLog(decision)
+    monotonic = [10.0]
+    reader = PostgresRunnerCachePlacementBindingReader(
+        admission,
+        decisions,
+        monotonic_clock=lambda: monotonic[0],
+    )
+
+    assert (
+        reader.read_current(
+            binding,
+            deadline_monotonic=10.25,
+            backend_timeout_s=1.0,
+        )
+        == binding
+    )
+    assert admission.calls[-1] == ("resolve", binding.target_id, 0.25)
+
+    admission.on_call = lambda: monotonic.__setitem__(0, 10.25)
+    with pytest.raises(TimeoutError, match="deadline"):
+        reader.read_current(
+            binding,
+            deadline_monotonic=10.25,
             backend_timeout_s=1.0,
         )
 

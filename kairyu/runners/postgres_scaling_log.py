@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import math
 import threading
+import time
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from types import TracebackType
 from typing import Literal, Self
@@ -27,6 +29,7 @@ except ModuleNotFoundError:  # pragma: no cover - core-only installation.
 _SCHEMA_VERSION = 1
 _SCHEMA_NAME = "public"
 _SCHEMA_LOCK = (1_261_587_810, 8)
+_MAX_POSTGRES_TIMEOUT_MS = 2_147_483_647
 _EXPECTED_COLUMNS = {
     "runner_scaling_log_registry": (
         ("store_id", "text", True),
@@ -106,6 +109,88 @@ _SCHEMA_STATEMENTS = (
 )
 
 
+def _timeout_seconds(value: float, *, name: str = "timeout_s") -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{name} must be a number")
+    timeout = float(value)
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError(f"{name} must be finite and greater than zero")
+    if math.ceil(timeout * 1000) > _MAX_POSTGRES_TIMEOUT_MS:
+        raise ValueError(f"{name} exceeds the PostgreSQL timeout limit")
+    return timeout
+
+
+def _remaining_timeout(started_at: float, timeout_s: float) -> float:
+    remaining = timeout_s - (time.monotonic() - started_at)
+    if remaining <= 0:
+        raise TimeoutError("Runner scaling decision PostgreSQL read timed out")
+    return remaining
+
+
+def _set_local_timeout(cursor, timeout_s: float) -> None:
+    timeout_ms = max(1, math.ceil(timeout_s * 1000))
+    value = f"{timeout_ms}ms"
+    cursor.execute(
+        "SELECT set_config('statement_timeout', %s, true), set_config('lock_timeout', %s, true)",
+        (value, value),
+    )
+    cursor.fetchone()
+
+
+class _DeadlineCursor:
+    def __init__(self, cursor, *, started_at: float, timeout_s: float) -> None:
+        self._cursor = cursor
+        self._started_at = started_at
+        self._timeout_s = timeout_s
+
+    def execute(self, query, params=None):
+        _set_local_timeout(
+            self._cursor,
+            _remaining_timeout(self._started_at, self._timeout_s),
+        )
+        if params is None:
+            return self._cursor.execute(query)
+        return self._cursor.execute(query, params)
+
+    def __getattr__(self, name: str):
+        return getattr(self._cursor, name)
+
+
+@contextmanager
+def _deadline_lock(lock, *, started_at: float, timeout_s: float):
+    if not lock.acquire(timeout=_remaining_timeout(started_at, timeout_s)):
+        raise TimeoutError("Runner scaling decision PostgreSQL lock budget expired")
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+@contextmanager
+def _cancel_connection_at_deadline(
+    connection,
+    *,
+    started_at: float,
+    timeout_s: float,
+):
+    def cancel() -> None:
+        try:
+            connection.cancel_safe(timeout=0.1)
+        except BaseException:
+            # Server timeouts and TCP keepalives remain the fallback if the
+            # auxiliary PostgreSQL cancellation connection cannot be made.
+            pass
+
+    timer = threading.Timer(_remaining_timeout(started_at, timeout_s), cancel)
+    timer.daemon = True
+    timer.start()
+    try:
+        yield
+    finally:
+        timer.cancel()
+        timer.join()
+
+
 class PostgresScalingDecisionLog:
     """Shared durable decision log with exact replay and bounded capacity."""
 
@@ -126,15 +211,9 @@ class PostgresScalingDecisionLog:
         self._store_id = _non_empty(store_id, name="store_id")
         if not isinstance(dsn, str) or not dsn.strip() or "\x00" in dsn:
             raise ValueError("dsn must be a non-empty string without NUL")
-        if (
-            type(max_records) is not int
-            or max_records <= 0
-            or max_records > _MAX_SIGNED_BIGINT
-        ):
+        if type(max_records) is not int or max_records <= 0 or max_records > _MAX_SIGNED_BIGINT:
             raise ValueError("max_records must be a positive signed 64-bit integer")
-        if isinstance(connect_timeout_s, bool) or not isinstance(
-            connect_timeout_s, (int, float)
-        ):
+        if isinstance(connect_timeout_s, bool) or not isinstance(connect_timeout_s, (int, float)):
             raise ValueError("connect_timeout_s must be a number")
         timeout = float(connect_timeout_s)
         if not math.isfinite(timeout) or timeout <= 0:
@@ -154,23 +233,29 @@ class PostgresScalingDecisionLog:
     def store_id(self) -> str:
         return self._store_id
 
+    @property
+    def connect_timeout_s(self) -> int:
+        """Return the hard libpq reconnect timeout used by this log."""
+
+        return self._connect_timeout
+
     def _connect(self):
         assert psycopg is not None
+        connect_timeout = self._connect_timeout
         timeout_ms = self._connect_timeout * 1000
         parameters = psycopg.conninfo.conninfo_to_dict(self._dsn)
         configured_options = parameters.pop("options", "")
         options = (
-            f"{configured_options} -c statement_timeout={timeout_ms} "
-            f"-c lock_timeout={timeout_ms}"
+            f"{configured_options} -c statement_timeout={timeout_ms} -c lock_timeout={timeout_ms}"
         ).strip()
         return psycopg.connect(
             psycopg.conninfo.make_conninfo(**parameters),
             autocommit=True,
-            connect_timeout=self._connect_timeout,
+            connect_timeout=connect_timeout,
             options=options,
             keepalives=1,
-            keepalives_idle=self._connect_timeout,
-            keepalives_interval=self._connect_timeout,
+            keepalives_idle=connect_timeout,
+            keepalives_interval=connect_timeout,
             keepalives_count=1,
         )
 
@@ -180,9 +265,15 @@ class PostgresScalingDecisionLog:
         if not allow_unstarted and self._connection is None:
             raise RuntimeError("PostgresScalingDecisionLog has not started")
 
-    def _ensure_connection(self) -> None:
+    def _ensure_connection(
+        self,
+        *,
+        allow_reconnect: bool = True,
+    ) -> None:
         assert self._connection is not None
         if self._connection.closed or self._connection.broken:
+            if not allow_reconnect:
+                raise TimeoutError("timed Runner scaling decision reads do not reconnect")
             self._connection.close()
             self._connection = self._connect()
             try:
@@ -279,12 +370,18 @@ class PostgresScalingDecisionLog:
         namespace_oid = self._validate_schema_objects_cursor(cursor)
         if expected_namespace_oid is not None and namespace_oid != expected_namespace_oid:
             raise RuntimeError("Runner scaling log PostgreSQL namespace identity changed")
+        self._validate_registry_cursor(cursor)
+        return namespace_oid
+
+    def _validate_registry_cursor(self, cursor, *, for_key_share: bool = False) -> None:
+        lock = " FOR KEY SHARE" if for_key_share else ""
         cursor.execute(
             """
             SELECT schema_version, max_records
             FROM public.runner_scaling_log_registry
             WHERE store_id = %s
-            """,
+            """
+            + lock,
             (self._store_id,),
         )
         row = cursor.fetchone()
@@ -297,10 +394,8 @@ class PostgresScalingDecisionLog:
             )
         if row[1] != self._max_records:
             raise RuntimeError(
-                f"Runner scaling log capacity is {row[1]!r}; "
-                f"configured {self._max_records!r}"
+                f"Runner scaling log capacity is {row[1]!r}; configured {self._max_records!r}"
             )
-        return namespace_oid
 
     @staticmethod
     def _validate_schema_objects_cursor(cursor) -> int:
@@ -323,9 +418,7 @@ class PostgresScalingDecisionLog:
         objects = cursor.fetchone()
         if objects is None:
             raise RuntimeError("Runner scaling log schema is missing required tables")
-        registry_oid, decisions_oid, registry_namespace, decisions_namespace, *kinds = (
-            objects
-        )
+        registry_oid, decisions_oid, registry_namespace, decisions_namespace, *kinds = objects
         cursor.execute(
             "SELECT pg_catalog.to_regnamespace(%s)::oid",
             (_SCHEMA_NAME,),
@@ -432,8 +525,7 @@ class PostgresScalingDecisionLog:
         )
         if index_row != expected_index:
             raise RuntimeError(
-                "Runner scaling decision index is incompatible: "
-                f"observed {index_row!r}"
+                f"Runner scaling decision index is incompatible: observed {index_row!r}"
             )
         return registry_namespace
 
@@ -542,9 +634,7 @@ class PostgresScalingDecisionLog:
                     count_row = cursor.fetchone()
                     assert count_row is not None
                     if count_row[0] >= self._max_records:
-                        raise ScalingDecisionCapacityError(
-                            "decision log capacity is exhausted"
-                        )
+                        raise ScalingDecisionCapacityError("decision log capacity is exhausted")
                     if record.action is not ScalingDecisionAction.HOLD:
                         if record.decision_generation is not None:
                             raise ScalingDecisionGenerationError(
@@ -572,9 +662,7 @@ class PostgresScalingDecisionLog:
                             )
                         record = ScalingDecisionRecord.model_validate(
                             record.model_copy(
-                                update={
-                                    "decision_generation": previous_generation + 1
-                                }
+                                update={"decision_generation": previous_generation + 1}
                             ).model_dump()
                         )
                     fingerprint = record.fingerprint
@@ -603,25 +691,116 @@ class PostgresScalingDecisionLog:
                     )
                     return record
 
-    def get(self, decision_id: str) -> ScalingDecisionRecord:
+    def _get(
+        self,
+        decision_id: str,
+        *,
+        timeout_s: float | None,
+    ) -> ScalingDecisionRecord:
         decision_id = _non_empty(decision_id, name="decision_id")
+        started_at = time.monotonic()
+        lock_context = (
+            _deadline_lock(
+                self._lock,
+                started_at=started_at,
+                timeout_s=timeout_s,
+            )
+            if timeout_s is not None
+            else self._lock
+        )
+        with lock_context:
+            self._require_open()
+            self._ensure_connection(allow_reconnect=timeout_s is None)
+            assert self._connection is not None
+            cancellation = (
+                _cancel_connection_at_deadline(
+                    self._connection,
+                    started_at=started_at,
+                    timeout_s=timeout_s,
+                )
+                if timeout_s is not None
+                else nullcontext()
+            )
+            with cancellation, self._connection.transaction():
+                with self._connection.cursor() as cursor:
+                    if timeout_s is not None:
+                        cursor = _DeadlineCursor(
+                            cursor,
+                            started_at=started_at,
+                            timeout_s=timeout_s,
+                        )
+                        self._validate_registry_cursor(
+                            cursor,
+                            for_key_share=True,
+                        )
+                    cursor.execute(
+                        f"""
+                        SELECT {self._select_columns()}
+                        FROM public.runner_scaling_decisions
+                        WHERE store_id = %s AND decision_id = %s
+                        """,
+                        (self._store_id, decision_id),
+                    )
+                    row = cursor.fetchone()
+                    if row is None:
+                        raise KeyError(f"unknown scaling decision {decision_id!r}")
+                    return self._record(row)
+
+    def get(self, decision_id: str) -> ScalingDecisionRecord:
+        return self._get(decision_id, timeout_s=None)
+
+    def get_with_timeout(
+        self,
+        decision_id: str,
+        *,
+        timeout_s: float,
+    ) -> ScalingDecisionRecord:
+        """Read one exact durable decision under a caller-supplied budget."""
+
+        return self._get(
+            decision_id,
+            timeout_s=_timeout_seconds(timeout_s),
+        )
+
+    def check_ready(self) -> None:
+        """Validate the live connection and durable log configuration."""
+
         with self._lock:
             self._require_open()
             self._ensure_connection()
+            self._validate_schema(expected_namespace_oid=self._namespace_oid)
+
+    def check_ready_with_timeout(self, *, timeout_s: float) -> None:
+        """Validate readiness under a caller-supplied backend budget."""
+
+        timeout_s = _timeout_seconds(timeout_s)
+        started_at = time.monotonic()
+        with _deadline_lock(
+            self._lock,
+            started_at=started_at,
+            timeout_s=timeout_s,
+        ):
+            self._require_open()
+            self._ensure_connection(allow_reconnect=False)
             assert self._connection is not None
-            with self._connection.cursor() as cursor:
-                cursor.execute(
-                    f"""
-                    SELECT {self._select_columns()}
-                    FROM public.runner_scaling_decisions
-                    WHERE store_id = %s AND decision_id = %s
-                    """,
-                    (self._store_id, decision_id),
-                )
-                row = cursor.fetchone()
-                if row is None:
-                    raise KeyError(f"unknown scaling decision {decision_id!r}")
-                return self._record(row)
+            with (
+                _cancel_connection_at_deadline(
+                    self._connection,
+                    started_at=started_at,
+                    timeout_s=timeout_s,
+                ),
+                self._connection.transaction(),
+            ):
+                with self._connection.cursor() as cursor:
+                    deadline_cursor = _DeadlineCursor(
+                        cursor,
+                        started_at=started_at,
+                        timeout_s=timeout_s,
+                    )
+                    self._validate_schema_cursor(
+                        deadline_cursor,
+                        expected_namespace_oid=self._namespace_oid,
+                    )
 
     def list(
         self,
@@ -654,7 +833,7 @@ class PostgresScalingDecisionLog:
                     f"""
                     SELECT {self._select_columns()}
                     FROM public.runner_scaling_decisions
-                    WHERE {' AND '.join(clauses)}
+                    WHERE {" AND ".join(clauses)}
                     ORDER BY decided_at DESC, decision_id DESC
                     LIMIT %s
                     """,

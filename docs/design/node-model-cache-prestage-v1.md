@@ -26,8 +26,9 @@ a replacement fence. D3.13 exposes path-free, owner-scoped live pre-stage and
 cache-index evidence from the authenticated node agent. D3.14 adds the strict
 authenticated controller client and bounded fan-out aggregator, joining those
 node responses only to scheduler placement facts observed afterward.
-PostgreSQL/Kubernetes/Kueue reader adapters, scheduling compaction, and
-deployment wiring remain deployment tasks.
+D3.15 adds deadline-bounded PostgreSQL current-binding and exact durable-decision
+readers. Kubernetes/Kueue reader adapters, scheduling compaction, and deployment
+wiring remain deployment tasks.
 
 ## Purpose
 
@@ -622,6 +623,25 @@ presented as current facts. Readiness covers every configured node and the
 inventory backend under the same deadline budget. The hosting runtime owns and
 closes the adopted client before process shutdown.
 
+D3.15 adds `PostgresRunnerCachePlacementBindingReader` as the current-binding
+and durable-decision side of the D3.12 source. It resolves the target's current
+admission plan and the exact decision ID named by that binding from their
+existing shared PostgreSQL stores. Missing plans or decisions become explicit
+authorization denials; connection, schema, projection, and data-corruption
+errors remain dependency failures. Every live read and readiness check applies
+the smaller of the per-backend timeout and remaining absolute deadline. The
+store methods subtract Python lock wait from that budget and set transaction-
+local PostgreSQL statement and lock timeouts from the remaining budget before
+every validation or selection query. A whole-operation PostgreSQL cancel timer
+also covers transaction startup and timeout-configuration round trips. Timed
+authority reads never perform a synchronous libpq reconnect because its timeout
+is per connection candidate and cannot be bounded by the short request deadline;
+they fail fast on a broken connection. Connection establishment and repair stay
+in non-request startup/health lifecycle calls. Results are deep-validated again
+before crossing the reader boundary.
+One reader instance implements both D3.12 protocols so composed readiness checks
+the paired durable dependencies once.
+
 ## Deployment boundary
 
 `private-ai-cloud-iac` must still provide:
@@ -633,8 +653,8 @@ closes the adopted client before process shutdown.
 - reconciliation that replays desired ensure/release commands after restart;
 - a scheduled caller for the implemented bounded compaction contract, with a
   documented retirement cutoff and monitoring of per-placement high-water rows;
-- concrete PostgreSQL and Kubernetes/Kueue readers, including the scheduler
-  placement-inventory adapter consumed by D3.14, for the D3.12 live-state source
+- concrete Kubernetes/Kueue readers, including the scheduler placement-inventory
+  adapter consumed by D3.14, for the D3.12 live-state source
   and deployment of the assembled scaling-authority
   reauthorization/readiness endpoint consumed by D3.8, plus a highly available
   Deployment/Service/MutatingWebhookConfiguration, TLS
@@ -670,7 +690,7 @@ template integrity.
 Real PostgreSQL admission tests cover cross-instance plan visibility, concurrent
 unique claims, same-name retry protection, safe creator rollback, target
 capacity, replay-window plan rotation, fixed configuration, validate-only
-startup, and plan/claim projection corruption.
+startup, plan/claim projection corruption, and deadline-bounded live reads.
 AdmissionReview tests cover strict v1 envelope parsing, request/Pod identity,
 UID-bound allow and deny responses, deterministic patch application, exact
 replay, dry-run/subresource rejection, request-size bounds, readiness, and

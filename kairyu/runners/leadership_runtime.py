@@ -132,7 +132,9 @@ class _LifecycleFencedRunnerController(LeaderFencedRunnerController):
         revoke_snapshot: Callable[[], None],
     ) -> None:
         super().__init__(elector, reconciler)
-        self._execution_lock = threading.Lock()
+        # Live binding authorization rechecks the same controller after its
+        # backend reads, so one thread must be able to nest a fenced mutation.
+        self._execution_lock = threading.RLock()
         self._precheck = precheck
         self._begin_mutation = begin_mutation
         self._end_mutation = end_mutation

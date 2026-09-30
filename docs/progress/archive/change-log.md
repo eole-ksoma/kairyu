@@ -11,6 +11,51 @@ header (above the existing entries), keeping their original order.
 
 <!-- ARCHIVE-INSERT-POINT: new trimmed entries go directly below this line -->
 
+### 2026-09-30 — [progress] Owner-scoped node live-evidence transport
+- What: added the D3.13 authenticated node-agent endpoint that joins a stable
+  ready pre-stage record to one cache-index snapshot and returns only path-free
+  physical hint and exact current pin-owner/generation evidence.
+- Why: D3.11 must prove that the binding's owner still pins the exact resident
+  generation without exposing node-local artifact paths or trusting a generic
+  `pinned=true` flag that permits different-owner ABA.
+- Refs: docs/design/node-model-cache-prestage-v1.md;
+  kairyu/runners/cache_agent_live_evidence.py;
+  tests/unit/test_node_model_cache_agent_api.py
+
+### 2026-09-30 — [progress] Deadline-bounded live-state source composition
+- What: added the D3.12 source that composes current binding, durable decision,
+  target, quota, and coherent cache/pin evidence, rereads the binding as a
+  replacement fence, and budgets every backend/readiness call by one deadline.
+- Why: D3.11's validator needs an executable integration seam that cannot mix
+  evidence across a superseded binding or let per-backend timeouts exceed the
+  authority request budget.
+- Refs: docs/design/node-model-cache-prestage-v1.md;
+  kairyu/runners/startup_binding_live_source.py;
+  tests/unit/test_runner_startup_binding_live_authority.py
+
+### 2026-09-30 — [progress] Leader-fenced placement-binding authorization
+- What: added the D3.11 scaling-controller adapter that rechecks leadership and
+  validates exact live binding, durable decision/target, quota, prewarm/cache
+  freshness, current pre-stage/pin/resident lineage, lifetime, and
+  deadline-bounded dependency readiness.
+- Why: the D3.10 service must not authorize from its admission-store echo or a
+  stale callback after controller leadership or scale-up capacity changes.
+- Refs: docs/design/node-model-cache-prestage-v1.md;
+  kairyu/runners/startup_binding_live_authority.py;
+  tests/unit/test_runner_startup_binding_live_authority.py
+
+### 2026-09-30 — [progress] Placement-binding authority runtime assembly
+- What: added the embedded D3.10 authority runtime with a strict versioned
+  config, bounded regular-file loading for bearer and TLS material, secret-file
+  permission checks, cross-service timeout headroom, app assembly, failed-build
+  cleanup, and idempotent shutdown of adopted live-authority resources.
+- Why: the D3.9 protocol boundary needs a fail-closed process assembly contract
+  without inventing a second source of scaling truth or dynamically importing
+  privileged callbacks.
+- Refs: docs/design/node-model-cache-prestage-v1.md;
+  kairyu/runners/startup_binding_authority_runtime.py;
+  tests/unit/test_runner_startup_binding_authority_runtime.py
+
 ### 2026-09-29 — [progress] Live placement-binding authority API
 - What: added the authenticated D3.9 scaling-authority HTTP boundary with strict
   nonce-bound request/response models, exact live-binding reauthorization,

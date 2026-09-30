@@ -84,10 +84,10 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 - AsyncRequest retention-expanded Kind evidence awaits registry access.
 - Runner autoscaling WP3.1–WP3.7 is fail-closed and CPU-tested; deployment wiring,
   durable runtime status, instrumentation, and live acceptance remain.
-- Model-cache WP4.1–WP4.7 and D3.1–D3.15 provide signed identity, verified cache,
-  fenced pre-stage/startup/admission, PostgreSQL authority, and TLS HTTP runtime.
-  Kubernetes/Kueue live readers, scheduled compaction, deployment, and acceptance
-  remain.
+- Model-cache WP4.1–WP4.7 and D3.1–D3.16 provide signed identity, verified cache,
+  fenced pre-stage/startup/admission, PostgreSQL/Kubernetes/Kueue authority, and
+  TLS HTTP runtime. CRD reconciliation, scheduled compaction, deployment, and
+  acceptance remain.
 - Qwen3.8 MTP stays disabled pending vllm#53912; DTO-D15 verification/re-pin and
   human sign-off for M2–M4 remain pending.
 
@@ -95,6 +95,15 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
+
+### 2026-09-30 — [progress] Kubernetes/Kueue live authority readers
+- What: added D3.16 bounded target, Kueue quota, and controller-owned placement
+  inventory reads with strict JSON/RBAC readiness and exact CRD projections.
+- Why: D3.12 and D3.14 must refresh workload fences, quota, and scheduler facts
+  without binding-controlled routing or mixing Kueue and quota revisions.
+- Refs: docs/design/node-model-cache-prestage-v1.md;
+  kairyu/runners/startup_binding_live_kubernetes.py;
+  tests/unit/test_runner_startup_binding_live_authority.py
 
 ### 2026-09-30 — [progress] Deadline-bounded PostgreSQL live readers
 - What: added the D3.15 current-binding and exact durable-decision adapter plus

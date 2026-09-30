@@ -269,6 +269,11 @@ from kairyu.runners.startup_binding_live_cache import (
     RunnerCachePlacementBindingInventory,
     RunnerCachePlacementBindingInventoryReader,
 )
+from kairyu.runners.startup_binding_live_kubernetes import (
+    InvalidKubernetesPlacementBindingLiveResponseError,
+    KubernetesKueueRunnerCachePlacementBindingReader,
+    KubernetesPlacementBindingLiveTarget,
+)
 from kairyu.runners.startup_binding_live_postgres import (
     PostgresRunnerCachePlacementBindingReader,
 )
@@ -311,12 +316,15 @@ __all__ = [
     "InvalidRunnerFailureEvidenceError",
     "InvalidRunnerLeadershipError",
     "InvalidKubernetesScaleResponseError",
+    "InvalidKubernetesPlacementBindingLiveResponseError",
     "InMemoryRunnerLeaderLeaseStore",
     "InMemoryRunnerCachePlacementAdmissionStore",
     "KubernetesPodPhase",
     "KubernetesRunnerPodSnapshot",
     "KubernetesRunnerWatcher",
     "KubernetesFencedScaleResult",
+    "KubernetesKueueRunnerCachePlacementBindingReader",
+    "KubernetesPlacementBindingLiveTarget",
     "KubernetesScaleActuator",
     "KubernetesScaleAuthorityClaim",
     "KubernetesScaleCleanupPendingError",

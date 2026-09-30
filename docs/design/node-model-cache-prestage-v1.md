@@ -27,8 +27,9 @@ cache-index evidence from the authenticated node agent. D3.14 adds the strict
 authenticated controller client and bounded fan-out aggregator, joining those
 node responses only to scheduler placement facts observed afterward.
 D3.15 adds deadline-bounded PostgreSQL current-binding and exact durable-decision
-readers. Kubernetes/Kueue reader adapters, scheduling compaction, and deployment
-wiring remain deployment tasks.
+readers. D3.16 adds deadline-bounded Kubernetes target, Kueue quota, and
+controller-owned placement-inventory readers. CRD reconciliation, scheduled
+compaction, and deployment wiring remain deployment tasks.
 
 ## Purpose
 
@@ -642,6 +643,44 @@ before crossing the reader boundary.
 One reader instance implements both D3.12 protocols so composed readiness checks
 the paired durable dependencies once.
 
+D3.16 adds `KubernetesKueueRunnerCachePlacementBindingReader` for the remaining
+Kubernetes/Kueue boundaries. Trusted per-model configuration fixes the API
+origin, workload identity, authority namespace, Kueue namespace/API version,
+pod set, resource name, and CRD names; no binding field can redirect a request.
+It reads the exact `apps/v1` Deployment or StatefulSet and projects the applied
+decision annotations, generation, UID, model identity, placement binding, and
+replica count into `RunnerCachePlacementBindingTargetState`.
+
+The quota read joins the exact Kueue Workload to an
+`autoscaling.kairyu.ai/v1alpha1` `RunnerScalingQuotaSnapshot`. The CRD spec binds
+the immutable workload and Kueue references plus tenant/model identity. Its
+ready status carries the monotonic quota revision, source timestamp, exact
+Kueue resourceVersion, and the three canonical cluster/model-family/tenant
+limits. A projection that does not observe the returned Kueue resourceVersion
+is denied instead of mixing snapshots. The live Kueue admission is parsed with
+the existing strict v1beta1/v1beta2 contract and deterministically reapplied to
+the refreshed limits.
+
+The placement read consumes an `autoscaling.kairyu.ai/v1alpha1`
+`RunnerCachePlacementInventory`. Its spec binds the target UID, binding,
+decision/fingerprint, model artifact, and placement-binding identity. Its ready
+status carries the monotonic cache revision, source timestamp, and canonical
+controller-owned candidate facts: node, ResourceFlavor, hardware profile,
+compatibility approval, assignment, health, and schedulability. D3.14 still
+joins those facts only after collecting node evidence and enforces exact
+placement coverage.
+
+All reads re-read the projected service-account token, reject redirects and
+environment proxy/CA inheritance, require strict bounded JSON, and apply one
+shared operation budget across Python lock wait and every sequential HTTP
+request. The reader adopts and closes one `httpx.AsyncClient` on a dedicated
+event loop; a whole-request async timeout completes cancellation before the
+synchronous callback returns, and shutdown joins the loop thread. A missing
+target, Workload, or authority CRD is an authorization
+denial; API transport/RBAC/server failures and malformed responses remain
+dependency failures. Readiness verifies the configured workload, both CRDs,
+and Kueue collection access under that same budget.
+
 ## Deployment boundary
 
 `private-ai-cloud-iac` must still provide:
@@ -653,9 +692,10 @@ the paired durable dependencies once.
 - reconciliation that replays desired ensure/release commands after restart;
 - a scheduled caller for the implemented bounded compaction contract, with a
   documented retirement cutoff and monitoring of per-placement high-water rows;
-- concrete Kubernetes/Kueue readers, including the scheduler placement-inventory
-  adapter consumed by D3.14, for the D3.12 live-state source
-  and deployment of the assembled scaling-authority
+- reconcilers and CRD definitions that publish the implemented
+  `RunnerScalingQuotaSnapshot` and `RunnerCachePlacementInventory` contracts,
+  with least-privilege read RBAC for the implemented Kubernetes/Kueue reader;
+- assembly and deployment of the scaling-authority
   reauthorization/readiness endpoint consumed by D3.8, plus a highly available
   Deployment/Service/MutatingWebhookConfiguration, TLS
   certificate issuance/rotation and trust, ingress restriction, orchestration
@@ -665,9 +705,9 @@ the paired durable dependencies once.
   pin reconciliation; and
 - live node-pool acceptance with real S3, NVMe, Kueue, and Runner startup.
 
-Until that wiring exists, the PostgreSQL store is durable authority but no
-production node agent consumes its work; the feature must remain disabled for
-production autoscaling.
+Until that wiring exists, the PostgreSQL and Kubernetes readers form a
+fail-closed library authority but no production node agent consumes its work;
+the feature must remain disabled for production autoscaling.
 
 ## CPU verification
 

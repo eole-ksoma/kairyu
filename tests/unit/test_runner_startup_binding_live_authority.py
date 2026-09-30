@@ -23,6 +23,9 @@ from kairyu.runners import (
     AuthenticatedNodeModelCacheLiveEvidenceClient,
     ComposedRunnerCachePlacementBindingLiveStateSource,
     InMemoryRunnerLeaderLeaseStore,
+    InvalidKubernetesPlacementBindingLiveResponseError,
+    KubernetesKueueRunnerCachePlacementBindingReader,
+    KubernetesPlacementBindingLiveTarget,
     LeaderFencedRunnerController,
     NodeModelCacheAgentEndpoint,
     NodeModelCacheLiveEvidenceRequest,
@@ -1529,3 +1532,769 @@ def test_node_live_evidence_client_bounds_pending_tasks_for_large_fanout() -> No
     assert started == 3
     assert stopped == 3
     assert task_counts and max(task_counts) <= 5
+
+
+def _kubernetes_live_target() -> KubernetesPlacementBindingLiveTarget:
+    return KubernetesPlacementBindingLiveTarget(
+        model_class="qwen-14b",
+        target_kind="Deployment",
+        namespace="model-serving",
+        name="qwen-runners",
+        authority_namespace="scaling-system",
+        kueue_namespace="model-serving",
+        quota_snapshot_name="qwen-quota",
+        inventory_name="qwen-inventory",
+        pod_set_name="runners",
+    )
+
+
+def _kubernetes_workload_payload(
+    decision: ScalingDecisionRecord,
+    binding: RunnerCacheStartupBinding,
+) -> dict[str, object]:
+    assert decision.target_revision is not None
+    assert decision.decision_generation is not None
+    target = decision.target_revision
+    return {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {
+            "name": target.name,
+            "namespace": target.namespace,
+            "uid": target.workload_uid,
+            "generation": target.workload_generation + 1,
+            "resourceVersion": "100",
+            "annotations": {
+                "kairyu.ai/release-id": target.release_id,
+                "kairyu.ai/model-id": binding.model_id,
+                "kairyu.ai/model-revision": target.model_revision,
+                "kairyu.ai/cache-placement-binding": binding.placement_binding_id,
+                "kairyu.ai/scale-decision-generation": str(decision.decision_generation),
+                "kairyu.ai/scale-decision-id": decision.decision_id,
+                "kairyu.ai/scale-decision-fingerprint": decision.fingerprint,
+            },
+        },
+        "spec": {"replicas": decision.desired_replicas},
+    }
+
+
+def _kueue_workload_payload(
+    decision: ScalingDecisionRecord,
+    *,
+    admitted: bool = True,
+    resource_version: str = "42",
+) -> dict[str, object]:
+    assert decision.quota_admission is not None
+    kueue = decision.quota_admission.snapshot.kueue
+    status: dict[str, object] = {
+        "conditions": [
+            {
+                "type": "Admitted",
+                "status": "True" if admitted else "False",
+                "observedGeneration": kueue.workload_generation,
+            }
+        ]
+    }
+    if admitted:
+        status["admission"] = {
+            "clusterQueue": kueue.cluster_queue,
+            "podSetAssignments": [
+                {
+                    "name": kueue.pod_set_name,
+                    "flavors": {kueue.resource_name: kueue.resource_flavor},
+                    "resourceUsage": {kueue.resource_name: 1},
+                    "count": 1,
+                }
+            ],
+        }
+    return {
+        "apiVersion": kueue.api_version,
+        "kind": "Workload",
+        "metadata": {
+            "name": kueue.workload_name,
+            "namespace": kueue.namespace,
+            "uid": kueue.workload_uid,
+            "generation": kueue.workload_generation,
+            "resourceVersion": resource_version,
+            "annotations": {
+                "kairyu.ai/scale-target-kind": kueue.target_kind,
+                "kairyu.ai/scale-target-namespace": kueue.target_namespace,
+                "kairyu.ai/scale-target-name": kueue.target_name,
+                "kairyu.ai/scale-target-uid": kueue.target_uid,
+            },
+        },
+        "spec": {
+            "queueName": kueue.local_queue,
+            "priority": kueue.priority,
+            "active": True,
+            "podSets": [{"name": kueue.pod_set_name, "count": 1}],
+        },
+        "status": status,
+    }
+
+
+def _target_reference(decision: ScalingDecisionRecord) -> dict[str, object]:
+    assert decision.target_revision is not None
+    target = decision.target_revision
+    return {
+        "apiVersion": "apps/v1",
+        "kind": target.target_kind,
+        "namespace": target.namespace,
+        "name": target.name,
+        "uid": target.workload_uid,
+    }
+
+
+def _quota_snapshot_payload(
+    decision: ScalingDecisionRecord,
+    *,
+    ready: bool = True,
+    kueue_resource_version: str = "42",
+) -> dict[str, object]:
+    assert decision.quota_admission is not None
+    quota = decision.quota_admission.snapshot
+    kueue = quota.kueue
+    return {
+        "apiVersion": "autoscaling.kairyu.ai/v1alpha1",
+        "kind": "RunnerScalingQuotaSnapshot",
+        "metadata": {
+            "name": "qwen-quota",
+            "namespace": "scaling-system",
+            "uid": "quota-uid",
+            "generation": 5,
+            "resourceVersion": "78",
+        },
+        "spec": {
+            "targetRef": _target_reference(decision),
+            "tenantId": quota.tenant_id,
+            "modelClass": quota.model_class,
+            "modelFamily": quota.model_family,
+            "gpusPerReplica": quota.gpus_per_replica,
+            "kueueWorkloadRef": {
+                "apiVersion": kueue.api_version,
+                "namespace": kueue.namespace,
+                "name": kueue.workload_name,
+                "uid": kueue.workload_uid,
+            },
+        },
+        "status": {
+            "observedGeneration": 5,
+            "conditions": [
+                {"type": "Ready", "status": "True" if ready else "False", "observedGeneration": 5}
+            ],
+            "snapshotId": "quota-live",
+            "quotaRevision": 2,
+            "observedAt": LIVE.isoformat(),
+            "kueueResourceVersion": kueue_resource_version,
+            "limits": [
+                {
+                    "scope": scope.value,
+                    "quotaName": f"{scope.value}-quota",
+                    "hardLimitGpus": 10,
+                    "usedGpusExcludingTarget": 0,
+                    "reservedGpusForHigherPriority": 0,
+                }
+                for scope in ScalingQuotaScope
+            ],
+        },
+    }
+
+
+def _inventory_payload(
+    decision: ScalingDecisionRecord,
+    binding: RunnerCacheStartupBinding,
+    *,
+    ready: bool = True,
+) -> dict[str, object]:
+    placement = binding.placements[0]
+    return {
+        "apiVersion": "autoscaling.kairyu.ai/v1alpha1",
+        "kind": "RunnerCachePlacementInventory",
+        "metadata": {
+            "name": "qwen-inventory",
+            "namespace": "scaling-system",
+            "uid": "inventory-uid",
+            "generation": 6,
+            "resourceVersion": "79",
+        },
+        "spec": {
+            "targetRef": _target_reference(decision),
+            "bindingId": binding.binding_id,
+            "decisionId": decision.decision_id,
+            "decisionFingerprint": decision.fingerprint,
+            "modelClass": binding.model_class,
+            "modelId": binding.model_id,
+            "modelRevision": binding.model_revision,
+            "manifestDigest": binding.manifest_digest,
+            "placementBindingId": binding.placement_binding_id,
+        },
+        "status": {
+            "observedGeneration": 6,
+            "conditions": [
+                {"type": "Ready", "status": "True" if ready else "False", "observedGeneration": 6}
+            ],
+            "snapshotId": "inventory-live",
+            "cacheRevision": 2,
+            "observedAt": LIVE.isoformat(),
+            "candidates": [
+                {
+                    "placementId": placement.placement_id,
+                    "nodeName": placement.node_name,
+                    "resourceFlavor": placement.resource_flavor,
+                    "profileId": placement.profile_id,
+                    "compatibilityApprovalId": placement.compatibility_approval_id,
+                    "assigned": False,
+                    "healthy": True,
+                    "schedulable": True,
+                }
+            ],
+        },
+    }
+
+
+def _kubernetes_live_reader(
+    tmp_path: Path,
+    handler,
+) -> KubernetesKueueRunnerCachePlacementBindingReader:
+    token = tmp_path / "token"
+    token.write_text("service-account-token\n", encoding="ascii")
+
+    async def async_handler(request: httpx.Request) -> httpx.Response:
+        response = handler(request)
+        if asyncio.iscoroutine(response):
+            return await response
+        return response
+
+    return KubernetesKueueRunnerCachePlacementBindingReader(
+        targets=(_kubernetes_live_target(),),
+        api_server="https://kubernetes.example",
+        token_path=token,
+        client=httpx.AsyncClient(
+            transport=httpx.MockTransport(async_handler),
+            trust_env=False,
+            follow_redirects=False,
+        ),
+        close_client=True,
+        wall_clock=lambda: LIVE,
+    )
+
+
+def _kubernetes_live_routes(
+    decision: ScalingDecisionRecord,
+    binding: RunnerCacheStartupBinding,
+) -> dict[str, object]:
+    assert decision.quota_admission is not None
+    workload_name = decision.quota_admission.snapshot.kueue.workload_name
+    return {
+        "/apis/apps/v1/namespaces/model-serving/deployments/qwen-runners": (
+            _kubernetes_workload_payload(decision, binding)
+        ),
+        f"/apis/kueue.x-k8s.io/v1beta2/namespaces/model-serving/workloads/{workload_name}": (
+            _kueue_workload_payload(decision)
+        ),
+        "/apis/autoscaling.kairyu.ai/v1alpha1/namespaces/scaling-system/"
+        "runnerscalingquotasnapshots/qwen-quota": _quota_snapshot_payload(decision),
+        "/apis/autoscaling.kairyu.ai/v1alpha1/namespaces/scaling-system/"
+        "runnercacheplacementinventories/qwen-inventory": _inventory_payload(
+            decision,
+            binding,
+        ),
+        "/apis/kueue.x-k8s.io/v1beta2/namespaces/model-serving/workloads": {
+            "apiVersion": "kueue.x-k8s.io/v1beta2",
+            "kind": "WorkloadList",
+            "items": [],
+        },
+    }
+
+
+def test_kubernetes_kueue_live_reader_reads_target_quota_and_inventory(tmp_path: Path) -> None:
+    decision = _decision()
+    binding = _binding(decision, command_id=_prestage_command(decision).command_id)
+    routes = _kubernetes_live_routes(decision, binding)
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=routes[request.url.path])
+
+    reader = _kubernetes_live_reader(tmp_path, handler)
+    deadline = time.monotonic() + 1
+    try:
+        target = reader.read_target(
+            binding,
+            decision,
+            deadline_monotonic=deadline,
+            backend_timeout_s=0.5,
+        )
+        quota = reader.read_quota(
+            binding,
+            decision,
+            deadline_monotonic=deadline,
+            backend_timeout_s=0.5,
+        )
+        inventory = reader.read_inventory(
+            binding,
+            decision,
+            deadline_monotonic=deadline,
+            backend_timeout_s=0.5,
+        )
+    finally:
+        reader.close()
+
+    assert target == _target_state(decision, binding)
+    assert quota.snapshot.snapshot_id == "quota-live"
+    assert quota.snapshot.quota_revision == 2
+    assert quota.admitted_replicas == 1
+    assert inventory.snapshot_id == "inventory-live"
+    assert inventory.cache_revision == 2
+    assert inventory.candidates[0].placement_id == "placement-a"
+    assert len(requests) == 4
+    assert all(
+        request.headers["authorization"] == "Bearer service-account-token" for request in requests
+    )
+
+
+def test_kubernetes_kueue_live_reader_readiness_checks_all_authority_routes(
+    tmp_path: Path,
+) -> None:
+    decision = _decision()
+    binding = _binding(decision, command_id=_prestage_command(decision).command_id)
+    routes = _kubernetes_live_routes(decision, binding)
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        return httpx.Response(200, json=routes[request.url.path])
+
+    reader = _kubernetes_live_reader(tmp_path, handler)
+    try:
+        reader.readiness(
+            deadline_monotonic=time.monotonic() + 1,
+            backend_timeout_s=0.5,
+        )
+    finally:
+        reader.close()
+
+    assert paths == [
+        "/apis/apps/v1/namespaces/model-serving/deployments/qwen-runners",
+        "/apis/autoscaling.kairyu.ai/v1alpha1/namespaces/scaling-system/"
+        "runnerscalingquotasnapshots/qwen-quota",
+        "/apis/autoscaling.kairyu.ai/v1alpha1/namespaces/scaling-system/"
+        "runnercacheplacementinventories/qwen-inventory",
+        "/apis/kueue.x-k8s.io/v1beta2/namespaces/model-serving/workloads",
+    ]
+
+
+def test_kubernetes_kueue_live_reader_maps_missing_authority_to_denial(tmp_path: Path) -> None:
+    decision = _decision()
+    binding = _binding(decision, command_id=_prestage_command(decision).command_id)
+    reader = _kubernetes_live_reader(
+        tmp_path,
+        lambda _request: httpx.Response(404, json={"kind": "Status"}),
+    )
+    try:
+        with pytest.raises(
+            RunnerCachePlacementBindingAuthorizationDeniedError,
+            match="unavailable",
+        ):
+            reader.read_target(
+                binding,
+                decision,
+                deadline_monotonic=time.monotonic() + 1,
+                backend_timeout_s=0.5,
+            )
+    finally:
+        reader.close()
+
+
+def test_kubernetes_kueue_live_reader_keeps_api_failures_as_dependency_errors(
+    tmp_path: Path,
+) -> None:
+    decision = _decision()
+    binding = _binding(decision, command_id=_prestage_command(decision).command_id)
+    reader = _kubernetes_live_reader(
+        tmp_path,
+        lambda _request: httpx.Response(503, json={"kind": "Status"}),
+    )
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            reader.read_target(
+                binding,
+                decision,
+                deadline_monotonic=time.monotonic() + 1,
+                backend_timeout_s=0.5,
+            )
+    finally:
+        reader.close()
+
+
+def test_kubernetes_kueue_live_reader_rejects_stale_quota_projection(tmp_path: Path) -> None:
+    decision = _decision()
+    binding = _binding(decision, command_id=_prestage_command(decision).command_id)
+    routes = _kubernetes_live_routes(decision, binding)
+    quota_path = (
+        "/apis/autoscaling.kairyu.ai/v1alpha1/namespaces/scaling-system/"
+        "runnerscalingquotasnapshots/qwen-quota"
+    )
+    routes[quota_path] = _quota_snapshot_payload(
+        decision,
+        kueue_resource_version="old",
+    )
+    reader = _kubernetes_live_reader(
+        tmp_path,
+        lambda request: httpx.Response(200, json=routes[request.url.path]),
+    )
+    try:
+        with pytest.raises(
+            RunnerCachePlacementBindingAuthorizationDeniedError,
+            match="current Kueue",
+        ):
+            reader.read_quota(
+                binding,
+                decision,
+                deadline_monotonic=time.monotonic() + 1,
+                backend_timeout_s=0.5,
+            )
+    finally:
+        reader.close()
+
+
+def test_kubernetes_kueue_live_reader_returns_revoked_kueue_admission(tmp_path: Path) -> None:
+    decision = _decision()
+    binding = _binding(decision, command_id=_prestage_command(decision).command_id)
+    routes = _kubernetes_live_routes(decision, binding)
+    assert decision.quota_admission is not None
+    workload_name = decision.quota_admission.snapshot.kueue.workload_name
+    routes[f"/apis/kueue.x-k8s.io/v1beta2/namespaces/model-serving/workloads/{workload_name}"] = (
+        _kueue_workload_payload(decision, admitted=False, resource_version="44")
+    )
+    quota_path = (
+        "/apis/autoscaling.kairyu.ai/v1alpha1/namespaces/scaling-system/"
+        "runnerscalingquotasnapshots/qwen-quota"
+    )
+    routes[quota_path] = _quota_snapshot_payload(
+        decision,
+        kueue_resource_version="44",
+    )
+    reader = _kubernetes_live_reader(
+        tmp_path,
+        lambda request: httpx.Response(200, json=routes[request.url.path]),
+    )
+    try:
+        quota = reader.read_quota(
+            binding,
+            decision,
+            deadline_monotonic=time.monotonic() + 1,
+            backend_timeout_s=0.5,
+        )
+    finally:
+        reader.close()
+
+    assert not quota.snapshot.kueue.admitted
+    assert quota.admitted_replicas == 0
+
+
+def test_kubernetes_kueue_live_reader_rejects_inventory_binding_drift(tmp_path: Path) -> None:
+    decision = _decision()
+    binding = _binding(decision, command_id=_prestage_command(decision).command_id)
+    routes = _kubernetes_live_routes(decision, binding)
+    inventory_path = (
+        "/apis/autoscaling.kairyu.ai/v1alpha1/namespaces/scaling-system/"
+        "runnercacheplacementinventories/qwen-inventory"
+    )
+    inventory = _inventory_payload(decision, binding)
+    inventory["spec"]["bindingId"] = "0" * 64  # type: ignore[index]
+    routes[inventory_path] = inventory
+    reader = _kubernetes_live_reader(
+        tmp_path,
+        lambda request: httpx.Response(200, json=routes[request.url.path]),
+    )
+    try:
+        with pytest.raises(
+            RunnerCachePlacementBindingAuthorizationDeniedError,
+            match="current decision",
+        ):
+            reader.read_inventory(
+                binding,
+                decision,
+                deadline_monotonic=time.monotonic() + 1,
+                backend_timeout_s=0.5,
+            )
+    finally:
+        reader.close()
+
+
+def test_kubernetes_kueue_live_reader_rejects_unready_projection(tmp_path: Path) -> None:
+    decision = _decision()
+    binding = _binding(decision, command_id=_prestage_command(decision).command_id)
+    routes = _kubernetes_live_routes(decision, binding)
+    inventory_path = (
+        "/apis/autoscaling.kairyu.ai/v1alpha1/namespaces/scaling-system/"
+        "runnercacheplacementinventories/qwen-inventory"
+    )
+    routes[inventory_path] = _inventory_payload(decision, binding, ready=False)
+    reader = _kubernetes_live_reader(
+        tmp_path,
+        lambda request: httpx.Response(200, json=routes[request.url.path]),
+    )
+    try:
+        with pytest.raises(
+            RunnerCachePlacementBindingAuthorizationDeniedError,
+            match="not current and ready",
+        ):
+            reader.read_inventory(
+                binding,
+                decision,
+                deadline_monotonic=time.monotonic() + 1,
+                backend_timeout_s=0.5,
+            )
+    finally:
+        reader.close()
+
+
+def test_kubernetes_kueue_live_reader_rejects_duplicate_json(tmp_path: Path) -> None:
+    decision = _decision()
+    binding = _binding(decision, command_id=_prestage_command(decision).command_id)
+    reader = _kubernetes_live_reader(
+        tmp_path,
+        lambda _request: httpx.Response(
+            200,
+            content=b'{"apiVersion":"apps/v1","apiVersion":"apps/v1"}',
+            headers={"content-type": "application/json"},
+        ),
+    )
+    try:
+        with pytest.raises(
+            InvalidKubernetesPlacementBindingLiveResponseError,
+            match="strict JSON",
+        ):
+            reader.read_target(
+                binding,
+                decision,
+                deadline_monotonic=time.monotonic() + 1,
+                backend_timeout_s=0.5,
+            )
+    finally:
+        reader.close()
+
+
+def test_kubernetes_kueue_live_reader_uses_one_backend_budget_for_multi_get(
+    tmp_path: Path,
+) -> None:
+    decision = _decision()
+    binding = _binding(decision, command_id=_prestage_command(decision).command_id)
+    routes = _kubernetes_live_routes(decision, binding)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.03)
+        return httpx.Response(200, json=routes[request.url.path])
+
+    reader = _kubernetes_live_reader(tmp_path, handler)
+    started = time.monotonic()
+    try:
+        with pytest.raises(TimeoutError):
+            reader.read_quota(
+                binding,
+                decision,
+                deadline_monotonic=started + 1,
+                backend_timeout_s=0.05,
+            )
+    finally:
+        reader.close()
+    assert time.monotonic() - started < 0.15
+
+
+def test_kubernetes_kueue_live_reader_bounds_python_lock_wait(tmp_path: Path) -> None:
+    decision = _decision()
+    binding = _binding(decision, command_id=_prestage_command(decision).command_id)
+    routes = _kubernetes_live_routes(decision, binding)
+    reader = _kubernetes_live_reader(
+        tmp_path,
+        lambda request: httpx.Response(200, json=routes[request.url.path]),
+    )
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def hold_lock() -> None:
+        with reader._lock:  # noqa: SLF001 - deadline lock regression coverage.
+            acquired.set()
+            release.wait(timeout=1)
+
+    thread = threading.Thread(target=hold_lock)
+    thread.start()
+    assert acquired.wait(timeout=0.2)
+    started = time.monotonic()
+    try:
+        with pytest.raises(TimeoutError, match="lock"):
+            reader.read_target(
+                binding,
+                decision,
+                deadline_monotonic=started + 0.04,
+                backend_timeout_s=0.5,
+            )
+    finally:
+        release.set()
+        thread.join(timeout=0.2)
+        reader.close()
+    assert time.monotonic() - started < 0.15
+
+
+def test_kubernetes_kueue_live_reader_joins_cancelled_request_before_close(
+    tmp_path: Path,
+) -> None:
+    decision = _decision()
+    binding = _binding(decision, command_id=_prestage_command(decision).command_id)
+    started = threading.Event()
+    stopped = threading.Event()
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        started.set()
+        try:
+            await asyncio.sleep(10)
+        finally:
+            stopped.set()
+        raise AssertionError("cancelled Kubernetes request resumed")
+
+    reader = _kubernetes_live_reader(tmp_path, handler)
+    loop_thread = reader._loop_thread  # noqa: SLF001 - lifecycle regression coverage.
+    with pytest.raises(TimeoutError):
+        reader.read_target(
+            binding,
+            decision,
+            deadline_monotonic=time.monotonic() + 0.04,
+            backend_timeout_s=0.5,
+        )
+    assert started.is_set()
+    assert stopped.wait(timeout=0.1)
+    reader.close()
+    assert not loop_thread.is_alive()
+
+
+def test_kubernetes_kueue_live_reader_bounds_service_account_token_read(
+    tmp_path: Path,
+) -> None:
+    decision = _decision()
+    binding = _binding(decision, command_id=_prestage_command(decision).command_id)
+    called = False
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(500)
+
+    reader = _kubernetes_live_reader(tmp_path, handler)
+    reader._token_path.write_bytes(b"a" * (64 * 1024 + 1))  # noqa: SLF001
+    try:
+        with pytest.raises(ValueError, match="token exceeds"):
+            reader.read_target(
+                binding,
+                decision,
+                deadline_monotonic=time.monotonic() + 1,
+                backend_timeout_s=0.5,
+            )
+    finally:
+        reader.close()
+    assert not called
+
+
+def test_kubernetes_kueue_live_reader_keeps_malformed_crd_type_as_dependency_failure(
+    tmp_path: Path,
+) -> None:
+    decision = _decision()
+    binding = _binding(decision, command_id=_prestage_command(decision).command_id)
+    routes = _kubernetes_live_routes(decision, binding)
+    quota_path = (
+        "/apis/autoscaling.kairyu.ai/v1alpha1/namespaces/scaling-system/"
+        "runnerscalingquotasnapshots/qwen-quota"
+    )
+    quota = _quota_snapshot_payload(decision)
+    quota["spec"]["tenantId"] = ["tenant-a"]  # type: ignore[index]
+    routes[quota_path] = quota
+    reader = _kubernetes_live_reader(
+        tmp_path,
+        lambda request: httpx.Response(200, json=routes[request.url.path]),
+    )
+    try:
+        with pytest.raises(ValueError, match="tenantId"):
+            reader.read_quota(
+                binding,
+                decision,
+                deadline_monotonic=time.monotonic() + 1,
+                backend_timeout_s=0.5,
+            )
+    finally:
+        reader.close()
+
+
+def test_kubernetes_kueue_live_readiness_checks_each_api_version_per_namespace(
+    tmp_path: Path,
+) -> None:
+    token = tmp_path / "token"
+    token.write_text("service-account-token\n", encoding="ascii")
+    targets = (
+        _kubernetes_live_target(),
+        KubernetesPlacementBindingLiveTarget(
+            model_class="qwen-32b",
+            target_kind="Deployment",
+            namespace="model-serving",
+            name="qwen-32b-runners",
+            authority_namespace="scaling-system",
+            kueue_namespace="model-serving",
+            kueue_api_version="kueue.x-k8s.io/v1beta1",
+            quota_snapshot_name="qwen-32b-quota",
+            inventory_name="qwen-32b-inventory",
+            pod_set_name="runners",
+        ),
+    )
+    paths: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path.endswith("/workloads"):
+            version = request.url.path.split("/")[3]
+            return httpx.Response(
+                200,
+                json={
+                    "apiVersion": f"kueue.x-k8s.io/{version}",
+                    "kind": "WorkloadList",
+                    "items": [],
+                },
+            )
+        if "runnerscalingquotasnapshots" in request.url.path:
+            return httpx.Response(
+                200,
+                json={
+                    "apiVersion": "autoscaling.kairyu.ai/v1alpha1",
+                    "kind": "RunnerScalingQuotaSnapshot",
+                },
+            )
+        if "runnercacheplacementinventories" in request.url.path:
+            return httpx.Response(
+                200,
+                json={
+                    "apiVersion": "autoscaling.kairyu.ai/v1alpha1",
+                    "kind": "RunnerCachePlacementInventory",
+                },
+            )
+        return httpx.Response(200, json={"apiVersion": "apps/v1", "kind": "Deployment"})
+
+    reader = KubernetesKueueRunnerCachePlacementBindingReader(
+        targets=targets,
+        api_server="https://kubernetes.example",
+        token_path=token,
+        client=httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            trust_env=False,
+            follow_redirects=False,
+        ),
+    )
+    try:
+        reader.readiness(
+            deadline_monotonic=time.monotonic() + 1,
+            backend_timeout_s=0.5,
+        )
+    finally:
+        reader.close()
+
+    assert "/apis/kueue.x-k8s.io/v1beta1/namespaces/model-serving/workloads" in paths
+    assert "/apis/kueue.x-k8s.io/v1beta2/namespaces/model-serving/workloads" in paths

@@ -415,6 +415,19 @@ class RunnerLeaderElector:
             self._lease = None
             return True
 
+    def abandon(self) -> bool:
+        """Drop process-local authority without mutating the shared lease.
+
+        This is a shutdown-only fallback when a release attempt cannot reach
+        the store. The durable lease is left to expire, while the local process
+        immediately loses its capability to authorize further mutations.
+        """
+
+        with self._lock:
+            had_lease = self._lease is not None
+            self._lease = None
+            return had_lease
+
 
 class LeaderFencedRunnerController:
     """Allow Runner and future autoscaler mutations only under live authority."""

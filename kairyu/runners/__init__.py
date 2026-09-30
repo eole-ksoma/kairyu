@@ -70,6 +70,11 @@ from kairyu.runners.leadership import (
     RunnerWriterAuthority,
     StaleRunnerLeaderLeaseError,
 )
+from kairyu.runners.leadership_runtime import (
+    RunnerLeaderElectionRuntime,
+    RunnerLeaderElectionRuntimeConfig,
+    RunnerLeaderElectionRuntimeStatus,
+)
 from kairyu.runners.lifecycle import (
     InvalidRunnerStartupReportError,
     InvalidRunnerTransitionError,
@@ -492,6 +497,9 @@ __all__ = [
     "RunnerPodObservation",
     "RunnerRuntimeObservation",
     "RunnerLeaderCapacityError",
+    "RunnerLeaderElectionRuntime",
+    "RunnerLeaderElectionRuntimeConfig",
+    "RunnerLeaderElectionRuntimeStatus",
     "RunnerLeaderElector",
     "RunnerLeaderLease",
     "RunnerLeaderLeaseStore",

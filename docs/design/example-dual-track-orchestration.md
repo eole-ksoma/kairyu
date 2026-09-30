@@ -11,7 +11,8 @@ Chat UI and Terminal-Bench passes remain on the next-window list. The
 previous green run (2026-08-18, `20260818T025710Z`) measured the pre-DTO-D8
 nine-role DAG.
 Applies to: `examples/qwen3.8-deepseek-v4-8gpu/` and the L2 mechanisms in
-`kairyu/orchestration/` + `kairyu/dsl/` that it consumes.
+`kairyu/orchestration/` + `kairyu/dsl/` that it consumes; DTO-D16 applies the
+same policy to `examples/qwen3.8-deepseek-v4.1-8gpu/`.
 Supersedes the ECO-D2/D3/D5/D6 role graphs, profiles, and profile judge in
 `example-coding-orchestration.md` (owner decision, 2026-08-18: the coding DAG,
 the general ensemble profile, the LLM profile judge, and the sandbox execution
@@ -606,6 +607,48 @@ Status: accepted; implemented; serving gates GPU re-verify and digest re-pin pen
   `prompt_suffix`.
 - GPU consequences: served config changed → both serving gates and the
   digest re-pin must be re-run before the next status claim.
+
+### DTO-D16 — DeepSeek V4.1 six-GPU + Qwen two-replica variant (owner decision, 2026-09-30)
+
+Status: accepted; CPU half implemented; GPU gates pending
+(plan `docs/superpowers/plans/2026-09-30-qwen38-deepseek-v41-8gpu-example.md`).
+
+- New example `qwen3.8-deepseek-v4.1-8gpu`: DeepSeek-V4.1-Flash as one
+  DP6/EP6 replica on GPUs 0–5 (the measured L1 of `deepseek-v4.1-flash-6gpu`,
+  FN-D9 six-GPU amendment) and Qwen3.8-27B TP1 × 2 on GPUs 6 and 7. The
+  V4 example is unchanged. The ensemble method is inherited unchanged:
+  the judge and its five routes (D13), the three-wave dual-track DAG (D1, D2),
+  the head stream and TTFT gate (D3), peer synthesis with the inline Qwen
+  audit (D10, D14), the sampling policy and budgets (D8, D12), and the
+  public-output floor (D9, D15). Role prompt bodies, seeds, and the four
+  policy-bound answerers are kept; wave 2 now shares two Qwen replicas.
+- D11 is withdrawn for this variant. V4.1 accepts images, so every worker is
+  image-capable. `derive_multimodal_prompt` attaches the request's images to
+  each role call, so `image_description`, its dependencies, and every
+  `IMAGE DESCRIPTION` block are removed; the budget becomes `{18, 2}`. The
+  judge now offers every route on image requests, because each route's worker
+  accepts images. The ensemble's image limit is the Qwen pool's one-image
+  policy.
+- DeepSeek roles move from inline completion scaffolds (D6, D7) to the
+  official V4.1 encoder on the chat path. Images can only reach a role
+  through a chat message, and V4.1 renders chats with its Python encoder,
+  not a Jinja template. Role prompts keep their text without the
+  `<｜User｜>`/`<｜Assistant｜>` scaffolding.
+  - One DeepSeek pool serves every DeepSeek role. `inherit` roles send the
+    L3 effort as `reasoning_effort` (thinking, 50/75/100 budgets). The
+    effort-less `deepseek_answer` gets Kairyu's existing `enable_thinking:
+    false`, which requires the L1 to carry no `thinking: true` default
+    (the encoder ORs the two keys).
+  - The V4 preamble templates are not carried over.
+- The D9 floor on the DeepSeek final units uses D15's `chat` continuation.
+  The pinned V4.1 encoder ignores `continue_final_message`: it appends
+  end-of-sentence and re-renders an empty think span. This example's own
+  overlay therefore patches the encoder to render a final
+  `<think>…</think>` assistant prefill as an open continuation. This is a
+  runtime adaptation owned by the example; `kairyu/` is unchanged.
+- Rationale: owner request — V4.1 performance on the six-GPU L1 with the
+  inherited ensemble method, and native image input in place of the
+  Qwen-described proxy.
 
 ## Acceptance
 

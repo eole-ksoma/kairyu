@@ -30,8 +30,10 @@ D3.15 adds deadline-bounded PostgreSQL current-binding and exact durable-decisio
 readers. D3.16 adds deadline-bounded Kubernetes target, Kueue quota, and
 controller-owned placement-inventory readers. D3.17 adds a lifecycle-owned,
 scheduled caller for the bounded compaction contract. D3.18 adds leader-fenced,
-optimistic-concurrency reconcilers for the two authority CRDs. CRD definitions,
-runtime assembly, deployment wiring, and live acceptance remain deployment tasks.
+optimistic-concurrency reconcilers for the two authority CRDs. D3.19 adds the
+leader-election lifecycle that campaigns, renews, retries, reports readiness,
+and resigns without overlapping lease operations. Runtime assembly, deployment
+wiring, and live acceptance remain deployment tasks.
 
 ## Purpose
 
@@ -737,6 +739,27 @@ proxy/CA inheritance, requires strict size-bounded JSON, and shares one absolute
 deadline across lock wait and all API calls. Exact replay performs only the GET;
 409/422 CAS failures and leadership changes remain explicit retryable conflicts.
 
+D3.19 adds `RunnerLeaderElectionRuntime` around the existing
+`RunnerLeaderElector` and `LeaderFencedRunnerController`. One lifecycle-owned
+worker campaigns immediately, renews an acquired tenure on a bounded interval,
+and retries follower or backend outcomes without overlapping an election
+operation. Its strict configuration keeps renewal and process-local readiness
+staleness shorter than the durable lease, bounds retry cadence and shutdown,
+and rejects boolean or non-finite timing values.
+
+Readiness requires a live worker, a locally held lease, a recent successful
+store interaction, and fewer than the configured consecutive failures. It is a
+low-disclosure process signal only: every controller mutation still calls the
+shared store's authorization path. The runtime exposes no raw elector, and its
+controller serializes mutation admission with lifecycle transitions so
+`stopping`, `stopped`, and `failed` states reject new writes even when an
+in-flight renewal later returns. Mutation callbacks do not hold the status
+lock; shutdown closes admission immediately and waits for an already-active
+callback only within the shared shutdown deadline before resigning.
+If durable release fails, shutdown reports the failure and abandons the local
+lease so the stopped process cannot authorize more work; the durable lease then
+expires normally. An injected store remains caller-owned.
+
 ## Deployment boundary
 
 `private-ai-cloud-iac` must still provide:
@@ -749,6 +772,8 @@ deadline across lock wait and all API calls. Exact replay performs only the GET;
 - assembly and configuration of the implemented scheduled compaction runtime,
   including an operator-approved retention age plus export of runtime status
   and per-placement high-water monitoring;
+- assembly and configuration of the implemented leader-election lifecycle,
+  including stable per-replica holder identities plus readiness/status export;
 - CRD definitions, runtime assembly and least-privilege read/write RBAC for the
   implemented `RunnerScalingQuotaSnapshot` and `RunnerCachePlacementInventory`
   reconcilers and Kubernetes/Kueue reader;

@@ -392,8 +392,24 @@ def _seed_model(target: Path, seed_env: str) -> bool:
     source = Path(seed).resolve()
     if not (source / "config.json").is_file():
         raise SystemExit(f"{seed_env} has no checkpoint: {source}")
-    _run(["cp", "-al", str(source), str(target)])
-    (target / ".kairyu-model-attestation.json").unlink(missing_ok=True)
+    print(f"+ seeding {target} from {source}", flush=True)
+    for path in sorted(source.rglob("*")):
+        if path.name == ".kairyu-model-attestation.json" or not path.is_file():
+            continue
+        destination = target / path.relative_to(source)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(path, destination)
+        except PermissionError:
+            # protected_hardlinks refuses files owned by another user (the
+            # root-written download metadata); those are small, so copy them.
+            # Unreadable Hugging Face bookkeeping under .cache is not part of
+            # the attested tree and is rebuilt by the download step.
+            try:
+                shutil.copy2(path, destination)
+            except PermissionError:
+                if ".cache" not in path.relative_to(source).parts:
+                    raise
     return True
 
 

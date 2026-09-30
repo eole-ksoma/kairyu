@@ -271,3 +271,41 @@ content) separately from first visible content, which stays null if no
 content was emitted. Completed-answer/tool/image gates are independent.
 Only SHA-bound measurements in the example's `MEASUREMENTS.md` establish
 the final runtime and performance claims.
+
+### V4.1 Flash six-GPU amendment (2026-09-30)
+
+Status: accepted by the owner (plan
+`docs/superpowers/plans/2026-09-30-deepseek-v41-flash-6gpu-example.md`);
+selection and gates in the example's `MEASUREMENTS.md`.
+
+`examples/deepseek-v4.1-flash-6gpu` serves one replica on GPUs 0–5 with the
+8-GPU example's L2/L3 structure (one ReplicaPool replica, legacy OpenAI
+chat/tool path, image admission, Open WebUI). GPUs 6–7 are not used. Every
+script, overlay file and test is the example's own; no file of another
+example is shared (owner instruction).
+
+The L1 starts from the official sources and deviates only where SM120 or
+the 576 GB of HBM forces it or a bounded one-parameter comparison supports
+it (≥ 5 % on c1 or c32 throughput, no > 5 % loss elsewhere). Six 96 GB GPUs
+are below the checkpoint's official 614 GB minimum, so the recipe's
+memory-bound (8 × H100) arm applies: Engram tables in pinned host memory,
+4,096 batched tokens and memory utilization 0.92. The replica is the
+official Blackwell DEP shape — attention DP6 with EP6 (384 experts, 64 per
+rank) — but on the TP path's SM120 kernels, because the recipe's DEP
+kernels and `indexer_sparse_logits` are SM100-only. DP6 beats the official
+TP2 degree (TP2 × DP3 on NUMA-local pairs) by 44–47 % at c32. DSpark runs
+with its trained 5-token block and full verification (the V4.1 indexer
+backend rejects adaptive verification); its 128 draft experts do not divide
+EP6, which the fused-MoE path accepts. DSpark adds 77 % at c1 and 20 % at c32
+over DP6 without it. TP2 × DP3 with DSpark fails in CUDA-graph capture of
+the TP2 custom all-reduce.
+
+The pinned nightly already renders the model author's efforts (low 50,
+high 75, max 100, default high); the overlay checks that and adds the
+SM120 edits the 8-GPU example needed, plus a zero row for masked sparse-KV
+candidates and the split top-p guard that the earlier six-GPU attempts
+showed necessary (without them EP6 returned non-finite output). Prebuilt
+FlashInfer JIT caches are removed so the patched kernels are the ones
+compiled; a NaN-poisoned masked slot in the kernel gate catches a shadowed
+kernel. Only SHA-bound rows in the example's `MEASUREMENTS.md` establish
+runtime and performance claims.

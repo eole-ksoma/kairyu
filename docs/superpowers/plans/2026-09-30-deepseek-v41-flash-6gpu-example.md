@@ -1,6 +1,6 @@
 # DeepSeek V4.1 Flash single-replica example on six GPUs
 
-Status: **Plan — awaiting owner approval; nothing below is implemented.**
+Status: **Approved 2026-09-30 and implemented; see Outcome.**
 
 Accepted scope (owner, 2026-09-30):
 
@@ -176,8 +176,28 @@ Evidence, run IDs, hashes and limitations go in `MEASUREMENTS.md`.
 
 ## Checklist
 
-- [ ] Owner approves this plan.
-- [ ] Branch, example files and example-owned scripts, CPU tests, lint.
-- [ ] Release GPUs 0–5 (save and report the state of anything running).
-- [ ] L1-0 … L1-6 in order; record every candidate.
-- [ ] Final gates; MEASUREMENTS.md; FN-D9 amendment; PROGRESS.md; PR.
+- [x] Owner approves this plan.
+- [x] Branch, example files and example-owned scripts, CPU tests, lint.
+- [x] Release GPUs 0–5 (they were idle; nothing was stopped).
+- [x] L1-0 … L1-6 in order; record every candidate.
+- [x] Final gates; MEASUREMENTS.md; FN-D9 amendment; PROGRESS.md.
+
+## Outcome and deviations from this plan
+
+- L1-0: candidate (a), the pinned nightly, passed first and was adopted;
+  (b) was not re-run (the tiered branch already showed it failing on EP6),
+  (c) passed the kernel gate but was not needed.
+- The replica shape changed from the planned TP2 × DP3 baseline to DP6 /
+  EP6: L1-4's DP6 row (with this example's SM120 kernels, not the official
+  SM100-only DEP kernels) beat TP2 × DP3 by 44–47 % at c32.
+- L1-6: DSpark needed no runtime change. The drafter's 128 experts load
+  under EP6 on the fused-MoE path (only the mega-MoE path asserts
+  divisibility — the earlier plan text was wrong). Adaptive verification is
+  rejected by the V4.1 indexer backend; full verification needs the recipe's
+  4K / 0.92 memory levers on DP6 and was adopted.
+- `indexer_sparse_logits` and the official DEP kernels fail on SM120; the
+  encoder-DP option and V2 runner showed no measurable difference.
+- One L1 container cannot pin each DP rank to its own NUMA node; its cpuset
+  is the union of the nodes of GPUs 0–5.
+- The unused 0909 patch profile was removed before the final gates, so the
+  final image differs from the tuning image only by that script content.

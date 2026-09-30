@@ -2,12 +2,12 @@
 
 Every edit replaces exactly one known source anchor and fails the image build
 when the anchor is missing or repeated, so an upstream change can never be
-patched silently. Edits are selected by the exact vLLM version of the base
-image (``PROFILES``); an unknown version fails.
+patched silently. The edits target one exact vLLM version (``VLLM_VERSION``);
+any other version fails the build.
 
 1. Effort aliases: the model author's encoder defines low=50, high=75, max=100
-   with high as the default (checkpoint ``encoding/README.md``). Older vLLM
-   builds carry 25/50/75/100; they are aligned, newer ones are only checked.
+   with high as the default (checkpoint ``encoding/README.md``). The pinned
+   runtime already renders them; the build only checks it.
 2. Page sizes: FlashInfer's SM120 sparse-MLA kernels need 64-token SWA pages,
    V4.1's C1/C2 compression needs 64-token manager blocks (C1=64, C2=32), and
    DeepGEMM's SM120 indexer accepts only those page sizes.
@@ -29,13 +29,11 @@ image (``PROFILES``); an unknown version fails.
 # ruff: noqa: E501  (C++ anchors keep their pinned line boundaries)
 from __future__ import annotations
 
-import ast
 import importlib.util
 import runpy
 from pathlib import Path
 
 OFFICIAL_EFFORTS = {"low": 50, "high": 75, "max": 100}
-LEGACY_VLLM_EFFORTS = {"low": 25, "high": 50, "xhigh": 75, "max": 100}
 
 
 def replace_once(source: str, before: str, after: str) -> str:
@@ -49,28 +47,6 @@ def replace_once(source: str, before: str, after: str) -> str:
 
 
 # --- 1. effort aliases ---------------------------------------------------------
-
-
-def align_efforts(source: str) -> str:
-    tree = ast.parse(source)
-    matches = [
-        node
-        for node in tree.body
-        if isinstance(node, ast.AnnAssign)
-        and isinstance(node.target, ast.Name)
-        and node.target.id == "REASONING_EFFORT_MAPPINGS"
-    ]
-    if len(matches) != 1:
-        raise ValueError("expected one V4.1 REASONING_EFFORT_MAPPINGS assignment")
-    node = matches[0]
-    current = ast.literal_eval(node.value)
-    if current != LEGACY_VLLM_EFFORTS:
-        raise ValueError(f"unrecognized legacy effort mapping: {current!r}")
-    lines = source.splitlines(keepends=True)
-    lines[node.lineno - 1 : node.end_lineno] = [
-        f"REASONING_EFFORT_MAPPINGS: Dict[str, int] = {OFFICIAL_EFFORTS!r}\n"
-    ]
-    return "".join(lines)
 
 
 def check_efforts(encoder_path: Path) -> None:
@@ -121,30 +97,8 @@ def sm120_mla_pages(source: str) -> str:
     )
 
 
-def sm120_indexer_pages_legacy(source: str) -> str:
-    """0909 base: the V4.1 indexer cache selects the generic V4 backend."""
-    declaration = "class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):"
-    backend = (
-        "class DeepseekV41SM120IndexerBackend(DeepseekV4IndexerBackend):\n"
-        "    @staticmethod\n"
-        "    def get_supported_kernel_block_sizes():\n"
-        "        return [64]\n"
-        "\n"
-        "\n"
-    )
-    source = replace_once(source, declaration, backend + declaration)
-    return replace_once(
-        source,
-        "        return DeepseekV4IndexerBackend\n",
-        "        from vllm.platforms import current_platform\n"
-        "        if current_platform.is_device_capability_family(120):\n"
-        "            return DeepseekV41SM120IndexerBackend\n"
-        "        return DeepseekV4IndexerBackend\n",
-    )
-
-
 def sm120_indexer_pages(source: str) -> str:
-    """Nightly: the V4.1 indexer backend already has a per-family page size."""
+    """The V4.1 indexer backend picks its page size per device family."""
     return replace_once(
         source,
         "        return [64 if current_platform.is_device_capability_family(90) else 128]\n",
@@ -285,45 +239,22 @@ def top_p_guard(source: str) -> str:
 
 FLASHINFER_SM120 = "data/include/flashinfer/attention/sparse_mla_sm120"
 
-# (package root, relative path, edits) per exact vLLM version.
-PROFILES: dict[str, dict[str, object]] = {
-    # vllm/vllm-openai:deepseekv41-flash-0909 (source 179dd0fa9) + FlashInfer 60b49158.
-    "0.1.dev20904+g179dd0fa9": {
-        "encoder": "legacy",
-        "edits": [
-            (
-                "vllm",
-                "models/deepseek_v4_1/attention.py",
-                (configurable_swa_pages, sm120_indexer_pages_legacy),
-            ),
-            (
-                "vllm",
-                "models/deepseek_v4_1/nvidia/flashinfer_sparse.py",
-                (sm120_swa_pages, sm120_mla_pages),
-            ),
-            ("vllm", "v1/attention/backends/mla/indexer.py", (sm120_v41_mxfp4_indexer,)),
-            ("vllm", "v1/sample/ops/topk_topp_triton.py", (top_p_guard,)),
-        ],
-    },
-    # vllm/vllm-openai:nightly of 2026-09-30 (FlashInfer 0.7.0.post1 bundled).
-    "0.30.1rc1.dev396+gac68c3087": {
-        "encoder": "official",
-        "edits": [
-            ("vllm", "models/deepseek_v41/attention.py", (configurable_swa_pages,)),
-            (
-                "vllm",
-                "models/deepseek_v41/nvidia/flashinfer_sparse.py",
-                (sm120_swa_pages, sm120_mla_pages),
-            ),
-            (
-                "vllm",
-                "v1/attention/backends/mla/indexer.py",
-                (sm120_indexer_pages, sm120_v41_mxfp4_indexer),
-            ),
-            ("vllm", "v1/sample/ops/topk_topp_triton.py", (top_p_guard,)),
-        ],
-    },
-}
+# vllm/vllm-openai:nightly of 2026-09-30 (FlashInfer 0.7.0.post1 bundled).
+VLLM_VERSION = "0.30.1rc1.dev396+gac68c3087"
+VLLM_EDITS = [
+    ("vllm", "models/deepseek_v41/attention.py", (configurable_swa_pages,)),
+    (
+        "vllm",
+        "models/deepseek_v41/nvidia/flashinfer_sparse.py",
+        (sm120_swa_pages, sm120_mla_pages),
+    ),
+    (
+        "vllm",
+        "v1/attention/backends/mla/indexer.py",
+        (sm120_indexer_pages, sm120_v41_mxfp4_indexer),
+    ),
+    ("vllm", "v1/sample/ops/topk_topp_triton.py", (top_p_guard,)),
+]
 FLASHINFER_EDITS = [
     ("flashinfer", "data/csrc/sparse_mla_sm120_prefill.cu", (flashinfer_page32_prefill,)),
     ("flashinfer", f"{FLASHINFER_SM120}/common/kv_cache_io.cuh", (masked_kv_io,)),
@@ -342,19 +273,14 @@ def _package_root(name: str) -> Path:
 def main() -> None:
     import vllm
 
-    version = vllm.__version__
-    if version not in PROFILES:
-        raise SystemExit(f"no SM120 patch profile for vLLM {version}")
-    profile = PROFILES[version]
-    encoder = _package_root("vllm") / "tokenizers/deepseek_v41_encoding.py"
-    if profile["encoder"] == "legacy":
-        encoder.write_text(align_efforts(encoder.read_text()))
-    check_efforts(encoder)
+    if vllm.__version__ != VLLM_VERSION:
+        raise SystemExit(f"patches target vLLM {VLLM_VERSION}, found {vllm.__version__}")
+    check_efforts(_package_root("vllm") / "tokenizers/deepseek_v41_encoding.py")
     print("V4.1 encoder: low=50, high=75, max=100; default high")
 
     # Transform everything first; write only when every anchor matched.
     updates: list[tuple[Path, str]] = []
-    for package, relative, edits in [*profile["edits"], *FLASHINFER_EDITS]:
+    for package, relative, edits in [*VLLM_EDITS, *FLASHINFER_EDITS]:
         path = _package_root(package) / relative
         source = path.read_text()
         for edit in edits:

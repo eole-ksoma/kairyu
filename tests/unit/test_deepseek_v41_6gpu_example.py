@@ -139,8 +139,6 @@ def test_runtime_patches_fail_closed(example):
     for source in ("no anchor here", "            block_size=32,\n" * 2):
         with pytest.raises(ValueError, match="exactly one"):
             patch.configurable_swa_pages(source)
-    with pytest.raises(ValueError, match="legacy"):
-        patch.align_efforts("REASONING_EFFORT_MAPPINGS: Dict[str, int] = {'low': 30}\n")
     guarded = patch.top_p_guard(patch.TOP_P_ANCHOR)
     assert "if not (pivot_logit < M):" in guarded
     with pytest.raises(ValueError):

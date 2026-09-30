@@ -37,8 +37,8 @@ pools:
         tensor_parallel_size: 1
         expert_parallel_size: 6
         attention_data_parallel_size: 6
-        dspark_enabled: false
-        container_image_digest: sha256:0a209afd6593376cb9d6d0b670ade745ce69e6ebd558f140696f249ed612ba77
+        dspark_enabled: true
+        container_image_digest: sha256:119afb09d8b71203707c50e8f9da1300c9992aea6c7aaa959cdb18df7e2483c5
     unhealthy_after: 1
     queue_depth_threshold: 0
     prefix_index: true

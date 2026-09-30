@@ -79,6 +79,27 @@ CANDIDATES: dict[str, dict[str, object]] = {
         )
     },
 }
+# DSpark with the full-block verification needs KV room on DP6: combine it
+# with the official memory levers, or with the TP2 shape (larger KV pool).
+_DSPARK_FULL = CANDIDATES["dspark-full-verify"]["--speculative-config"]
+CANDIDATES.update(
+    {
+        "dspark-batch-4k": {
+            "--speculative-config": _DSPARK_FULL,
+            "--max-num-batched-tokens": "4096",
+        },
+        "dspark-batch-4k-memory-0.92": {
+            "--speculative-config": _DSPARK_FULL,
+            "--max-num-batched-tokens": "4096",
+            "--gpu-memory-utilization": "0.92",
+        },
+        "dspark-tp2-dp3": {
+            "--speculative-config": _DSPARK_FULL,
+            "--tensor-parallel-size": "2",
+            "--data-parallel-size": "3",
+        },
+    }
+)
 CANDIDATE_ENVIRONMENT = {"v2-runner": {"VLLM_USE_V2_MODEL_RUNNER": "1"}}
 BARE_FLAGS = {"--enable-expert-parallel", "--enable-prefix-caching", "--trust-remote-code"}
 

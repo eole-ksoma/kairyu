@@ -271,12 +271,6 @@ def _image_id(image: str) -> str | None:
     return inspected.stdout.strip() if inspected.returncode == 0 else None
 
 
-def build_arguments(source: dict) -> list[str]:
-    arguments = [f"VLLM_BASE_IMAGE={source['base_image']}"]
-    arguments.append(f"FLASHINFER_REVISION={source['flashinfer_revision']}")
-    return [item for argument in arguments for item in ("--build-arg", argument)]
-
-
 def _ensure_vllm_image(env: dict[str, str]) -> None:
     """Build this example's SM120 overlay when absent, then attest it by ID."""
 
@@ -294,7 +288,8 @@ def _ensure_vllm_image(env: dict[str, str]) -> None:
                 "--pull",
                 "--file",
                 str(HERE / source["dockerfile"]),
-                *build_arguments(source),
+                "--build-arg",
+                f"VLLM_BASE_IMAGE={source['base_image']}",
                 "--tag",
                 image,
                 "--label",

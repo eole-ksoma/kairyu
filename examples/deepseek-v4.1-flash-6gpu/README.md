@@ -6,7 +6,7 @@ Blackwell (SM120, PCIe) cards, behind the same L2/L3 structure as
 OpenAI-compatible API, and Open WebUI. GPUs 6–7 are not used.
 
 ```text
-Open WebUI (:3008) -> Kairyu (:8008) -> ReplicaPool -> vLLM (TP2 x DP3, EP6, GPUs 0-5)
+Open WebUI (:3008) -> Kairyu (:8008) -> ReplicaPool -> vLLM (DP6 / EP6 + DSpark, GPUs 0-5)
 ```
 
 ## Start
@@ -39,20 +39,29 @@ Chat UI: `http://127.0.0.1:3008` (local, no authentication).
 
 ## Why this configuration
 
-The settings start from the official sources and change only what this
-hardware forces or what a measurement in `MEASUREMENTS.md` supports.
+The settings start from the official sources (model card, encoder
+specification, vLLM recipe) and change only what this hardware forces or
+what a bounded measurement in `MEASUREMENTS.md` supports (one parameter at a
+time; a change is adopted only for ≥ 5 % on c1 or c32 throughput without a
+> 5 % loss elsewhere).
 
 | Setting | Value | Source / reason |
 |---|---|---|
-| Replica shape | TP2 × attention-DP3, EP6 | Official Blackwell TP is TP2. TP6 cannot divide 64 attention heads or 8 output groups; 384 routed experts / 6 = 64 per rank. Each DP rank's TP pair is one NUMA-local PCIe pair (0,1)(2,3)(4,5); `run.sh` refuses a layout that splits a pair across sockets. |
-| Engram | `cpu_offload: true` | 6 × 96 GB is below the checkpoint's official 614 GB minimum; the recipe's memory-bound 8 × H100 arm moves the 183 GiB Engram tables to pinned host memory ("output is unchanged"). |
-| Attention | `FLASHINFER_MLA_SPARSE_DSV41`, FP8 KV, MXFP4 indexer | Official Blackwell TP settings. |
-| Pages | 64-token blocks | SM120 requirement (FlashInfer SM120 SWA pages, DeepGEMM C1/C2 indexer pages); `patch_sm120.py`. |
-| MoE | Marlin | SM120 MXFP4 MoE path measured by the 8-GPU example. |
-| Scheduler | 128 sequences, 16,384 batched tokens, memory 0.90 | Official Blackwell `max-num-seqs`; recipe tuning order for the rest (see measurements). |
-| Speculative decoding | off | DSpark's drafter has 128 experts per stage; vLLM asserts `experts % ep_size == 0` for every MoE layer, and redundant experts cannot make both 384 + r and 128 + r divisible by 6. Enabling it needs a runtime change, not a flag. |
-| Effort | default thinking high (75); low 50, max 100 | The model author's encoder (`encoding/README.md`); vLLM's recipe lists 25/50/75/100, which the author's definition overrides. |
+| Runtime | `vllm/vllm-openai:nightly` pinned by digest + `patch_sm120.py` | The recipe's image. It already renders the model author's efforts; the SM120 edits below are still missing upstream. |
+| Replica shape | DP6 / EP6 (TP1 per rank) | Official Blackwell "DEP" shape. 384 routed experts / 6 = 64 per rank. Measured against the official TP2 degree (TP2 × DP3 on NUMA-local pairs): c32 +44–47 %, c1 TTFT −37 %. TP6 cannot divide 64 heads / 8 output groups. The official DEP kernels (FlashMLA mega attention, DeepGEMM mega MoE) are SM100-only, so DEP runs on the TP path's SM120 kernels. |
+| Engram | `cpu_offload: true` | 6 × 96 GB is below the checkpoint's official 614 GB minimum; the recipe's memory-bound 8 × H100 arm moves the 183 GiB tables to pinned host memory ("output is unchanged"). |
+| Batched tokens / memory | 4096 / 0.92 | The same memory-bound arm's values. Needed to fit DSpark on DP6 (at 16K / 0.90 its KV pool is negative). |
+| DSpark | 5-token block, probabilistic drafts, block rejection, full verification | Official method and block. Adaptive verification (the NVIDIA default) is rejected by the V4.1 indexer backend. Measured: c1 +77 % (TPOT 14.7 → 6.9 ms), c32 +20 %. |
+| Attention | `FLASHINFER_MLA_SPARSE_DSV41`, FP8 KV, MXFP4 indexer | Official Blackwell settings. `indexer_sparse_logits` fails at start on SM120 (SM100-only DeepGEMM kernel). |
+| Pages | 64-token blocks | SM120 requirement (FlashInfer SWA pages, DeepGEMM C1/C2 indexer pages). |
+| MoE | Marlin | SM120 MXFP4 MoE path. |
+| Sequences | 128 per DP engine | Official Blackwell value; 64 measured no different. |
+| Vision encoder | default (not `--mm-encoder-tp-mode data`) | Official option measured no different on TP1 ranks. |
+| Effort | default thinking high (75); low 50, max 100 | The model author's encoder (`encoding/README.md`), which the runtime renders; the recipe's 25/50/75/100 table is the older vLLM encoder's. |
 | Sampling | temperature 1.0, top_p 0.95 | Model card; the setting DeepSeek's published results use. Applied at L1 with `--override-generation-config`; callers can still send their own. |
+
+Each of the six DP engines holds about 8.3M KV tokens, so a full
+1,048,576-token request fits on any engine.
 
 ## SM120 runtime overlay
 
@@ -66,7 +75,7 @@ fails the build if any anchor is missing or repeated:
   it every EP6 shape returned NaN log-probabilities or unrelated text);
 - the split top-p cutoff keeps a candidate when a forced logit rounds the
   cutoff to the maximum;
-- effort aliases aligned to the model author on bases that predate it.
+- a build-time check that the encoder renders the model author's efforts.
 
 Prebuilt FlashInfer JIT caches are removed so the patched sources are the
 ones compiled. `check_sm120_kernels.py` is the numerical gate for these
@@ -79,9 +88,9 @@ docker run --rm --gpus device=0 -v "$PWD:/checks:ro" --entrypoint python3 \
 
 ## Verification gates
 
-- `l1`: rendered efforts (default/low/high/max/chat), 12 concurrent
-  `17 * 19` probes per variant with exact answers and finite
-  log-probabilities that must reach all three DP engines, the L1 default
+- `l1`: rendered efforts (default/low/high/max/chat), rounds of 12
+  concurrent `17 * 19` probes per variant with exact answers and finite
+  log-probabilities until all six DP engines have answered, the L1 default
   sampling, tool call, image, and memory.
 - `serving`: fixed 8K-in / 256-out rows at c1/8/16/32/64 (64 requests each),
   every request placed on the replica, GPU peaks.

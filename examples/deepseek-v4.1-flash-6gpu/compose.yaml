@@ -2,9 +2,12 @@ name: kairyu-deepseek-v4.1-flash-6gpu
 services:
   # One DeepSeek-V4.1-Flash replica on GPUs 0-5: attention data parallel
   # DP6 (TP1 per rank) with EP6 over the 384 routed experts (64 per rank), the
-  # official Blackwell "DEP" shape with this example's SM120 kernels. It beat
-  # TP2 x DP3 in MEASUREMENTS.md. Engram tables (183 GiB) live in pinned host
-  # memory: 6 x 96 GB is below the checkpoint's 614 GB official minimum.
+  # official Blackwell "DEP" shape with this example's SM120 kernels. Engram
+  # tables (183 GiB) live in pinned host memory and batched tokens / memory
+  # use follow the official memory-bound (8 x H100) arm: 6 x 96 GB is below
+  # the checkpoint's 614 GB official minimum. DSpark verifies the full block
+  # (the V4.1 indexer backend rejects adaptive verification). MEASUREMENTS.md
+  # records every candidate.
   deepseek:
     image: ${DEEPSEEK_VLLM_IMAGE:-local/vllm-openai:deepseek-v41-6gpu-nightly}
     ipc: host
@@ -50,11 +53,13 @@ services:
     - '64'
     - --enable-prefix-caching
     - --gpu-memory-utilization
-    - '0.90'
+    - '0.92'
     - --max-num-seqs
     - '128'
     - --max-num-batched-tokens
-    - '16384'
+    - '4096'
+    - --speculative-config
+    - '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":false}'
     - --reasoning-parser
     - deepseek_v41
     - --enable-auto-tool-choice

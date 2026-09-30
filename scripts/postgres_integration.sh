@@ -80,5 +80,6 @@ fi
   tests/unit/test_postgres_node_model_prestage.py \
   tests/unit/test_postgres_runner_leadership.py \
   tests/unit/test_postgres_runner_scaling_log.py \
+  tests/unit/test_postgres_runner_startup_admission.py \
   tests/unit/test_postgres_request_store.py \
   -v --no-cov

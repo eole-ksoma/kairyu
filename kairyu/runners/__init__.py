@@ -254,6 +254,22 @@ from kairyu.runners.startup_binding_authority import (
 from kairyu.runners.startup_binding_authority_api import (
     create_runner_cache_placement_binding_authority_app,
 )
+from kairyu.runners.startup_binding_authority_reconciler import (
+    AUTHORITY_API_VERSION,
+    AUTHORITY_HOLDER_ID_ANNOTATION,
+    AUTHORITY_SOURCE_DIGEST_ANNOTATION,
+    AUTHORITY_SOURCE_REVISION_ANNOTATION,
+    PLACEMENT_INVENTORY_KIND,
+    PLACEMENT_INVENTORY_PLURAL,
+    QUOTA_SNAPSHOT_KIND,
+    QUOTA_SNAPSHOT_PLURAL,
+    InvalidKubernetesAuthorityReconcileResponseError,
+    KubernetesAuthorityReconcileConflictError,
+    KubernetesAuthorityReconcileResult,
+    KubernetesPlacementBindingAuthorityReconciler,
+    RunnerCachePlacementInventoryPublication,
+    RunnerScalingQuotaSnapshotPublication,
+)
 from kairyu.runners.startup_binding_authority_runtime import (
     RunnerCachePlacementBindingAuthorityRuntime,
     RunnerCachePlacementBindingAuthorityRuntimeConfig,
@@ -306,6 +322,10 @@ from kairyu.runners.startup_scheduling import (
 )
 
 __all__ = [
+    "AUTHORITY_API_VERSION",
+    "AUTHORITY_HOLDER_ID_ANNOTATION",
+    "AUTHORITY_SOURCE_DIGEST_ANNOTATION",
+    "AUTHORITY_SOURCE_REVISION_ANNOTATION",
     "AggregatingRunnerCachePlacementBindingCacheReader",
     "AuthenticatedNodeModelCacheLiveEvidenceClient",
     "DEFAULT_RUNNER_CLOCK_SKEW_TOLERANCE",
@@ -324,6 +344,7 @@ __all__ = [
     "InvalidRunnerLeadershipError",
     "InvalidKubernetesScaleResponseError",
     "InvalidKubernetesPlacementBindingLiveResponseError",
+    "InvalidKubernetesAuthorityReconcileResponseError",
     "InMemoryRunnerLeaderLeaseStore",
     "InMemoryRunnerCachePlacementAdmissionStore",
     "KubernetesPodPhase",
@@ -331,6 +352,9 @@ __all__ = [
     "KubernetesRunnerWatcher",
     "KubernetesFencedScaleResult",
     "KubernetesKueueRunnerCachePlacementBindingReader",
+    "KubernetesAuthorityReconcileConflictError",
+    "KubernetesAuthorityReconcileResult",
+    "KubernetesPlacementBindingAuthorityReconciler",
     "KubernetesPlacementBindingLiveTarget",
     "KubernetesScaleActuator",
     "KubernetesScaleAuthorityClaim",
@@ -347,6 +371,8 @@ __all__ = [
     "NodeModelPrestageCapacityError",
     "NodeModelCacheAgentHealth",
     "NodeModelCacheAgentEndpoint",
+    "PLACEMENT_INVENTORY_KIND",
+    "PLACEMENT_INVENTORY_PLURAL",
     "LocalNodeModelCacheLiveEvidenceSource",
     "NodeModelCacheLiveEvidenceRequest",
     "NodeModelCacheLiveEvidenceResponse",
@@ -435,6 +461,7 @@ __all__ = [
     "RunnerCachePlacementBindingPinEvidence",
     "RunnerCachePlacementBindingInventory",
     "RunnerCachePlacementBindingInventoryReader",
+    "RunnerCachePlacementInventoryPublication",
     "RunnerCachePlacementBindingPrestageEvidence",
     "RunnerCachePlacementBindingTargetState",
     "ScalingControllerPlacementBindingAuthority",
@@ -478,6 +505,9 @@ __all__ = [
     "RunnerStatusReconciler",
     "RunnerTerminationAuthorization",
     "RunnerWriterAuthority",
+    "RunnerScalingQuotaSnapshotPublication",
+    "QUOTA_SNAPSHOT_KIND",
+    "QUOTA_SNAPSHOT_PLURAL",
     "ScalingPolicy",
     "ScalingPolicyCatalog",
     "ScalingPrewarmAction",

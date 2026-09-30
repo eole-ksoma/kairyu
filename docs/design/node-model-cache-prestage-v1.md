@@ -29,9 +29,9 @@ node responses only to scheduler placement facts observed afterward.
 D3.15 adds deadline-bounded PostgreSQL current-binding and exact durable-decision
 readers. D3.16 adds deadline-bounded Kubernetes target, Kueue quota, and
 controller-owned placement-inventory readers. D3.17 adds a lifecycle-owned,
-scheduled caller for the bounded compaction contract. CRD reconciliation,
-runtime assembly, deployment wiring, and live acceptance remain deployment
-tasks.
+scheduled caller for the bounded compaction contract. D3.18 adds leader-fenced,
+optimistic-concurrency reconcilers for the two authority CRDs. CRD definitions,
+runtime assembly, deployment wiring, and live acceptance remain deployment tasks.
 
 ## Purpose
 
@@ -705,6 +705,38 @@ synchronous `run_once()` uses the same contract for explicit jobs and
 deterministic tests, rejects overlapping cycles, and is included in the bounded
 shutdown wait.
 
+D3.18 adds `KubernetesPlacementBindingAuthorityReconciler` as the controller-side
+publisher paired with the D3.16 reader. Trusted per-model configuration fixes
+the API origin, namespaces, target and CRD names. A publication can supply only
+source facts and immutable identities; it cannot redirect a Kubernetes write.
+The quota renderer emits the exact target/Kueue references, canonical nested
+limits, Kueue resourceVersion and monotonic quota revision consumed by D3.16.
+The inventory renderer emits the exact binding, decision, artifact and target
+identity plus canonical scheduler candidates and monotonic cache revision.
+
+Creation, spec replacement and `/status` update are separate bounded operations.
+The resulting temporary absence or generation mismatch is deliberately denied
+by D3.16 until the ready status observes the newly returned generation. Existing
+resources must carry the controller's election, holder and fencing-token
+annotations. Creation and every source advance atomically persist the monotonic
+source revision and a canonical status-content digest in those metadata fences,
+so a crash before `/status` cannot turn a later stale retry into recovery. A
+newer token, another holder at the same token, a missing or non-advancing
+inventory decision generation, a source-revision regression, or reuse of one
+source revision for different status content is rejected before any PATCH. A
+successor may claim an exact resource with a higher fence. JSON Patch tests the
+observed resourceVersion before changing spec or fence metadata, and the status
+subresource update carries the post-spec resourceVersion. Responses must retain
+the UID, advance resourceVersion, advance generation exactly for spec changes,
+preserve generation for metadata/status changes, and echo the requested spec,
+status and leader fence.
+
+Every write immediately reauthorizes the original leadership tenure. The
+client re-reads a bounded service-account token, disables redirects and ambient
+proxy/CA inheritance, requires strict size-bounded JSON, and shares one absolute
+deadline across lock wait and all API calls. Exact replay performs only the GET;
+409/422 CAS failures and leadership changes remain explicit retryable conflicts.
+
 ## Deployment boundary
 
 `private-ai-cloud-iac` must still provide:
@@ -717,9 +749,9 @@ shutdown wait.
 - assembly and configuration of the implemented scheduled compaction runtime,
   including an operator-approved retention age plus export of runtime status
   and per-placement high-water monitoring;
-- reconcilers and CRD definitions that publish the implemented
-  `RunnerScalingQuotaSnapshot` and `RunnerCachePlacementInventory` contracts,
-  with least-privilege read RBAC for the implemented Kubernetes/Kueue reader;
+- CRD definitions, runtime assembly and least-privilege read/write RBAC for the
+  implemented `RunnerScalingQuotaSnapshot` and `RunnerCachePlacementInventory`
+  reconcilers and Kubernetes/Kueue reader;
 - assembly and deployment of the scaling-authority
   reauthorization/readiness endpoint consumed by D3.8, plus a highly available
   Deployment/Service/MutatingWebhookConfiguration, TLS
@@ -761,6 +793,11 @@ AdmissionReview tests cover strict v1 envelope parsing, request/Pod identity,
 UID-bound allow and deny responses, deterministic patch application, exact
 replay, dry-run/subresource rejection, request-size bounds, readiness, and
 failure-detail redaction.
+Authority publisher tests cover exact reader-compatible quota/inventory shapes,
+canonical ordering, create/status sequencing, exact read-only replay, monotonic
+source revisions, same-revision equivocation, successor claims, stale leaders,
+decision-generation fencing, reauthorization loss, Kubernetes CAS conflicts,
+trusted routing, and expired deadlines.
 Runtime tests cover strict bounded config/secrets, HTTPS/same-origin policy,
 nonce and full-binding request/response integrity, redirect/proxy suppression,
 response-size and non-finite-number rejection, TLS key permissions, dependency

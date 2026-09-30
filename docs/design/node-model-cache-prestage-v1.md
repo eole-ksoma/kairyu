@@ -23,9 +23,11 @@ decision, target, quota, prewarm capacity, cache freshness, and lifetime.
 D3.12 composes those facts through explicit deadline-bounded current-binding,
 decision, target, quota, and cache backend readers with a second binding read as
 a replacement fence. D3.13 exposes path-free, owner-scoped live pre-stage and
-cache-index evidence from the authenticated node agent. Controller-side backend
-reader adapters, scheduling compaction, and Kubernetes deployment wiring remain
-deployment tasks.
+cache-index evidence from the authenticated node agent. D3.14 adds the strict
+authenticated controller client and bounded fan-out aggregator, joining those
+node responses only to scheduler placement facts observed afterward.
+PostgreSQL/Kubernetes/Kueue reader adapters, scheduling compaction, and
+deployment wiring remain deployment tasks.
 
 ## Purpose
 
@@ -573,10 +575,10 @@ backend timeout by the remaining absolute request budget. It then reads the
 current binding again; replacement before the second read is an authorization
 denial rather than a mixed snapshot. Readiness checks every distinct backend
 once under the same budget. Reader outputs are deep-validated before the D3.11
-authority consumes them, and the cache reader must return prewarm, full
-pre-stage records, physical hints, and owner-scoped pin evidence together.
-Production adapters for PostgreSQL and Kubernetes/Kueue, plus the authenticated
-node-agent client/aggregation side, remain the next integration unit.
+authority consumes them, and the cache reader must return prewarm, path-free
+pre-stage projections, physical hints, and owner-scoped pin evidence together.
+Production adapters for PostgreSQL and Kubernetes/Kueue remained outside that
+assembly boundary.
 
 D3.13 adds `LocalNodeModelCacheLiveEvidenceSource` and the authenticated
 `POST /v1/cache/live-evidence` node-agent endpoint. The request carries one
@@ -591,6 +593,35 @@ failure details never cross the transport. The production node-agent runtime
 always constructs this source and uses a bounded hint TTL. Missing or changed
 lineage is a sanitized conflict, while unavailable state remains fail closed.
 
+D3.14 adds `AuthenticatedNodeModelCacheLiveEvidenceClient` and
+`AggregatingRunnerCachePlacementBindingCacheReader` on the scaling-controller
+side. Node URLs come only from a canonical, credential-free HTTPS endpoint
+registry; a binding cannot supply or redirect the destination. Every request
+uses an explicit bounded bearer credential, disables redirect following,
+rejects environment proxy/CA inheritance, applies the smaller of the backend
+timeout and remaining absolute deadline, bounds request and streaming response
+bytes, rejects duplicate/non-finite JSON, requires JSON plus
+`Cache-Control: no-store`, and binds the returned node, command, artifact, pin
+owner, generation, hint, and pin evidence to the exact request. Conflict is an
+authorization denial; transport, authentication, and malformed responses
+remain dependency failures.
+
+The client adopts one `httpx.AsyncClient` on a single owned event loop and
+performs cancellable fan-out through a fixed, configured number of worker tasks
+for exactly the binding's placements. It never creates one task per placement.
+Total async timeouts, per-chunk absolute-deadline checks, sibling cancellation,
+and joined shutdown prevent slow-drip responses or partial failure from leaving
+background workers and connections. The aggregator then
+reads `RunnerCachePlacementBindingInventory` from an injected controller-owned
+scheduler adapter. Inventory must be canonical, cover exactly the bound
+placements, have a non-regressing cache revision, and be observed no earlier
+than every node hint while all hints remain live. Only then does the aggregator
+rebuild the prewarm snapshot and plan. This ordering prevents stale health,
+schedulability, or assignment values from the original decision from being
+presented as current facts. Readiness covers every configured node and the
+inventory backend under the same deadline budget. The hosting runtime owns and
+closes the adopted client before process shutdown.
+
 ## Deployment boundary
 
 `private-ai-cloud-iac` must still provide:
@@ -602,9 +633,9 @@ lineage is a sanitized conflict, while unavailable state remains fail closed.
 - reconciliation that replays desired ensure/release commands after restart;
 - a scheduled caller for the implemented bounded compaction contract, with a
   documented retirement cutoff and monitoring of per-placement high-water rows;
-- concrete PostgreSQL, Kubernetes/Kueue, and authenticated D3.13 node-agent
-  client/aggregation adapters for the D3.12 live-state source and deployment of
-  the assembled scaling-authority
+- concrete PostgreSQL and Kubernetes/Kueue readers, including the scheduler
+  placement-inventory adapter consumed by D3.14, for the D3.12 live-state source
+  and deployment of the assembled scaling-authority
   reauthorization/readiness endpoint consumed by D3.8, plus a highly available
   Deployment/Service/MutatingWebhookConfiguration, TLS
   certificate issuance/rotation and trust, ingress restriction, orchestration

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import threading
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -16,11 +19,18 @@ from kairyu.artifacts import (
     NodeModelCacheResidentHint,
 )
 from kairyu.runners import (
+    AggregatingRunnerCachePlacementBindingCacheReader,
+    AuthenticatedNodeModelCacheLiveEvidenceClient,
     ComposedRunnerCachePlacementBindingLiveStateSource,
     InMemoryRunnerLeaderLeaseStore,
     LeaderFencedRunnerController,
+    NodeModelCacheAgentEndpoint,
+    NodeModelCacheLiveEvidenceRequest,
+    NodeModelCacheLiveEvidenceResponse,
     RunnerCachePlacementBindingAuthorizationDeniedError,
+    RunnerCachePlacementBindingAuthorizationError,
     RunnerCachePlacementBindingCacheState,
+    RunnerCachePlacementBindingInventory,
     RunnerCachePlacementBindingLiveState,
     RunnerCachePlacementBindingPinEvidence,
     RunnerCachePlacementBindingPrestageEvidence,
@@ -38,6 +48,7 @@ from kairyu.runners import (
 from kairyu.runners.prestage import NodeModelPrestageRecord
 from kairyu.runners.prewarm import (
     ModelCachePlacement,
+    ModelCachePlacementCandidate,
     ModelCachePlacementState,
     ScalingPrewarmSnapshot,
     plan_cache_aware_scale_up,
@@ -507,6 +518,19 @@ def _live_state(
     )
 
 
+def _node_live_evidence_response(
+    decision: ScalingDecisionRecord,
+    binding: RunnerCacheStartupBinding,
+) -> NodeModelCacheLiveEvidenceResponse:
+    state = _live_state(decision, binding)
+    return NodeModelCacheLiveEvidenceResponse(
+        node_id="gpu-a",
+        prestage_record=state.prestage_records[0],
+        placement_hint=state.placement_hints[0],
+        pin_evidence=state.pin_evidence[0],
+    )
+
+
 def _authority(*, monotonic=None, leader_time: datetime = LIVE):
     decision = _decision()
     command = _prestage_command(decision)
@@ -852,3 +876,483 @@ def test_composed_live_source_checks_deadline_after_snapshot_validation() -> Non
             deadline_monotonic=20.0,
             backend_timeout_s=1.0,
         )
+
+
+def test_authenticated_node_live_evidence_client_binds_transport_and_readiness() -> None:
+    decision = _decision()
+    command = _prestage_command(decision)
+    binding = _binding(decision, command_id=command.command_id)
+    evidence = _node_live_evidence_response(decision, binding)
+    observed: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        observed.append(request)
+        if request.url.path == "/readyz":
+            return httpx.Response(200, json={"status": "ready", "node_id": "gpu-a"})
+        assert request.url.path == "/v1/cache/live-evidence"
+        return httpx.Response(
+            200,
+            json=evidence.model_dump(mode="json"),
+            headers={"Cache-Control": "private, no-store"},
+        )
+
+    http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        follow_redirects=False,
+        trust_env=False,
+    )
+    client = AuthenticatedNodeModelCacheLiveEvidenceClient(
+        http_client,
+        endpoints=(NodeModelCacheAgentEndpoint(node_id="gpu-a", base_url="https://gpu-a.test"),),
+        bearer_token=TOKEN,
+        monotonic_clock=lambda: 10.0,
+    )
+    request = NodeModelCacheLiveEvidenceRequest(
+        placement=binding.placements[0],
+        model_id=binding.model_id,
+        model_revision=binding.model_revision,
+    )
+    try:
+        assert (
+            client.read(
+                request,
+                deadline_monotonic=20.0,
+                backend_timeout_s=2.0,
+            )
+            == evidence
+        )
+        client.readiness(deadline_monotonic=20.0, backend_timeout_s=2.0)
+    finally:
+        client.close()
+
+    assert [request.method for request in observed] == ["POST", "GET"]
+    assert all(request.headers["authorization"] == f"Bearer {TOKEN}" for request in observed)
+    assert observed[0].headers["content-type"] == "application/json"
+    assert json.loads(observed[0].content) == request.model_dump(mode="json")
+
+
+@pytest.mark.parametrize("failure", ["duplicate", "cacheable", "wrong-node", "conflict"])
+def test_authenticated_node_live_evidence_client_fails_closed(failure: str) -> None:
+    decision = _decision()
+    command = _prestage_command(decision)
+    binding = _binding(decision, command_id=command.command_id)
+    evidence = _node_live_evidence_response(decision, binding)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        if failure == "duplicate":
+            return httpx.Response(
+                200,
+                content=b'{"node_id":"gpu-a","node_id":"gpu-b"}',
+                headers={
+                    "Content-Type": "application/json",
+                    "Cache-Control": "no-store",
+                },
+            )
+        if failure == "cacheable":
+            return httpx.Response(200, json=evidence.model_dump(mode="json"))
+        if failure == "wrong-node":
+            return httpx.Response(
+                200,
+                json=evidence.model_copy(update={"node_id": "gpu-b"}).model_dump(mode="json"),
+                headers={"Cache-Control": "no-store"},
+            )
+        return httpx.Response(409, json={"error": {"code": "prestage_conflict"}})
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler), trust_env=False)
+    client = AuthenticatedNodeModelCacheLiveEvidenceClient(
+        http_client,
+        endpoints=(NodeModelCacheAgentEndpoint(node_id="gpu-a", base_url="https://gpu-a.test"),),
+        bearer_token=TOKEN,
+        monotonic_clock=lambda: 10.0,
+    )
+    request = NodeModelCacheLiveEvidenceRequest(
+        placement=binding.placements[0],
+        model_id=binding.model_id,
+        model_revision=binding.model_revision,
+    )
+    expected = (
+        RunnerCachePlacementBindingAuthorizationDeniedError
+        if failure in {"wrong-node", "conflict"}
+        else RunnerCachePlacementBindingAuthorizationError
+    )
+    try:
+        with pytest.raises(expected):
+            client.read(
+                request,
+                deadline_monotonic=20.0,
+                backend_timeout_s=2.0,
+            )
+    finally:
+        client.close()
+
+
+def test_authenticated_node_live_evidence_client_enforces_size_and_deadline() -> None:
+    decision = _decision()
+    command = _prestage_command(decision)
+    binding = _binding(decision, command_id=command.command_id)
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            content=b"{" + b"x" * 128 + b"}",
+            headers={
+                "Content-Type": "application/json",
+                "Cache-Control": "no-store",
+            },
+        )
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler), trust_env=False)
+    request = NodeModelCacheLiveEvidenceRequest(
+        placement=binding.placements[0],
+        model_id=binding.model_id,
+        model_revision=binding.model_revision,
+    )
+    clock = [10.0]
+    limited = AuthenticatedNodeModelCacheLiveEvidenceClient(
+        http_client,
+        endpoints=(NodeModelCacheAgentEndpoint(node_id="gpu-a", base_url="https://gpu-a.test"),),
+        bearer_token=TOKEN,
+        response_limit_bytes=64,
+        monotonic_clock=lambda: clock[0],
+    )
+    try:
+        with pytest.raises(RunnerCachePlacementBindingAuthorizationError, match="limit"):
+            limited.read(
+                request,
+                deadline_monotonic=20.0,
+                backend_timeout_s=2.0,
+            )
+        clock[0] = 20.0
+        with pytest.raises(TimeoutError, match="deadline"):
+            limited.read(
+                request,
+                deadline_monotonic=20.0,
+                backend_timeout_s=2.0,
+            )
+    finally:
+        limited.close()
+
+    assert calls == 1
+
+
+def test_live_cache_reader_aggregates_node_evidence_then_current_inventory() -> None:
+    decision = _decision()
+    command = _prestage_command(decision)
+    binding = _binding(decision, command_id=command.command_id)
+    response = _node_live_evidence_response(decision, binding)
+    calls: list[str] = []
+
+    class EvidenceReader:
+        def read(self, request, *, deadline_monotonic, backend_timeout_s):
+            calls.append("evidence")
+            assert request.placement == binding.placements[0]
+            assert deadline_monotonic == 20.0
+            assert backend_timeout_s == 2.0
+            return response
+
+        def read_many(self, requests, **kwargs):
+            return tuple(self.read(request, **kwargs) for request in requests)
+
+        def readiness(self, *, deadline_monotonic, backend_timeout_s):
+            calls.append("evidence-ready")
+
+    class InventoryReader:
+        def read_inventory(self, current_binding, current_decision, **kwargs):
+            calls.append("inventory")
+            assert current_binding == binding
+            assert current_decision == decision
+            return RunnerCachePlacementBindingInventory(
+                snapshot_id="live-cache-2",
+                cache_revision=2,
+                observed_at=LIVE + timedelta(seconds=1),
+                candidates=(
+                    ModelCachePlacementCandidate(
+                        placement_id="placement-a",
+                        node_name="gpu-a",
+                        resource_flavor="h100-sxm",
+                        profile_id="h100-sxm-tp1",
+                        compatibility_approval_id="compat-qwen-h100",
+                    ),
+                ),
+            )
+
+        def readiness(self, *, deadline_monotonic, backend_timeout_s):
+            calls.append("inventory-ready")
+
+    reader = AggregatingRunnerCachePlacementBindingCacheReader(
+        evidence=EvidenceReader(),
+        inventory=InventoryReader(),
+        monotonic_clock=lambda: 10.0,
+    )
+
+    state = reader.read_cache(
+        binding,
+        decision,
+        deadline_monotonic=20.0,
+        backend_timeout_s=2.0,
+    )
+    reader.readiness(deadline_monotonic=20.0, backend_timeout_s=2.0)
+
+    assert calls == ["evidence", "inventory", "evidence-ready", "inventory-ready"]
+    assert state.prewarm_plan.runner_start_placement_ids == ("placement-a",)
+    assert state.prewarm_plan.snapshot.snapshot_id == "live-cache-2"
+    assert state.prewarm_plan.snapshot.cache_revision == 2
+    assert state.prestage_records == (response.prestage_record,)
+    assert state.placement_hints == (response.placement_hint,)
+    assert state.pin_evidence == (response.pin_evidence,)
+
+
+def test_live_cache_reader_rejects_inventory_observed_before_node_evidence() -> None:
+    decision = _decision()
+    command = _prestage_command(decision)
+    binding = _binding(decision, command_id=command.command_id)
+    response = _node_live_evidence_response(decision, binding)
+
+    class EvidenceReader:
+        def read(self, *_args, **_kwargs):
+            return response
+
+        def read_many(self, requests, **kwargs):
+            return tuple(self.read(request, **kwargs) for request in requests)
+
+        def readiness(self, **_kwargs):
+            return None
+
+    class StaleInventoryReader:
+        def read_inventory(self, *_args, **_kwargs):
+            return RunnerCachePlacementBindingInventory(
+                snapshot_id="stale-cache",
+                cache_revision=2,
+                observed_at=LIVE - timedelta(seconds=1),
+                candidates=(
+                    ModelCachePlacementCandidate(
+                        placement_id="placement-a",
+                        node_name="gpu-a",
+                        resource_flavor="h100-sxm",
+                        profile_id="h100-sxm-tp1",
+                        compatibility_approval_id="compat-qwen-h100",
+                    ),
+                ),
+            )
+
+        def readiness(self, **_kwargs):
+            return None
+
+    reader = AggregatingRunnerCachePlacementBindingCacheReader(
+        evidence=EvidenceReader(),
+        inventory=StaleInventoryReader(),
+        monotonic_clock=lambda: 10.0,
+    )
+
+    with pytest.raises(
+        RunnerCachePlacementBindingAuthorizationDeniedError,
+        match="inventory",
+    ):
+        reader.read_cache(
+            binding,
+            decision,
+            deadline_monotonic=20.0,
+            backend_timeout_s=2.0,
+        )
+
+
+def test_node_endpoint_rejects_non_https_and_non_origin_urls() -> None:
+    with pytest.raises(ValueError, match="HTTPS origin"):
+        NodeModelCacheAgentEndpoint(node_id="gpu-a", base_url="http://gpu-a.test")
+    with pytest.raises(ValueError, match="HTTPS origin"):
+        NodeModelCacheAgentEndpoint(
+            node_id="gpu-a",
+            base_url="https://gpu-a.test/untrusted/path",
+        )
+
+
+def test_node_live_evidence_client_rejects_environment_proxy_inheritance() -> None:
+    unsafe = httpx.AsyncClient()
+    try:
+        with pytest.raises(ValueError, match="environment trust"):
+            AuthenticatedNodeModelCacheLiveEvidenceClient(
+                unsafe,
+                endpoints=(
+                    NodeModelCacheAgentEndpoint(
+                        node_id="gpu-a",
+                        base_url="https://gpu-a.test",
+                    ),
+                ),
+                bearer_token=TOKEN,
+            )
+    finally:
+        asyncio.run(unsafe.aclose())
+
+
+def test_node_live_evidence_client_cancels_slow_drip_without_worker_leak() -> None:
+    decision = _decision()
+    command = _prestage_command(decision)
+    binding = _binding(decision, command_id=command.command_id)
+    request = NodeModelCacheLiveEvidenceRequest(
+        placement=binding.placements[0],
+        model_id=binding.model_id,
+        model_revision=binding.model_revision,
+    )
+    stopped = 0
+    stopped_lock = threading.Lock()
+
+    class SlowStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            nonlocal stopped
+            try:
+                while True:
+                    await asyncio.sleep(0.01)
+                    yield b" "
+            finally:
+                with stopped_lock:
+                    stopped += 1
+
+        async def aclose(self) -> None:
+            return None
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            stream=SlowStream(),
+            headers={
+                "Content-Type": "application/json",
+                "Cache-Control": "no-store",
+            },
+        )
+
+    baseline = sum(
+        thread.name == "kairyu-node-cache-live-evidence" for thread in threading.enumerate()
+    )
+    client = AuthenticatedNodeModelCacheLiveEvidenceClient(
+        httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            trust_env=False,
+        ),
+        endpoints=(NodeModelCacheAgentEndpoint(node_id="gpu-a", base_url="https://gpu-a.test"),),
+        bearer_token=TOKEN,
+    )
+    try:
+        for _ in range(3):
+            with pytest.raises(TimeoutError):
+                client.read(
+                    request,
+                    deadline_monotonic=time.monotonic() + 0.04,
+                    backend_timeout_s=1.0,
+                )
+            assert (
+                sum(
+                    thread.name == "kairyu-node-cache-live-evidence"
+                    for thread in threading.enumerate()
+                )
+                == baseline + 1
+            )
+    finally:
+        client.close()
+
+    assert stopped == 3
+    assert (
+        sum(thread.name == "kairyu-node-cache-live-evidence" for thread in threading.enumerate())
+        == baseline
+    )
+
+
+def test_node_live_evidence_client_cancels_sibling_after_partial_failure() -> None:
+    decision = _decision()
+    command = _prestage_command(decision)
+    binding = _binding(decision, command_id=command.command_id)
+    first = NodeModelCacheLiveEvidenceRequest(
+        placement=binding.placements[0],
+        model_id=binding.model_id,
+        model_revision=binding.model_revision,
+    )
+    second = NodeModelCacheLiveEvidenceRequest(
+        placement=binding.placements[0].model_copy(update={"node_name": "gpu-b"}),
+        model_id=binding.model_id,
+        model_revision=binding.model_revision,
+    )
+    sibling_started = asyncio.Event()
+    sibling_stopped = threading.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "gpu-a.test":
+            await sibling_started.wait()
+            return httpx.Response(409, json={"error": {"code": "prestage_conflict"}})
+        sibling_started.set()
+        try:
+            await asyncio.sleep(10)
+        finally:
+            sibling_stopped.set()
+        raise AssertionError("cancelled sibling resumed")
+
+    client = AuthenticatedNodeModelCacheLiveEvidenceClient(
+        httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            trust_env=False,
+        ),
+        endpoints=(
+            NodeModelCacheAgentEndpoint(node_id="gpu-a", base_url="https://gpu-a.test"),
+            NodeModelCacheAgentEndpoint(node_id="gpu-b", base_url="https://gpu-b.test"),
+        ),
+        bearer_token=TOKEN,
+        max_parallel_requests=2,
+    )
+    try:
+        with pytest.raises(RunnerCachePlacementBindingAuthorizationDeniedError):
+            client.read_many(
+                (first, second),
+                deadline_monotonic=time.monotonic() + 1.0,
+                backend_timeout_s=1.0,
+            )
+        assert sibling_stopped.wait(timeout=0.1)
+    finally:
+        client.close()
+
+
+def test_node_live_evidence_client_bounds_pending_tasks_for_large_fanout() -> None:
+    decision = _decision()
+    command = _prestage_command(decision)
+    binding = _binding(decision, command_id=command.command_id)
+    request = NodeModelCacheLiveEvidenceRequest(
+        placement=binding.placements[0],
+        model_id=binding.model_id,
+        model_revision=binding.model_revision,
+    )
+    started = 0
+    stopped = 0
+    task_counts: list[int] = []
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal started, stopped
+        started += 1
+        task_counts.append(len(asyncio.all_tasks()))
+        try:
+            await asyncio.sleep(10)
+        finally:
+            stopped += 1
+        raise AssertionError("cancelled request resumed")
+
+    client = AuthenticatedNodeModelCacheLiveEvidenceClient(
+        httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            trust_env=False,
+        ),
+        endpoints=(NodeModelCacheAgentEndpoint(node_id="gpu-a", base_url="https://gpu-a.test"),),
+        bearer_token=TOKEN,
+        max_parallel_requests=3,
+    )
+    try:
+        with pytest.raises(TimeoutError):
+            client.read_many(
+                (request,) * 100,
+                deadline_monotonic=time.monotonic() + 0.04,
+                backend_timeout_s=1.0,
+            )
+    finally:
+        client.close()
+
+    assert started == 3
+    assert stopped == 3
+    assert task_counts and max(task_counts) <= 5

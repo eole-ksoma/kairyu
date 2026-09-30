@@ -1,0 +1,168 @@
+name: kairyu-deepseek-v4.1-flash-6gpu
+services:
+  # One DeepSeek-V4.1-Flash replica on GPUs 0-5: attention data parallel
+  # DP6 (TP1 per rank) with EP6 over the 384 routed experts (64 per rank), the
+  # official Blackwell "DEP" shape with this example's SM120 kernels. Engram
+  # tables (183 GiB) live in pinned host memory and batched tokens / memory
+  # use follow the official memory-bound (8 x H100) arm: 6 x 96 GB is below
+  # the checkpoint's 614 GB official minimum. DSpark verifies the full block
+  # (the V4.1 indexer backend rejects adaptive verification). MEASUREMENTS.md
+  # records every candidate.
+  deepseek:
+    image: ${DEEPSEEK_VLLM_IMAGE:-local/vllm-openai:deepseek-v41-6gpu-nightly}
+    ipc: host
+    environment:
+      HF_HOME: /models/.cache
+      HF_HUB_OFFLINE: '1'
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      VLLM_NO_USAGE_STATS: '1'
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      SAFETENSORS_FAST_GPU: '1'
+      XDG_CACHE_HOME: /root/.cache
+      TORCHINDUCTOR_CACHE_DIR: /root/.cache/torchinductor
+      TRITON_CACHE_DIR: /root/.cache/triton
+      TILELANG_CACHE_DIR: /root/.cache/tilelang
+      TILELANG_TMP_DIR: /root/.cache/tilelang/tmp
+      VLLM_ENGINE_READY_TIMEOUT_S: '3600'
+      VLLM_USE_RUST_FRONTEND: '0'
+    command:
+    - /models/deepseek-v4.1-flash
+    - --served-model-name
+    - deepseek-v4.1-flash
+    - --max-model-len
+    - '1048576'
+    - --trust-remote-code
+    - --tokenizer-mode
+    - deepseek_v41
+    - --tensor-parallel-size
+    - '1'
+    - --data-parallel-size
+    - '6'
+    - --data-parallel-backend
+    - mp
+    - --enable-expert-parallel
+    - --moe-backend
+    - marlin
+    - --engram-config
+    - '{"cpu_offload":true}'
+    - --attention-config
+    - '{"backend":"FLASHINFER_MLA_SPARSE_DSV41","indexer_kv_dtype":"mxfp4"}'
+    - --kv-cache-dtype
+    - fp8
+    - --block-size
+    - '64'
+    - --enable-prefix-caching
+    - --gpu-memory-utilization
+    - '0.92'
+    - --max-num-seqs
+    - '128'
+    - --max-num-batched-tokens
+    - '4096'
+    - --speculative-config
+    - '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":false}'
+    - --reasoning-parser
+    - deepseek_v41
+    - --enable-auto-tool-choice
+    - --tool-call-parser
+    - deepseek_v41
+    - --default-chat-template-kwargs
+    - '{"thinking":true,"reasoning_effort":"high"}'
+    - --override-generation-config
+    - '{"temperature":1.0,"top_p":0.95}'
+    - --limit-mm-per-prompt
+    - '{"image":8}'
+    - --disable-uvicorn-access-log
+    healthcheck:
+      test:
+      - CMD
+      - python3
+      - -c
+      - import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/health",
+        timeout=2)
+      interval: 5s
+      timeout: 3s
+      retries: 1440
+      start_period: 30s
+    restart: unless-stopped
+    cpuset: ${DEEPSEEK_CPUSET}
+    volumes:
+    - type: bind
+      source: ${DEEPSEEK_MODEL_STORAGE_PATH}
+      target: /models
+      read_only: true
+    - type: bind
+      source: ${DEEPSEEK_CACHE_PATH}
+      target: /root/.cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+          - driver: nvidia
+            device_ids:
+            - '0'
+            - '1'
+            - '2'
+            - '3'
+            - '4'
+            - '5'
+            capabilities:
+            - gpu
+  kairyu:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      args:
+        KAIRYU_VISION: '1'
+    image: ${KAIRYU_IMAGE:-local/kairyu:deepseek-v41-6gpu-example}
+    command:
+    - /etc/kairyu/kairyu.yaml
+    environment:
+      KAIRYU_CONTAINER_IMAGE_DIGEST: ${KAIRYU_IMAGE_ID:-local-build}
+    volumes:
+    - type: bind
+      source: ${PLACEMENT_LOG_PATH}
+      target: /var/lib/kairyu/placement
+    - ./kairyu.yaml:/etc/kairyu/kairyu.yaml:ro
+    depends_on:
+      deepseek:
+        condition: service_healthy
+    ports:
+    - 127.0.0.1:${API_PORT:-8008}:8000
+    healthcheck:
+      test:
+      - CMD
+      - python3
+      - -c
+      - import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/readyz",
+        timeout=2)
+      interval: 5s
+      timeout: 3s
+      retries: 120
+    restart: unless-stopped
+  chat-ui:
+    image: ${OPEN_WEBUI_IMAGE:-ghcr.io/open-webui/open-webui:v0.11.0-slim@sha256:3698bd4e9628b7ae3768808721098616e669b4a05a6bceb2f5da2d84a3282a01}
+    environment:
+      OPENAI_API_BASE_URL: http://kairyu:8000/v1
+      OPENAI_API_KEY: sk-local-kairyu
+      DEFAULT_MODELS: deepseek-v4.1-flash
+      DEFAULT_MODEL_PARAMS: '{"max_tokens":32768,"temperature":1.0,"top_p":0.95}'
+      ENABLE_PERSISTENT_CONFIG: 'false'
+      RESET_CONFIG_ON_START: 'true'
+      ENABLE_SIGNUP: 'false'
+      ENABLE_LOGIN_FORM: 'false'
+      WEBUI_AUTH: 'false'
+      WEBUI_URL: ${WEBUI_URL:-http://localhost:3008}
+      WEBUI_ADMIN_NAME: ${WEBUI_ADMIN_NAME:-Kairyu Admin}
+      ENABLE_OLLAMA_API: 'false'
+      ENABLE_EVALUATION_ARENA_MODELS: 'false'
+      RAG_EMBEDDING_ENGINE: ''
+    volumes:
+    - type: bind
+      source: ${WEBUI_STORAGE_PATH}
+      target: /app/backend/data
+    depends_on:
+      kairyu:
+        condition: service_healthy
+    ports:
+    - ${CHAT_UI_BIND_ADDRESS:-127.0.0.1}:${CHAT_UI_PORT:-3008}:8080
+    restart: unless-stopped

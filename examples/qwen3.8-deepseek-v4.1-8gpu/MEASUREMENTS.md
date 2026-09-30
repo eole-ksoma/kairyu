@@ -67,7 +67,10 @@ Observations:
   modes, so the likely cause is the model not emitting the requested blank
   line.
 
-## GPU gates on the current configuration (DTO-D17, 2026-10-01)
+## GPU gates on the first DTO-D17 judge criteria (superseded by the criteria amendment)
+
+These are kept for reference only. They were measured before the ENSEMBLE
+criteria were loosened.
 
 Runs are stored under
 `/mnt/nvme/kairyu/model-volumes/qwen3.8-deepseek-v4.1-8gpu/verification-results/`
@@ -119,3 +122,9 @@ Open points:
 - **Not re-run for this example.** The SM120 kernel check was not repeated
   here: edit 7 touches only the Python encoder, and the kernel edits are
   those of `deepseek-v4.1-flash-6gpu`, which passed 28/28.
+
+## GPU gates on the loosened ENSEMBLE criteria (DTO-D17 amendment, 2026-10-01)
+
+Pending re-run: readiness, `vision`, `tool-calling`, `serving-auto-max`,
+`serving-auto-max-coding`, and the browser smoke.
+

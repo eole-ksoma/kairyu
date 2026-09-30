@@ -422,7 +422,10 @@ roles:
 # view of the latest user turn, 5 s timeout. The two choices (DTO-D17) are
 # listed faster -> more thorough and their criteria text is the routing
 # policy the judge reads; `fallback: primary` keeps quality on any judge
-# failure.
+# failure. DTO-D17 amendment (2026-10-01): hard problems and ties go to
+# ENSEMBLE; DEEPSEEK_THINK keeps everyday requests and routine agent turns.
+# The tie-break lives in the criteria text because profile_judge
+# prompt_prefix/suffix switch the judge to a pre-rendered raw prompt.
 profile_judge:
   worker: tier1
   timeout_seconds: 5.0
@@ -432,20 +435,20 @@ profile_judge:
     - profile: deepseek_think
       label: DEEPSEEK_THINK
       criteria: >-
-        one careful expert answer suffices: every request from greetings,
-        short questions, and routine agent tool-call turns to hard problems
-        where deliberation decides correctness, such as competition-level
-        math, complex algorithms, multi-file coding or debugging, proofs, and
-        planning.
+        everyday to moderate requests that one careful expert answer handles:
+        greetings and chit-chat, short questions and facts, rewording,
+        translation or formatting, simple explanations, small well-specified
+        code edits, and routine agent tool-call turns whose next action is
+        clear from the conversation.
     - profile: primary
       label: ENSEMBLE
       criteria: >-
-        the hardest, highest-stakes open-ended work where comparing several
-        independent approaches and auditing the merged answer materially
-        improves quality: research-level questions, ambiguous
-        multi-constraint design, or an explicit request for the most thorough
-        possible answer. By far the slowest and most expensive route; never
-        choose it when DEEPSEEK_THINK would already be correct.
+        requests whose correctness depends on deep reasoning or on comparing
+        several approaches: math or logic problems, algorithm design,
+        multi-file coding or debugging, proofs, design or planning, multi-step
+        analysis, ambiguous or multi-constraint requests, and any request for
+        a thorough answer. If unsure between the two routes, choose
+        ENSEMBLE.
 
 # Direct route (DTO-D13; the only one kept by DTO-D17): one publisher role —
 # the selected final unit — so the Conductor's streaming, effort resolution,

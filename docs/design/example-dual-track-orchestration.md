@@ -690,6 +690,31 @@ five routes and four policies.
   measured with the Qwen pair as the bottleneck: at c32 the Qwen-only routes
   reached a 43.9 s TTFT p50 and the judge a 2.4 s p50.
 
+**DTO-D17 amendment (owner, 2026-10-01): looser ENSEMBLE criteria.**
+
+- **Why:** under the first DTO-D17 criteria the judge routed 100% of the
+  gates' synthetic requests and of a live benchmark (44/44) to
+  `deepseek_think`. The ENSEMBLE text excluded anything DEEPSEEK_THINK
+  "would already answer", so almost nothing qualified.
+- **New `DEEPSEEK_THINK` criteria:** everyday to moderate requests.
+  - greetings and short questions, facts
+  - rewording, translation, formatting
+  - simple explanations, small well-specified code edits
+  - routine agent tool-call turns whose next action is clear
+- **New `ENSEMBLE` criteria:** requests whose correctness depends on deep
+  reasoning or on comparing approaches.
+  - math or logic, algorithm design, multi-file coding or debugging
+  - proofs, design or planning, multi-step analysis
+  - ambiguous or multi-constraint requests, and any request for a thorough
+    answer
+  - The deterrent sentences are removed, and the criteria end with "If
+    unsure between the two routes, choose ENSEMBLE."
+- **Why the tie-break is in the criteria text:** the judge's
+  `prompt_prefix`/`prompt_suffix` would turn the judge prompt into a
+  pre-rendered raw prompt, dropping the Qwen chat template and
+  `enable_thinking: false`.
+- **Status:** GPU gates re-run after this amendment.
+
 ## Acceptance
 
 - CPU suite green with the rewritten example pinning test

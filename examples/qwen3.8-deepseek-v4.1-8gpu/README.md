@@ -59,17 +59,24 @@ The judge is asked to pick the faster route that will still answer correctly
 and completely, and to escalate only when the request needs it. The criteria
 it reads (`profile_judge.choices[*].criteria` in `auto-max.yaml`):
 
-- **`DEEPSEEK_THINK`:** one careful expert answer suffices. This covers
-  every request from greetings, short questions, and routine agent tool-call
-  turns up to hard problems where deliberation decides correctness:
-  competition-level math, complex algorithms, multi-file coding or
-  debugging, proofs, and planning.
-- **`ENSEMBLE`:** the hardest, highest-stakes open-ended work, where
-  comparing independent approaches and auditing the merged answer materially
-  improves quality: research-level questions, ambiguous multi-constraint
-  design, or an explicit request for the most thorough possible answer. It
-  is by far the slowest route, never chosen when `DEEPSEEK_THINK` would
-  already be correct.
+- **`DEEPSEEK_THINK`:** everyday to moderate requests that one careful
+  expert answer handles. That covers:
+  - greetings and chit-chat, short questions, and facts;
+  - rewording, translation, or formatting;
+  - simple explanations and small, well-specified code edits;
+  - routine agent tool-call turns whose next action is clear.
+- **`ENSEMBLE`:** requests whose correctness depends on deep reasoning or on
+  comparing several approaches. That covers:
+  - math or logic problems;
+  - algorithm design;
+  - multi-file coding or debugging;
+  - proofs, design, or planning;
+  - multi-step analysis;
+  - ambiguous or multi-constraint requests;
+  - any request for a thorough answer.
+
+  When the judge is unsure between the two routes, it is told to choose
+  `ENSEMBLE`.
 
 This is a prompt-driven heuristic, not a measured cost model. Every trace
 records the verdict, the offered labels, and the judge's token usage, and

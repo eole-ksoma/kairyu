@@ -7,6 +7,7 @@
 | [`qwen3.8-27b-1gpu`](qwen3.8-27b-1gpu/README.md) | one selected RTX PRO 6000 Blackwell | official FP8, 262,144 tokens |
 | [`deepseek-v4-flash-0731-8gpu`](deepseek-v4-flash-0731-8gpu/README.md) | TP8 + EP8 on eight RTX PRO 6000 Blackwell cards | mixed FP4/FP8, 1,048,576 tokens |
 | [`qwen3.8-deepseek-v4-8gpu`](qwen3.8-deepseek-v4-8gpu/README.md) | Qwen TP1 x 4 replicas + DeepSeek TP4/EP4 | Qwen-judged five-route Kairyu L2 (four direct routes + verifier-gated ensemble DAG) |
+| [`qwen3.8-deepseek-v4.1-8gpu`](qwen3.8-deepseek-v4.1-8gpu/README.md) | DeepSeek-V4.1 DP6/EP6 (GPU 0-5) + Qwen TP1 x 2 replicas (GPU 6, 7) | the same judged five-route L2 with native image input on every route (no Qwen image-description stage) |
 | [`qwen3.8-27b-dp8-8gpu`](qwen3.8-27b-dp8-8gpu/README.md) | Qwen TP1 x 8 replicas, one per card | one public model with OpenAI tool calling; Kairyu L2 is the replica pool only (even, prefix-aware placement) |
 | [`deepseek-v4-flash-0731-dp2-8gpu`](deepseek-v4-flash-0731-dp2-8gpu/README.md) | DeepSeek TP4+EP4 x 2 replicas (GPU 0-3, 4-7) | one public model with OpenAI tool calling; Kairyu L2 is the replica pool only (even, prefix-aware placement) |
 | [`deepseek-v4-flash-vision-exp-dp2-8gpu`](deepseek-v4-flash-vision-exp-dp2-8gpu/README.md) | DeepSeek-V4-Flash-Vision-Exp TP4+EP4 x 2 replicas (GPU 0-3, 4-7) | one public text + image model with OpenAI tool calling and a Chat UI reasoning-effort dropdown (default/low/high/max); replica pool only |
@@ -38,6 +39,7 @@ Start everything and print the local Chat UI URL:
 ./examples/deepseek-v4-flash-0731-8gpu/run.sh
 ./examples/qwen3.8-27b-1gpu/run.sh
 ./examples/qwen3.8-deepseek-v4-8gpu/run.sh
+./examples/qwen3.8-deepseek-v4.1-8gpu/run.sh
 ./examples/qwen3.8-27b-dp8-8gpu/run.sh
 ./examples/deepseek-v4-flash-0731-dp2-8gpu/run.sh
 ./examples/deepseek-v4-flash-vision-exp-dp2-8gpu/run.sh
@@ -50,6 +52,7 @@ Run serving verification through the Kairyu L3 endpoint:
 ./examples/deepseek-v4-flash-0731-8gpu/verify.sh serving
 ./examples/qwen3.8-27b-1gpu/verify.sh serving
 ./examples/qwen3.8-deepseek-v4-8gpu/verify.sh serving-auto-max
+./examples/qwen3.8-deepseek-v4.1-8gpu/verify.sh serving-auto-max
 ./examples/qwen3.8-27b-dp8-8gpu/verify.sh serving
 ./examples/deepseek-v4-flash-0731-dp2-8gpu/verify.sh serving
 ./examples/deepseek-v4-flash-vision-exp-dp2-8gpu/verify.sh serving

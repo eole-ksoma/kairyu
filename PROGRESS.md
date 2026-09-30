@@ -82,6 +82,7 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 - Replica-pool scale-out examples (FN-D9, 2026-09-01): Qwen3.8 TP1 x 8 and DeepSeek TP4+EP4 x 2 behind one public model each; `verify.sh serving` proves the even per-replica split from the pool placement log and `verify.sh tool-calling` proves OpenAI tool calls on every replica (see their MEASUREMENTS.md); two vision replica examples (FN-D9 amendment 2026-09-04: DeepSeek-V4-Flash-Vision-Exp TP4+EP4 x 2, Qwen3.8-Flash-Next-FP8 TP4 x 2 on a shared upstream-main SM120 overlay image, Chat UI reasoning-effort dropdown, `verify.sh vision`) are GPU-verified (2026-09-04: pins locked, serving/tool-calling/vision gates PASS, MEASUREMENTS.md written); the Qwen example serves without the recipe's MTP k=3 because prefix caching + MTP corrupts batched output on this vLLM revision (vllm#53912)
 - DeepSeek V4.1 Flash single-replica example (FN-D9 amendment, 2026-09-11) is GPU-verified on TP8/EP8 SM120 with the V4 ReplicaPool/API/UI structure and official thinking-high default; bounded L1 comparisons select DSpark 5, 16K batching and NCCL. The 320-request matrix, reasoning/tool/vision/cancellation, normal restart and retrieval through 1,039,909 prompt tokens pass; exact evidence and limitations are in its `MEASUREMENTS.md`.
 - DeepSeek V4.1 Flash six-GPU example (FN-D9 six-GPU amendment, 2026-09-30): one DP6/EP6 replica on GPUs 0–5 with the 8-GPU example's L2/L3 structure and its own scripts; official-first L1 (pinned vLLM nightly + SM120 overlay, Engram offload, 4K batch / 0.92 from the recipe's memory-bound arm, DSpark 5 with full verification). Serving 102 / 591 / 718 tok/s at c1/c32/c64; gate evidence in its `MEASUREMENTS.md`.
+- Qwen3.8 + DeepSeek-V4.1 ensemble example (DTO-D16, 2026-09-30): the V4 example's judged five-route L2 on V4.1 DP6/EP6 (GPU 0–5, the six-GPU example's L1) + Qwen TP1 × 2 (GPU 6, 7); every role takes images natively (no Qwen image-description stage); DeepSeek roles use the official V4.1 encoder with per-request effort, and the example's overlay continues the floor's assistant prefill. CPU half done; GPU gates pending.
 - Process-split backend (`kairyu-proc`) with delta wire, TP group attestation, graceful lifecycle
 - CPU suite green (thousands of tests, no selected skips); CPU microbenchmark smoke + nightly regression series in CI
 
@@ -104,6 +105,11 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
+
+### 2026-09-30 — [design] Qwen3.8 + DeepSeek-V4.1 six-GPU ensemble example (DTO-D16)
+- What: new example `qwen3.8-deepseek-v4.1-8gpu`. It keeps the V4 ensemble method (judge + 5 routes, dual-track DAG, audit, budgets) on V4.1 DP6/EP6 (GPU 0–5) + Qwen TP1 × 2 (GPU 6, 7). `image_description` is removed; budget `{18, 2}`. DeepSeek roles use the official encoder via chat requests with one pool: `reasoning_effort` for thinking, `enable_thinking: false` for chat mode, no server-wide thinking default. Overlay edit 7 makes the V4.1 encoder continue a final `<think>` prefill (DTO-D9/D15 floor). `kairyu/` is unchanged.
+- Why: owner request — V4.1 takes images natively, so the Qwen description proxy is unnecessary. The encoder ignored `continue_final_message` and ORs `thinking`/`enable_thinking` (probed on the live six-GPU L1).
+- Refs: DTO-D16 in `docs/design/example-dual-track-orchestration.md`; plan `docs/superpowers/plans/2026-09-30-qwen38-deepseek-v41-8gpu-example.md`; example `MEASUREMENTS.md`
 
 ### 2026-09-30 — [design] DeepSeek V4.1 Flash on six GPUs
 - What: new example `deepseek-v4.1-flash-6gpu` (GPUs 0–5, same L2/L3 as the 8-GPU example, all scripts example-owned). Bounded one-parameter comparisons select DP6/EP6 over the official TP2 degree (c32 +44–47 %) and DSpark with full verification plus the recipe's 4K / 0.92 memory levers (c1 +77 %, c32 +20 %).

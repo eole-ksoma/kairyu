@@ -1,0 +1,123 @@
+server:
+  host: 0.0.0.0
+  port: 8000
+  api_keys_env: null
+  responses_compaction_secret_env: KAIRYU_RESPONSES_COMPACTION_SECRET
+  max_concurrency: 256
+  # A bounded queue wait fails a stuck request fast instead of parking it for
+  # a day (issue #495); this example's measured E2E envelope is in
+  # MEASUREMENTS.md.
+  admission_wait_timeout_s: 600
+  max_chat_body_bytes: 16777216
+
+pools:
+  qwen3.8-27b:
+    replicas:
+      - backend: openai
+        health_url: http://qwen-0:8000/health
+        options: &qwen
+          base_url: http://qwen-0:8000/v1
+          model: qwen3.8-27b
+          api_key_env: null
+          # Bounded so a hung upstream call fails instead of holding its
+          # replica slot for a day; > the measured per-stage worst case
+          # (issue #495).
+          timeout_s: 1800
+          upstream: vllm
+          capabilities:
+            allow_prompt_kinds: [multimodal]
+            allow_chat_template_kwargs: [enable_thinking]
+          image_input_policy:
+            max_images: 1
+            max_image_bytes: 8388608
+            max_total_image_bytes: 8388608
+            max_image_pixels: 2097152
+            max_total_image_pixels: 2097152
+            max_image_dimension: 4096
+            max_image_aspect_ratio: 200
+            max_processed_prompt_tokens: 262144
+          model_revision: 017b9c7af6b5689d5dd426a76e0bc077eb5ca20a
+          max_model_len: 262144
+          quantization_format: fp8
+          cache_descriptor:
+            family: qwen3.8-hybrid-mamba-paged-kv
+          tensor_parallel_size: 1
+          mtp_enabled: false
+          container_image_digest: sha256:6d8429e38e3747723ca07ee1b17972e09bb9c51c4032b266f24fb1cc3b22ed8f
+      - backend: openai
+        health_url: http://qwen-1:8000/health
+        options: {<<: *qwen, base_url: http://qwen-1:8000/v1}
+    unhealthy_after: 1
+    # Overflow as soon as the affine replica has one in-flight request. Agent
+    # turns and MoA proposals deliberately share a cache session; a larger
+    # threshold funnels concurrent work onto one GPU and leaves the other
+    # replica idle.
+    queue_depth_threshold: 0
+    prefix_index: true
+    probe_interval_s: 2.0
+
+  # One DP6 / EP6 replica on GPUs 0-5 (the deepseek-v4.1-flash-6gpu L1).
+  # Every call is a chat request rendered by the official V4.1 encoder
+  # (DTO-D16): thinking roles send reasoning_effort, and an effort-less role
+  # is sent enable_thinking=false (chat mode).
+  deepseek-v4.1-flash:
+    replicas:
+      - backend: openai
+        health_url: http://deepseek:8000/health
+        options:
+          base_url: http://deepseek:8000/v1
+          model: deepseek-v4.1-flash
+          api_key_env: null
+          # Bounded for the same issue #495 rationale as the Qwen pool.
+          timeout_s: 1800
+          upstream: vllm
+          capabilities:
+            allow_prompt_kinds: [multimodal]
+            allow_chat_template_kwargs: [enable_thinking]
+          image_input_policy:
+            max_images: 8
+            max_image_bytes: 8388608
+            max_total_image_bytes: 67108864
+            max_image_pixels: 16777216
+            max_total_image_pixels: 134217728
+            max_image_dimension: 8192
+            max_image_aspect_ratio: 200
+            max_processed_prompt_tokens: 1048576
+          model_revision: dba1be0a40aa45a94ad051997016db3960a90277
+          max_model_len: 1048576
+          quantization_format: mixed-fp4-fp8
+          cache_descriptor:
+            family: deepseek-v41-swa-csa-engram
+            block_size: 64
+          tensor_parallel_size: 1
+          expert_parallel_size: 6
+          attention_data_parallel_size: 6
+          dspark_enabled: true
+          container_image_digest: sha256:c70d91086275a55c82a58da4fc53adc09ca8ee68e49e8eeb9bfb271041f97f30
+    unhealthy_after: 1
+    queue_depth_threshold: 8
+    prefix_index: true
+    probe_interval_s: 2.0
+
+embeddings:
+  embed-small:
+    backend: fastembed
+    model: sentence-transformers/all-MiniLM-L6-v2
+    model_path: /opt/kairyu/models/all-MiniLM-L6-v2
+    revision: 5f1b8cd78bc4fb444dd171e59b18f3a3af89a079
+    model_sha256: bbd7b466f6d58e646fdc2bd5fd67b2f5e93c0b687011bd4548c420f7bd46f0c5
+    provenance_sha256: 57246a4990eb0f08755df06ba57c1fec161032bd588332435e89c7ece244639c
+    dimensions: 384
+    batch_size: 64
+    threads: 2
+    max_concurrency: 2
+
+orchestrators:
+  kairyu-auto-max:
+    spec: /etc/kairyu/auto-max.yaml
+
+# The public API exposes one chat model plus one embedding model. L1 pools
+# remain deployment-owned runtime resources and are not public model IDs.
+public_models: [kairyu-auto-max, embed-small]
+
+legacy_chat_models: [qwen3.8-27b]

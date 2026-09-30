@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Verify the live tiered product through the pinned Open WebUI browser surface.
+# Verify the live product through the pinned Open WebUI browser surface with
+# this example's own browser gate (webui-browser-smoke.mjs).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -13,10 +14,8 @@ docker build \
   "$REPO_ROOT"
 
 docker run --rm --init --network host \
-  --env WEBUI_SMOKE_PHASE=tiered \
   --env WEBUI_SMOKE_BASE_URL="$WEBUI_BASE_URL" \
-  --env EXPECTED_PRODUCT_MODEL=kairyu-auto-max \
   --env WEBUI_SMOKE_RESPONSE_TIMEOUT_MS="${WEBUI_SMOKE_RESPONSE_TIMEOUT_MS:-1800000}" \
   --env WEBUI_SMOKE_PHASE_TIMEOUT_MS="${WEBUI_SMOKE_PHASE_TIMEOUT_MS:-2100000}" \
-  --volume "$REPO_ROOT/scripts/webui_browser_smoke.mjs:/work/webui_browser_smoke.mjs:ro" \
+  --volume "$SCRIPT_DIR/webui-browser-smoke.mjs:/work/webui_browser_smoke.mjs:ro" \
   "$BROWSER_IMAGE" node /work/webui_browser_smoke.mjs

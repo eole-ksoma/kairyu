@@ -656,7 +656,11 @@ configuration (plan
 
 ### DTO-D17 — Two routes and two policies for the V4.1 example (owner decision, 2026-10-01)
 
-Status: accepted; CPU half implemented; GPU gates pending.
+Status: accepted; implemented. The GPU gates pass on 2026-10-01: readiness,
+vision, tool-calling, the generic matrix, and the browser smoke. The coding
+TTFT gate is `not_applicable` on every row, because the judge routed all
+synthetic requests to `deepseek_think`; ensemble TTFT stays unmeasured. See
+the example's MEASUREMENTS.md.
 
 Applies only to `examples/qwen3.8-deepseek-v4.1-8gpu/`. The V4 example keeps
 five routes and four policies.

@@ -327,5 +327,10 @@ export QWEN_MODEL_SEED=/mnt/nvme/kairyu/model-volumes/qwen3.8-27b-1gpu/models/qw
   image per DeepSeek generation stage, which proves those stages received
   the image itself.
 - **`tool-calling`** requires one executable bash tool call through L3.
+- **`browser-smoke.sh`** runs this example's own browser gate,
+  `webui-browser-smoke.mjs`. It checks the one product model, the folded
+  internal-work item, and the separate final answer. It requires the
+  DeepSeek-V4.1 (`tier2`) attribution, plus the Qwen one when the ensemble
+  ran.
 
 Results and every measured deviation go to [`MEASUREMENTS.md`](MEASUREMENTS.md).

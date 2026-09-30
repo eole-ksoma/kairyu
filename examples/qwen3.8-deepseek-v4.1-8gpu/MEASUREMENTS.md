@@ -67,8 +67,55 @@ Observations:
   modes, so the likely cause is the model not emitting the requested blank
   line.
 
-## GPU gates on the current configuration
+## GPU gates on the current configuration (DTO-D17, 2026-10-01)
 
-Pending: `up` readiness, `vision`, `tool-calling`, `serving-auto-max`,
-`serving-auto-max-coding` (TTFT and the 900 s turn envelope), and the
-browser smoke.
+Runs are stored under
+`/mnt/nvme/kairyu/model-volumes/qwen3.8-deepseek-v4.1-8gpu/verification-results/`
+as `d17-vision`, `d17-tool-calling`, `d17-serving`, and `d17-coding`.
+
+| Gate | Result |
+|---|---|
+| `up` readiness probes | PASS: efforts 50/75/100, chat mode, edit-7 continuation, `323` from all 6 DP ranks, image; the served L2 matches `example.json` (8 roles, 2 routes, `{16, 2}`) |
+| `vision` | PASS: 4/4 primary; the DeepSeek L1 processed 12 images for 12 DeepSeek stages |
+| `tool-calling` | PASS: `bash {"command": "ls -la"}` via `deepseek_think` |
+| `serving-auto-max` | PASS (completeness and stage traces); every row was judged 32/32 `deepseek_think` |
+| `serving-auto-max-coding` | exit 0. TTFT gate `not_applicable` at c1/8/16/32: the judge sent 32/32 of each row to `deepseek_think`, so the ensemble gate has no sample |
+| browser smoke (`webui-browser-smoke.mjs`, this example's own) | PASS: one product model; a folded, attributed internal-work item; a separate final answer |
+
+`serving-auto-max` rows use about 8K tokens in, 32 requests per row, and
+natural completion. Output tok/s counts thinking; public tok/s counts the
+answer only.
+
+| c | wall | TTFT p50 / p99 | E2E p50 / p99 | output tok/s | public tok/s | TPOT mean | judge p50 / p99 |
+|---|---|---|---|---|---|---|---|
+| 1 | 462.4 s | 11.84 s / 27.41 s | 13.02 s / 28.52 s | 134.3 | 18.6 | 5.04 ms | 308 / 310 ms |
+| 8 | 116.5 s | 22.85 s / 48.60 s | 25.79 s / 51.75 s | 460.4 | 70.5 | 10.73 ms | 305 / 733 ms |
+| 16 | 103.5 s | 31.20 s / 52.21 s | 35.97 s / 53.67 s | 526.1 | 81.2 | 15.20 ms | 308 / 1,209 ms |
+| 32 | 53.5 s | 37.80 s / 51.83 s | 41.26 s / 53.46 s | 988.4 | 156.2 | 10.93 ms | 1,706 / 2,236 ms |
+
+For c1, one request breaks down as a 308 ms judge, 1,345 ms to DeepSeek's
+first token, and 11,330 ms of thinking and answer.
+
+`serving-auto-max-coding` rows use about 1.5K tokens in and 32 requests per
+row. The paired direct row sends the same dataset straight to the DeepSeek
+L1 with `max_tokens` 512.
+
+| c | wall | TTFT p50 / p99 | E2E p50 / p99 | output tok/s | public tok/s | TPOT mean | direct TTFT p50 / p99 | direct output tok/s |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 627.6 s | 13.09 s / 45.63 s | 14.26 s / 47.04 s | 167.8 | 14.1 | 4.28 ms | 3.71 s / 4.23 s | 137.5 |
+| 8 | 163.4 s | 25.01 s / 114.45 s | 26.44 s / 115.54 s | 685.0 | 54.7 | 7.15 ms | 7.14 s / 8.92 s | 559.2 |
+| 16 | 133.3 s | 34.60 s / 110.81 s | 38.21 s / 112.67 s | 910.6 | 66.8 | 7.88 ms | 8.64 s / 11.85 s | 875.6 |
+| 32 | 94.9 s | 40.35 s / 93.75 s | 42.20 s / 94.87 s | 1,133.6 | 96.0 | 8.60 ms | 9.42 s / 10.23 s | 1,600.7 |
+
+Open points:
+
+- **Ensemble TTFT is unmeasured.** Under the DTO-D17 criteria the judge
+  routed every synthetic generic and coding request to `deepseek_think`.
+  Only the vision gate exercised the ensemble.
+- **Seam formatting is unconfirmed.** The head/synthesis seam problem (see
+  above) could not be re-checked, because the gates store only the first
+  400 characters of each answer.
+- **The 900 s turn envelope holds.** The largest E2E p99 was 115.5 s.
+- **Not re-run for this example.** The SM120 kernel check was not repeated
+  here: edit 7 touches only the Python encoder, and the kernel edits are
+  those of `deepseek-v4.1-flash-6gpu`, which passed 28/28.

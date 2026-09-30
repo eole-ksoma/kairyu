@@ -1,6 +1,6 @@
 # deepseek-v4.1-flash-6gpu evidence
 
-Status: **in progress — L1 selection running.**
+Status: **all final gates PASS on the committed configuration (2026-09-30).**
 
 Hardware: 6 × NVIDIA RTX PRO 6000 Blackwell Server Edition (97,887 MiB,
 SM120, PCIe) out of an 8-GPU host; 1 TiB host memory, 4 NUMA nodes with
@@ -184,3 +184,28 @@ streamed call, low and max effort each thinking and calling).
 `vision`: PASS 6/6 completed red answers. `reasoning`: default/low/high/max
 all `323` with reasoning. `cancellation`: PASS — L1 observed the request,
 L1 and L2 released 0.29 s after the disconnect, a follow-up completed.
+
+`completed` (natural completion at the default thinking-high effort, 32
+requests per row, `max_tokens` 65,536; every request stopped with visible
+content; generic = short explanatory questions, coding = self-contained
+Python modules):
+
+| workload | c | completed | first content p50 ms | completion p50 ms | completion p99 ms | output tok/s |
+|---|---|---|---|---|---|---|
+| generic | 1 | 32/32 | 2,806 | 5,516 | 49,515 | 157.9 |
+| generic | 8 | 32/32 | 3,326 | 7,501 | 49,871 | 517.1 |
+| generic | 32 | 32/32 | 4,955 | 9,472 | 54,210 | 788.3 |
+| coding | 1 | 32/32 | 7,546 | 10,218 | 55,906 | 182.5 |
+| coding | 8 | 32/32 | 17,965 | 19,218 | 113,580 | 770.6 |
+| coding | 32 | 32/32 | 22,714 | 27,976 | 114,766 | 1,049.4 |
+
+These rows check completion and latency, not answer quality.
+
+`long-context` (retrieval of a random key placed mid-prompt; server-reported
+prompt tokens): 32,805 in 3.2 s, 131,109 in 10.6 s, 262,181 in 21.8 s and
+**1,039,909 in 119.6 s**, each returning exactly the key. Retrieval smokes,
+not a long-context quality evaluation.
+
+`restart` (`docker compose restart deepseek`): healthy and passing the
+readiness probes (exact finite answers on the DP ranks, tool call, image)
+again after 435.7 s.

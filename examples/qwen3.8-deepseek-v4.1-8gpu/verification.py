@@ -26,8 +26,6 @@ _DUAL_TRACK_INTERNAL_NODES = (
     "policies",
     "answer_1",
     "answer_2",
-    "answer_3",
-    "answer_4",
     "critique",
 )
 # Verification nodes every primary-profile request must trace: the audit
@@ -38,9 +36,9 @@ _DUAL_TRACK_VERIFICATION_NODES = ("audit",)
 # final unit. Direct routes have no head and no internal stages.
 _ROUTE_FINAL_NODES: dict[str, str] = dict(SPEC["orchestration"]["profile_final_roles"])
 _JUDGE_NODE = "profile_judge"
-# The public-TTFT gate (DTO-D3) applies to the head-streamed ensemble and the
-# non-thinking direct routes; the thinking direct routes pay a deliberate
-# think tax before their first public byte and are reported, not gated.
+# The public-TTFT gate (DTO-D3) applies to the head-streamed ensemble; the
+# thinking direct route pays a deliberate think tax before its first public
+# byte and is reported, not gated (DTO-D17 keeps only these two routes).
 _TTFT_GATED_PROFILES = tuple(SPEC["orchestration"]["ttft_gated_profiles"])
 DEEPSEEK_MODEL = SPEC["models"]["tier2"]["served_name"]
 # Serving-benchmark metadata: the DeepSeek L1 is one DP6 replica of TP1 ranks.
@@ -672,12 +670,12 @@ def serving_auto_max_coding(run_dir: Path) -> int:
     Every concurrency row runs the same deterministic coding dataset through
     the L3 product path AND directly against the DeepSeek L1 loopback
     endpoint; the row passes only when the product's semantic TTFT p50 over
-    the TTFT-gated routes (the head-streamed ensemble and the non-thinking
-    direct routes, DTO-D13) stays within ``ttft_multiplier_vs_deepseek_direct``
-    times the paired direct row (pinned example.json denominators are the
-    fallback when the paired row fails to produce a summary). Samples the
-    judge sent to a thinking direct route are reported per route but not
-    gated; a row with no gated-route sample records ``not_applicable``.
+    the TTFT-gated route (the head-streamed ensemble, DTO-D17) stays within
+    ``ttft_multiplier_vs_deepseek_direct`` times the paired direct row
+    (pinned example.json denominators are the fallback when the paired row
+    fails to produce a summary). Samples the
+    judge sent to the thinking direct route are reported per route but not
+    gated; a row with no ensemble sample records ``not_applicable``.
     """
 
     config = SPEC["verification"]["coding"]

@@ -12,7 +12,8 @@ previous green run (2026-08-18, `20260818T025710Z`) measured the pre-DTO-D8
 nine-role DAG.
 Applies to: `examples/qwen3.8-deepseek-v4-8gpu/` and the L2 mechanisms in
 `kairyu/orchestration/` + `kairyu/dsl/` that it consumes; DTO-D16 applies the
-same policy to `examples/qwen3.8-deepseek-v4.1-8gpu/`.
+same policy to `examples/qwen3.8-deepseek-v4.1-8gpu/`, reduced there to two
+routes and two policies by DTO-D17.
 Supersedes the ECO-D2/D3/D5/D6 role graphs, profiles, and profile judge in
 `example-coding-orchestration.md` (owner decision, 2026-08-18: the coding DAG,
 the general ensemble profile, the LLM profile judge, and the sandbox execution
@@ -610,8 +611,11 @@ Status: accepted; implemented; serving gates GPU re-verify and digest re-pin pen
 
 ### DTO-D16 — DeepSeek V4.1 six-GPU + Qwen two-replica variant (owner decision, 2026-09-30)
 
-Status: accepted; CPU half implemented; GPU gates pending
-(plan `docs/superpowers/plans/2026-09-30-qwen38-deepseek-v41-8gpu-example.md`).
+Status: accepted; implemented. Startup probes, vision, tool-calling, and the
+generic matrix passed on the five-route, four-policy configuration; DTO-D17
+then reduced the routes and policies, so those gates are re-run on the new
+configuration (plan
+`docs/superpowers/plans/2026-09-30-qwen38-deepseek-v41-8gpu-example.md`).
 
 - New example `qwen3.8-deepseek-v4.1-8gpu`: DeepSeek-V4.1-Flash as one
   DP6/EP6 replica on GPUs 0–5 (the measured L1 of `deepseek-v4.1-flash-6gpu`,
@@ -649,6 +653,38 @@ Status: accepted; CPU half implemented; GPU gates pending
 - Rationale: owner request — V4.1 performance on the six-GPU L1 with the
   inherited ensemble method, and native image input in place of the
   Qwen-described proxy.
+
+### DTO-D17 — Two routes and two policies for the V4.1 example (owner decision, 2026-10-01)
+
+Status: accepted; CPU half implemented; GPU gates pending.
+
+Applies only to `examples/qwen3.8-deepseek-v4.1-8gpu/`. The V4 example keeps
+five routes and four policies.
+
+- **Routes.** Two routes remain: `DEEPSEEK_THINK` → `deepseek_think` and
+  `ENSEMBLE` → `primary`, with fallback `primary`.
+  - `qwen_direct`, `qwen_think_medium`, and `deepseek_direct` are removed.
+  - The `DEEPSEEK_THINK` criteria now cover every request that one careful
+    expert answer handles, from greetings and short questions to hard
+    problems. Without this, requests the removed Qwen routes used to serve
+    would match no choice.
+  - The `ENSEMBLE` criteria are unchanged.
+- **Policies.** `policies` writes `POLICY 1:` and `POLICY 2:`. `answer_3`
+  and `answer_4` are removed, so each Qwen replica hosts one answerer.
+- **Synthesis.** It merges three UNTRUSTED peer candidates: 1 = `answer_1`,
+  2 = `answer_2`, and 3 = critique.
+- **Budget.** `{16, 2}`: 7 generation units, 1 empty-output re-dispatch,
+  3 audit verdicts, 3 inconclusive re-verifies, and 2 refinements.
+- **DeepSeek pool.** No DeepSeek role is effort-less, so the pool no longer
+  allows `enable_thinking`. The Qwen pool keeps it for the judge and head.
+- **TTFT gate.** The coding gate is applied to the ensemble only
+  (`ttft_gated_profiles: [primary]`). The thinking direct route is reported,
+  not gated.
+- **Unchanged.** The head, draft, critique, and audit roles; the effort
+  budgets; `internal_max_tokens`; and the 256-token floor.
+- **Rationale.** Owner request. The route mix and the width-4 fan-out were
+  measured with the Qwen pair as the bottleneck: at c32 the Qwen-only routes
+  reached a 43.9 s TTFT p50 and the judge a 2.4 s p50.
 
 ## Acceptance
 

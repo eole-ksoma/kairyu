@@ -119,35 +119,24 @@
   "orchestration": {
     "auto_max_model": "kairyu-auto-max",
     "internal_max_output_tokens": 65536,
-    "product_policy": "judged-five-route-dual-track",
+    "product_policy": "judged-two-route-dual-track",
     "roles": [
       "head",
       "draft",
       "policies",
       "answer_1",
       "answer_2",
-      "answer_3",
-      "answer_4",
       "critique",
       "synthesis",
       "audit"
     ],
     "stream_head": "head",
-    "max_steps": 18,
-    "product_normal_calls": 9,
-    "product_max_calls": 18,
+    "max_steps": 16,
+    "product_normal_calls": 7,
+    "product_max_calls": 16,
     "product_max_refinements": 2,
     "product_exposes_intermediate_outputs": true,
     "profiles": {
-      "qwen_direct": [
-        "qwen_answer"
-      ],
-      "qwen_think_medium": [
-        "qwen_think_answer"
-      ],
-      "deepseek_direct": [
-        "deepseek_answer"
-      ],
       "deepseek_think": [
         "deepseek_think_answer"
       ]
@@ -156,18 +145,6 @@
       "worker": "tier1",
       "fallback": "primary",
       "choices": [
-        {
-          "label": "QWEN",
-          "profile": "qwen_direct"
-        },
-        {
-          "label": "QWEN_THINK",
-          "profile": "qwen_think_medium"
-        },
-        {
-          "label": "DEEPSEEK",
-          "profile": "deepseek_direct"
-        },
         {
           "label": "DEEPSEEK_THINK",
           "profile": "deepseek_think"
@@ -180,41 +157,15 @@
     },
     "profile_final_roles": {
       "primary": "synthesis",
-      "qwen_direct": "qwen_answer",
-      "qwen_think_medium": "qwen_think_answer",
-      "deepseek_direct": "deepseek_answer",
       "deepseek_think": "deepseek_think_answer"
     },
     "ttft_gated_profiles": [
-      "primary",
-      "qwen_direct",
-      "deepseek_direct"
+      "primary"
     ],
     "direct_route_max_tokens": {
-      "qwen_direct": 131072,
-      "qwen_think_medium": 131072,
-      "deepseek_direct": 262144,
       "deepseek_think": 262144
     },
     "direct_route_sampling": {
-      "qwen_direct": {
-        "temperature": 0.7,
-        "top_p": 0.8,
-        "top_k": 20,
-        "presence_penalty": 1.5,
-        "max_tokens": 131072
-      },
-      "qwen_think_medium": {
-        "temperature": 1.0,
-        "top_p": 0.95,
-        "top_k": 20,
-        "max_tokens": 131072
-      },
-      "deepseek_direct": {
-        "temperature": 1.0,
-        "top_p": 0.95,
-        "max_tokens": 262144
-      },
       "deepseek_think": {
         "temperature": 1.0,
         "top_p": 0.95,

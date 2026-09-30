@@ -12,7 +12,6 @@ import json
 from pathlib import Path
 
 import httpx
-import pytest
 
 from kairyu.deploy.builder import build_app_from_spec
 from kairyu.deploy.spec import load_deployment_spec
@@ -63,7 +62,7 @@ def _orchestrator(verdict: str, seen: list[dict]):
         elif "[audit]" in text:
             answer = "PASS"
         elif "[policies]" in text:
-            answer = "\n".join(f"POLICY {n}: approach {n}" for n in range(1, 5))
+            answer = "\n".join(f"POLICY {n}: approach {n}" for n in range(1, 3))
         else:
             answer = "The image is red."
         return httpx.Response(
@@ -140,8 +139,8 @@ async def test_image_ensemble_sends_the_image_to_every_deepseek_role() -> None:
     call = await orchestrator.judge_role_profile(_image_call())
     assert call.role_profile_judgment == "primary"
     judge_prompt = next(_text(body) for body in seen if _JUDGE_MARKER in _text(body))
-    # Every route's worker accepts images, so none is withheld (DTO-D16).
-    for label in ("QWEN", "QWEN_THINK", "DEEPSEEK", "DEEPSEEK_THINK", "ENSEMBLE"):
+    # Both routes' workers accept images, so neither is withheld (DTO-D16/D17).
+    for label in ("DEEPSEEK_THINK", "ENSEMBLE"):
         assert f"- {label}:" in judge_prompt
 
     result = await orchestrator.run(call)
@@ -159,27 +158,18 @@ async def test_image_ensemble_sends_the_image_to_every_deepseek_role() -> None:
         assert "chat_template_kwargs" not in body
 
 
-@pytest.mark.parametrize(
-    ("verdict", "role", "effort", "kwargs"),
-    [
-        ("DEEPSEEK", "[deepseek_answer]", None, {"enable_thinking": False}),
-        ("DEEPSEEK_THINK", "[deepseek_think_answer]", "high", None),
-    ],
-)
-async def test_direct_deepseek_routes_select_thinking_per_request(
-    verdict: str, role: str, effort: str | None, kwargs: dict | None
-) -> None:
+async def test_direct_deepseek_route_thinks_at_the_request_effort() -> None:
     seen: list[dict] = []
-    orchestrator = _orchestrator(verdict, seen)
+    orchestrator = _orchestrator("DEEPSEEK_THINK", seen)
     call = await orchestrator.judge_role_profile(_image_call())
 
     await orchestrator.run(call)
 
     (body,) = _deepseek(seen)
-    assert role in _text(body)
+    assert "[deepseek_think_answer]" in _text(body)
     assert _has_image(body)
-    assert body.get("reasoning_effort") == effort
-    assert body.get("chat_template_kwargs") == kwargs
+    assert body["reasoning_effort"] == "high"
+    assert "chat_template_kwargs" not in body
 
 
 def _control():

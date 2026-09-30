@@ -58,8 +58,7 @@ pools:
 
   # One DP6 / EP6 replica on GPUs 0-5 (the deepseek-v4.1-flash-6gpu L1).
   # Every call is a chat request rendered by the official V4.1 encoder
-  # (DTO-D16): thinking roles send reasoning_effort, and an effort-less role
-  # is sent enable_thinking=false (chat mode).
+  # (DTO-D16); every DeepSeek role thinks and sends reasoning_effort.
   deepseek-v4.1-flash:
     replicas:
       - backend: openai
@@ -73,7 +72,6 @@ pools:
           upstream: vllm
           capabilities:
             allow_prompt_kinds: [multimodal]
-            allow_chat_template_kwargs: [enable_thinking]
           image_input_policy:
             max_images: 8
             max_image_bytes: 8388608

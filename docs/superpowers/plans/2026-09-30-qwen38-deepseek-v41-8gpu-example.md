@@ -94,3 +94,18 @@ no role references it.
 - [ ] Example files, overlay edit 7, tests, CPU suite and ruff
 - [ ] GPU: kernel check, `l1`, `vision`, serving matrices, browser smoke
 - [ ] MEASUREMENTS.md, image digests, PROGRESS.md status
+
+## Amendment 2026-10-01 (owner): two routes, two policies (DTO-D17)
+
+- **Routes:** DEEPSEEK_THINK and ENSEMBLE only. The DEEPSEEK_THINK criteria
+  now cover every request that one careful expert answer handles.
+- **Policies:** two policies and two answerers, one per Qwen replica.
+  Synthesis merges answer_1, answer_2, and critique.
+- **Budget:** `{16, 2}`.
+- **TTFT gate:** ensemble only.
+- **GPU results so far:** the gates run on the five-route configuration
+  (readiness, vision, tool-calling, and the generic matrix passed; the
+  coding matrix was stopped) are recorded as superseded.
+- **Next:** every gate is re-run on the new configuration after the owner's
+  go-ahead.
+

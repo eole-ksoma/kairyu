@@ -427,6 +427,18 @@ class NodeModelPrestageCompactionStore(NodeModelPrestageStore, Protocol):
     def list_high_water_marks(self) -> tuple[NodeModelPrestageHighWaterMark, ...]: ...
 
 
+@runtime_checkable
+class NodeModelPrestageCompactionMonitoringStore(Protocol):
+    """Optional bounded high-water monitoring extension."""
+
+    def list_high_water_marks_page(
+        self,
+        *,
+        after_placement_id: str | None = None,
+        limit: int = 100,
+    ) -> tuple[NodeModelPrestageHighWaterMark, ...]: ...
+
+
 def _copy_prestage_record(record: NodeModelPrestageRecord) -> NodeModelPrestageRecord:
     return NodeModelPrestageRecord.model_validate(record.model_dump())
 
@@ -922,6 +934,25 @@ class InMemoryNodeModelPrestageStore:
                 _copy_high_water_mark(self._high_water_marks[key])
                 for key in sorted(self._high_water_marks)
             )
+
+    def list_high_water_marks_page(
+        self,
+        *,
+        after_placement_id: str | None = None,
+        limit: int = 100,
+    ) -> tuple[NodeModelPrestageHighWaterMark, ...]:
+        if after_placement_id is not None:
+            after_placement_id = _text(after_placement_id, name="after_placement_id")
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("limit must be an integer in [1, 1000]")
+        with self._lock:
+            keys = (
+                key
+                for key in sorted(self._high_water_marks)
+                if after_placement_id is None or key > after_placement_id
+            )
+            selected = tuple(islice(keys, limit))
+            return tuple(_copy_high_water_mark(self._high_water_marks[key]) for key in selected)
 
 
 class NodeModelPrestageExecutor:

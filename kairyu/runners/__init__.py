@@ -110,6 +110,7 @@ from kairyu.runners.prestage import (
     InMemoryNodeModelPrestageStore,
     NodeModelPrestageCapacityError,
     NodeModelPrestageCommand,
+    NodeModelPrestageCompactionMonitoringStore,
     NodeModelPrestageCompactionStore,
     NodeModelPrestageConflictError,
     NodeModelPrestageError,
@@ -123,6 +124,12 @@ from kairyu.runners.prestage import (
     build_node_model_prestage_commands,
     build_node_model_prestage_release_command,
     build_runner_start_prestage_commands,
+)
+from kairyu.runners.prestage_compaction_runtime import (
+    NodeModelPrestageCompactionCycle,
+    NodeModelPrestageCompactionRuntime,
+    NodeModelPrestageCompactionRuntimeConfig,
+    NodeModelPrestageCompactionRuntimeStatus,
 )
 from kairyu.runners.prewarm import (
     ModelCachePlacement,
@@ -349,7 +356,12 @@ __all__ = [
     "NodeModelCacheAgentRuntime",
     "NodeModelCacheAgentRuntimeConfig",
     "NodeModelPrestageCommand",
+    "NodeModelPrestageCompactionCycle",
+    "NodeModelPrestageCompactionMonitoringStore",
     "NodeModelPrestageCompactionStore",
+    "NodeModelPrestageCompactionRuntime",
+    "NodeModelPrestageCompactionRuntimeConfig",
+    "NodeModelPrestageCompactionRuntimeStatus",
     "NodeModelPrestageConflictError",
     "NodeModelPrestageError",
     "NodeModelPrestageExecutor",

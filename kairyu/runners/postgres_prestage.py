@@ -950,6 +950,47 @@ class PostgresNodeModelPrestageStore:
                     )
                     return tuple(self._high_water_mark(row) for row in cursor.fetchall())
 
+    def list_high_water_marks_page(
+        self,
+        *,
+        after_placement_id: str | None = None,
+        limit: int = 100,
+    ) -> tuple[NodeModelPrestageHighWaterMark, ...]:
+        if after_placement_id is not None:
+            after_placement_id = _text(after_placement_id, name="after_placement_id")
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("limit must be an integer in [1, 1000]")
+        with self._lock:
+            self._require_open()
+            self._ensure_connection()
+            assert self._connection is not None
+            with self._connection.transaction():
+                with self._connection.cursor() as cursor:
+                    self._validate_registry_cursor(cursor)
+                    if after_placement_id is None:
+                        cursor.execute(
+                            f"""
+                            SELECT {self._high_water_select_columns()}
+                            FROM public.node_model_prestage_high_water_marks
+                            WHERE store_id = %s
+                            ORDER BY placement_id
+                            LIMIT %s
+                            """,
+                            (self._store_id, limit),
+                        )
+                    else:
+                        cursor.execute(
+                            f"""
+                            SELECT {self._high_water_select_columns()}
+                            FROM public.node_model_prestage_high_water_marks
+                            WHERE store_id = %s AND placement_id > %s
+                            ORDER BY placement_id
+                            LIMIT %s
+                            """,
+                            (self._store_id, after_placement_id, limit),
+                        )
+                    return tuple(self._high_water_mark(row) for row in cursor.fetchall())
+
     def check_ready(self) -> None:
         """Validate the live connection and this store's durable registry binding."""
 

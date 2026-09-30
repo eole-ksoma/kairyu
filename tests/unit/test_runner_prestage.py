@@ -38,6 +38,7 @@ from kairyu.runners import (
     ModelCachePlacementCandidate,
     ModelCachePlacementState,
     NodeModelPrestageCapacityError,
+    NodeModelPrestageCompactionMonitoringStore,
     NodeModelPrestageCompactionStore,
     NodeModelPrestageConflictError,
     NodeModelPrestageExecutor,
@@ -838,6 +839,16 @@ def test_compaction_is_cutoff_limited_and_never_moves_live_records() -> None:
         "placement-00",
         "placement-01",
     }
+    assert store.list_high_water_marks_page(limit=1) == first_batch
+    assert (
+        store.list_high_water_marks_page(
+            after_placement_id=first_batch[0].placement_id,
+            limit=1,
+        )
+        == second_batch
+    )
+    with pytest.raises(ValueError, match=r"\[1, 1000\]"):
+        store.list_high_water_marks_page(limit=0)
     assert tuple(record.command.placement_id for record in store.list_records()) == (
         "placement-live",
     )
@@ -934,6 +945,10 @@ def test_compaction_extension_preserves_legacy_store_runtime_compatibility() -> 
     assert isinstance(legacy, NodeModelPrestageStore)
     assert not isinstance(legacy, NodeModelPrestageLookupStore)
     assert not isinstance(legacy, NodeModelPrestageCompactionStore)
+    assert isinstance(
+        InMemoryNodeModelPrestageStore(node_id="gpu-node-00"),
+        NodeModelPrestageCompactionMonitoringStore,
+    )
 
 
 def test_lookup_extension_returns_an_isolated_exact_record() -> None:

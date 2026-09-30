@@ -144,9 +144,7 @@ def isolated_database():
     database_name = f"pytest_node_prestage_{uuid.uuid4().hex}"
     with psycopg.connect(_POSTGRES_DSN, autocommit=True) as connection:
         connection.execute(
-            psycopg.sql.SQL("CREATE DATABASE {}").format(
-                psycopg.sql.Identifier(database_name)
-            )
+            psycopg.sql.SQL("CREATE DATABASE {}").format(psycopg.sql.Identifier(database_name))
         )
     database_dsn = psycopg.conninfo.make_conninfo(
         _POSTGRES_DSN,
@@ -170,9 +168,7 @@ def test_cross_instance_claim_complete_release_and_replay(store_factory) -> None
     assert isinstance(first, NodeModelPrestageStore)
     assert first.check_ready() is None
     claimed = first.claim(command, claim_id="b" * 64, now=_NOW + timedelta(seconds=1))
-    assert second.claim(
-        command, claim_id="b" * 64, now=_NOW + timedelta(seconds=1)
-    ) == claimed
+    assert second.claim(command, claim_id="b" * 64, now=_NOW + timedelta(seconds=1)) == claimed
     with pytest.raises(NodeModelPrestageConflictError, match="another attempt"):
         second.claim(command, claim_id="c" * 64, now=_NOW + timedelta(seconds=1))
 
@@ -185,11 +181,14 @@ def test_cross_instance_claim_complete_release_and_replay(store_factory) -> None
     )
     assert ready.pin_record_generation == 7
     assert first.list_records() == (ready,)
-    assert first.claim(
-        command,
-        claim_id=b"ignored".hex().ljust(64, "0"),
-        now=_NOW + timedelta(seconds=3),
-    ) == ready
+    assert (
+        first.claim(
+            command,
+            claim_id=b"ignored".hex().ljust(64, "0"),
+            now=_NOW + timedelta(seconds=3),
+        )
+        == ready
+    )
 
     release = build_node_model_prestage_release_command(
         command,
@@ -239,6 +238,14 @@ def test_cross_instance_compaction_reclaims_capacity_without_losing_fences(
 
     assert first.list_records() == ()
     assert second.list_high_water_marks() == marks
+    assert second.list_high_water_marks_page(limit=1) == marks
+    assert (
+        second.list_high_water_marks_page(
+            after_placement_id=marks[0].placement_id,
+            limit=1,
+        )
+        == ()
+    )
     assert marks[0].command_generation == 21
     assert marks[0].fencing_token == 5
     assert marks[0].target_revision == 9
@@ -252,11 +259,14 @@ def test_cross_instance_compaction_reclaims_capacity_without_losing_fences(
         )
 
     other = _command("placement-01", generation=30)
-    assert second.claim(
-        other,
-        claim_id="d" * 64,
-        now=_NOW + timedelta(seconds=6),
-    ).command == other
+    assert (
+        second.claim(
+            other,
+            claim_id="d" * 64,
+            now=_NOW + timedelta(seconds=6),
+        ).command
+        == other
+    )
 
 
 def test_concurrent_cross_instance_claim_has_one_winner(store_factory) -> None:
@@ -329,9 +339,7 @@ def test_list_records_page_uses_stable_placement_cursor(store_factory) -> None:
     ]
     assert [
         record.command.placement_id
-        for record in first.list_records_page(
-            after_placement_id="placement-01", limit=2
-        )
+        for record in first.list_records_page(after_placement_id="placement-01", limit=2)
     ] == ["placement-02"]
 
 

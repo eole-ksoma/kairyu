@@ -264,3 +264,44 @@ def test_placement_admission_serve_uses_tls_runtime_and_closes(monkeypatch, tmp_
     assert captured["access_log"] is False
     assert captured["workers"] == 1
     assert runtime.close_calls == 1
+
+
+def test_placement_authority_serve_uses_tls_runtime_and_closes(monkeypatch, tmp_path):
+    config_path = tmp_path / "placement-authority.json"
+    config_path.write_text("{}", encoding="utf-8")
+    server = SimpleNamespace(
+        listen_host="127.0.0.1",
+        listen_port=8444,
+        tls_cert_file=tmp_path / "tls.crt",
+        tls_key_file=tmp_path / "tls.key",
+    )
+    config = SimpleNamespace(authority=server)
+    runtime = SimpleNamespace(app=object(), close_calls=0)
+
+    def close():
+        runtime.close_calls += 1
+
+    runtime.close = close
+    captured = {}
+    monkeypatch.setattr(
+        "kairyu.runners.startup_binding_authority_production."
+        "load_runner_cache_placement_binding_production_runtime_config",
+        lambda path: config,
+    )
+    monkeypatch.setattr(
+        "kairyu.runners.startup_binding_authority_production."
+        "build_runner_cache_placement_binding_production_runtime",
+        lambda value: runtime,
+    )
+    monkeypatch.setattr("uvicorn.run", lambda app, **kwargs: captured.update(app=app, **kwargs))
+
+    cli.main(["placement-authority", "serve", str(config_path)])
+
+    assert captured["app"] is runtime.app
+    assert captured["host"] == "127.0.0.1"
+    assert captured["port"] == 8444
+    assert captured["ssl_certfile"] == str(server.tls_cert_file)
+    assert captured["ssl_keyfile"] == str(server.tls_key_file)
+    assert captured["access_log"] is False
+    assert captured["workers"] == 1
+    assert runtime.close_calls == 1

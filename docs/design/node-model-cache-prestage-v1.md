@@ -32,8 +32,10 @@ controller-owned placement-inventory readers. D3.17 adds a lifecycle-owned,
 scheduled caller for the bounded compaction contract. D3.18 adds leader-fenced,
 optimistic-concurrency reconcilers for the two authority CRDs. D3.19 adds the
 leader-election lifecycle that campaigns, renews, retries, reports readiness,
-and resigns without overlapping lease operations. Runtime assembly, deployment
-wiring, and live acceptance remain deployment tasks.
+and resigns without overlapping lease operations. D3.20 assembles the durable
+stores, live readers, leader lifecycle, authorization source, and HTTPS service
+under one production ownership boundary. Deployment wiring and live acceptance
+remain deployment tasks.
 
 ## Purpose
 
@@ -760,6 +762,22 @@ If durable release fails, shutdown reports the failure and abandons the local
 lease so the stopped process cannot authorize more work; the durable lease then
 expires normally. An injected store remains caller-owned.
 
+D3.20 adds `RunnerCachePlacementBindingProductionRuntime`. Its versioned strict
+configuration fixes PostgreSQL store identity and limits, Kubernetes/Kueue and
+authority-CRD routing, node-agent HTTPS origins, TLS roots, fan-out limits, and
+leader timing. DSNs and bearer tokens are read only from bounded regular files
+with secret permissions; duplicate-key or non-finite JSON is rejected.
+
+The builder connects the three PostgreSQL stores, Kubernetes/Kueue reader,
+authenticated node-evidence client, aggregate cache reader, composed live-state
+source, state-aware leader controller, and authority HTTP app. Leadership starts
+only after the graph is complete. Partial construction and normal shutdown close
+all adopted resources once in reverse order, beginning with leadership, while
+readiness requires both a healthy leader lifecycle and every live dependency.
+`kairyu placement-authority serve CONFIG.json` exposes that graph with the
+configured TLS certificate and a single process worker; replication belongs to
+the Deployment because leadership and resource ownership are process-local.
+
 ## Deployment boundary
 
 `private-ai-cloud-iac` must still provide:
@@ -772,12 +790,12 @@ expires normally. An injected store remains caller-owned.
 - assembly and configuration of the implemented scheduled compaction runtime,
   including an operator-approved retention age plus export of runtime status
   and per-placement high-water monitoring;
-- assembly and configuration of the implemented leader-election lifecycle,
-  including stable per-replica holder identities plus readiness/status export;
-- CRD definitions, runtime assembly and least-privilege read/write RBAC for the
+- configuration of the implemented production authority runtime, including
+  stable per-replica holder identities, secret/TLS mounts, and status export;
+- CRD definitions and least-privilege read/write RBAC for the
   implemented `RunnerScalingQuotaSnapshot` and `RunnerCachePlacementInventory`
   reconcilers and Kubernetes/Kueue reader;
-- assembly and deployment of the scaling-authority
+- deployment of the assembled scaling-authority
   reauthorization/readiness endpoint consumed by D3.8, plus a highly available
   Deployment/Service/MutatingWebhookConfiguration, TLS
   certificate issuance/rotation and trust, ingress restriction, orchestration
@@ -787,9 +805,9 @@ expires normally. An injected store remains caller-owned.
   pin reconciliation; and
 - live node-pool acceptance with real S3, NVMe, Kueue, and Runner startup.
 
-Until that wiring exists, the PostgreSQL and Kubernetes readers form a
-fail-closed library authority but no production node agent consumes its work;
-the feature must remain disabled for production autoscaling.
+Until that wiring exists, the assembled runtime remains a fail-closed library
+entrypoint but no production deployment consumes its work; the feature must
+remain disabled for production autoscaling.
 
 ## CPU verification
 

@@ -90,6 +90,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Assemble and serve the TLS admission webhook from versioned JSON config.",
     )
     placement_admission_serve.add_argument("config", type=Path)
+
+    placement_authority = subparsers.add_parser(
+        "placement-authority",
+        help="Run the live cache-placement scaling authority.",
+    )
+    placement_authority_commands = placement_authority.add_subparsers(
+        dest="placement_authority_command",
+        required=True,
+    )
+    placement_authority_serve = placement_authority_commands.add_parser(
+        "serve",
+        help="Assemble and serve the production authority from versioned JSON config.",
+    )
+    placement_authority_serve.add_argument("config", type=Path)
     return parser
 
 
@@ -200,6 +214,36 @@ def _run_placement_admission(args: argparse.Namespace) -> None:
         runtime.close()
 
 
+def _run_placement_authority(args: argparse.Namespace) -> None:
+    import uvicorn
+
+    from kairyu.entrypoints.server.middleware import configure_json_logging
+    from kairyu.runners.startup_binding_authority_production import (
+        build_runner_cache_placement_binding_production_runtime,
+        load_runner_cache_placement_binding_production_runtime_config,
+    )
+
+    configure_json_logging()
+    config = load_runner_cache_placement_binding_production_runtime_config(args.config)
+    runtime = build_runner_cache_placement_binding_production_runtime(config)
+    server = config.authority
+    try:
+        uvicorn.run(
+            runtime.app,
+            host=server.listen_host,
+            port=server.listen_port,
+            loop="uvloop" if sys.platform == "linux" else "auto",
+            http="httptools" if sys.platform == "linux" else "auto",
+            log_config=None,
+            access_log=False,
+            workers=1,
+            ssl_certfile=str(server.tls_cert_file),
+            ssl_keyfile=str(server.tls_key_file),
+        )
+    finally:
+        runtime.close()
+
+
 def main(argv: list[str] | None = None) -> None:
     args = _build_parser().parse_args(argv)
     if args.command == "serve":
@@ -244,6 +288,8 @@ def main(argv: list[str] | None = None) -> None:
         _run_cache_agent(args)
     elif args.command == "placement-admission":
         _run_placement_admission(args)
+    elif args.command == "placement-authority":
+        _run_placement_authority(args)
 
 
 if __name__ == "__main__":

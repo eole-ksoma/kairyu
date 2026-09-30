@@ -261,6 +261,14 @@ from kairyu.runners.startup_binding_live_authority import (
     RunnerCachePlacementBindingTargetState,
     ScalingControllerPlacementBindingAuthority,
 )
+from kairyu.runners.startup_binding_live_cache import (
+    AggregatingRunnerCachePlacementBindingCacheReader,
+    AuthenticatedNodeModelCacheLiveEvidenceClient,
+    NodeModelCacheAgentEndpoint,
+    NodeModelCacheLiveEvidenceReader,
+    RunnerCachePlacementBindingInventory,
+    RunnerCachePlacementBindingInventoryReader,
+)
 from kairyu.runners.startup_binding_live_source import (
     ComposedRunnerCachePlacementBindingLiveStateSource,
     RunnerCachePlacementBindingCacheReader,
@@ -283,6 +291,8 @@ from kairyu.runners.startup_scheduling import (
 )
 
 __all__ = [
+    "AggregatingRunnerCachePlacementBindingCacheReader",
+    "AuthenticatedNodeModelCacheLiveEvidenceClient",
     "DEFAULT_RUNNER_CLOCK_SKEW_TOLERANCE",
     "RUNNER_STARTUP_PHASES",
     "OPTIONAL_RUNNER_STARTUP_PHASES",
@@ -317,10 +327,12 @@ __all__ = [
     "InMemoryNodeModelPrestageStore",
     "NodeModelPrestageCapacityError",
     "NodeModelCacheAgentHealth",
+    "NodeModelCacheAgentEndpoint",
     "LocalNodeModelCacheLiveEvidenceSource",
     "NodeModelCacheLiveEvidenceRequest",
     "NodeModelCacheLiveEvidenceResponse",
     "NodeModelCacheLiveEvidenceSource",
+    "NodeModelCacheLiveEvidenceReader",
     "NodeModelCacheAgentAPIKeys",
     "NodeModelCacheAgentRuntime",
     "NodeModelCacheAgentRuntimeConfig",
@@ -397,6 +409,8 @@ __all__ = [
     "RunnerCachePlacementBindingLiveState",
     "RunnerCachePlacementBindingLiveStateSource",
     "RunnerCachePlacementBindingPinEvidence",
+    "RunnerCachePlacementBindingInventory",
+    "RunnerCachePlacementBindingInventoryReader",
     "RunnerCachePlacementBindingPrestageEvidence",
     "RunnerCachePlacementBindingTargetState",
     "ScalingControllerPlacementBindingAuthority",

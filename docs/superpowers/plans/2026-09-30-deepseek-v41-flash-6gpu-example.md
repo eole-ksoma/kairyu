@@ -77,12 +77,14 @@ recorded verbatim in `MEASUREMENTS.md` and the stage moves on.
 
 - **L1-0 Runtime image (time box: 1 GPU day).** Candidates, first passing
   wins:
-  (a) a current `vllm/vllm-openai:nightly` pinned by digest plus the 8-GPU
-  example's SM120 FlashInfer overlay recipe (it carries `indexer_sparse_logits`
+  (a) a current `vllm/vllm-openai:nightly` pinned by digest plus this
+  example's own SM120 FlashInfer overlay (it carries `indexer_sparse_logits`
   and upstream fixes since 09-09);
-  (b) the 8-GPU example's image (`0.1.dev20904`) unchanged;
+  (b) the 0909-era base (`0.1.dev20904`) with this example's own overlay;
   (c) (b) plus the masked-KV and seeded top-p fixes the tiered branch found
   necessary for EP6 (re-derived and SHA-pinned in this example).
+  Every overlay file is this example's own; no image or file is taken from
+  another example.
   Pass rule = the correctness gate: SM120 kernel checks
   (`check_sm120_pages.py`, `check_sm120_indexer.py`), rendered effort
   50/75/100 and chat mode via `/tokenize`, 12 concurrent `17 * 19` probes
@@ -144,21 +146,23 @@ measurable difference.
 
 - New: `examples/deepseek-v4.1-flash-6gpu/{README.md, MEASUREMENTS.md,
   example.json, kairyu.yaml, compose.yaml, run.sh, verify.sh}`.
-- Lifecycle, verification, benchmark and tuning scripts: reuse the 8-GPU
-  example's `control.py` / `verification.py` / `benchmark.py` / `tune.py` by
-  pointing them at this example's `example.json` instead of copying ≈2,600
-  lines. The needed sibling change (spec/compose path taken from the caller,
-  allocation with `data_parallel_size` and per-DP-rank cpusets) stays inside
-  `examples/`; if it turns out larger than a small parameterisation, stop and
-  ask before copying or refactoring.
+- Lifecycle, verification, benchmark and tuning scripts are this example's
+  own (owner, 2026-09-30: no script sharing between examples). The example
+  writes its own `control.py`, `verification.py`, `benchmark.py`, `tune.py`,
+  runtime overlay (Dockerfile / patch scripts / SM120 kernel checks) and
+  Chat UI filter, written for the TP2 × DP3 / EP6 topology from the start
+  (per-DP-rank NUMA cpusets, three-rank probe coverage, Engram host-memory
+  check). No file under another example is imported, referenced or
+  modified; the 8-GPU example is read for reference only.
 - Kairyu (`kairyu/`) is not changed. The native engine's `ep_size ∈
   {1,2,4,8}` limit (`kairyu/models/deepseek_v4.py:193`) is why L1 stays on
   vLLM; lifting it is out of scope.
-- Tests (CLAUDE.md test policy): add this example to the existing
-  parametrised example-lifecycle tests only where they check behaviour
-  (compose rendering, GPU/cpuset allocation, effort default); one test for
-  the DP-rank cpuset mapping if that logic is new. No tests that restate
-  `example.json` contents.
+- Tests (CLAUDE.md test policy): one example-owned test file,
+  `tests/unit/test_deepseek_v41_6gpu_example.py`, covering only behaviour
+  with a concrete failure mode: DP-rank → GPU pair → NUMA cpuset mapping,
+  fail-closed runtime patch anchors, and readiness rejecting wrong or
+  non-finite answers. Shared example tests are not extended. No tests that
+  restate `example.json` contents.
 - Docs: FN-D9 V4.1 six-GPU amendment in `docs/design/frontier-native-runtime.md`
   (topology derivation, official deviations, selected L1); `examples/README.md`
   row; `PROGRESS.md` Current Status + Change Log entry.
@@ -173,7 +177,7 @@ Evidence, run IDs, hashes and limitations go in `MEASUREMENTS.md`.
 ## Checklist
 
 - [ ] Owner approves this plan.
-- [ ] Branch, example skeleton, sibling-script parameterisation, CPU tests, lint.
+- [ ] Branch, example files and example-owned scripts, CPU tests, lint.
 - [ ] Release GPUs 0–5 (save and report the state of anything running).
 - [ ] L1-0 … L1-6 in order; record every candidate.
 - [ ] Final gates; MEASUREMENTS.md; FN-D9 amendment; PROGRESS.md; PR.

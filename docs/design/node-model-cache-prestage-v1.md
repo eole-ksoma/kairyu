@@ -28,8 +28,10 @@ authenticated controller client and bounded fan-out aggregator, joining those
 node responses only to scheduler placement facts observed afterward.
 D3.15 adds deadline-bounded PostgreSQL current-binding and exact durable-decision
 readers. D3.16 adds deadline-bounded Kubernetes target, Kueue quota, and
-controller-owned placement-inventory readers. CRD reconciliation, scheduled
-compaction, and deployment wiring remain deployment tasks.
+controller-owned placement-inventory readers. D3.17 adds a lifecycle-owned,
+scheduled caller for the bounded compaction contract. CRD reconciliation,
+runtime assembly, deployment wiring, and live acceptance remain deployment
+tasks.
 
 ## Purpose
 
@@ -681,6 +683,28 @@ denial; API transport/RBAC/server failures and malformed responses remain
 dependency failures. Readiness verifies the configured workload, both CRDs,
 and Kueue collection access under that same budget.
 
+D3.17 adds `NodeModelPrestageCompactionRuntime` as the scheduled caller for the
+D3.5/D3.6 store contract. Each cycle selects one explicit retirement cutoff
+from its timezone-aware start time and configured retention age, then reuses
+that cutoff and compaction time for every batch. Both the batch size (at most
+1,000) and calls per cycle are bounded, and their product cannot exceed 10,000
+retained results. A short batch ends the cycle; consuming the complete call
+budget is reported as possible backlog rather than causing an unbounded catch-up
+loop.
+
+The worker starts with an immediate cycle, retries ordinary backend failures on
+the fixed interval, and owns a stop event plus bounded join. It does not own or
+close the injected store. Process-local status preserves successful batch and
+record totals even when a later batch in the same cycle fails, but exposes no
+backend exception text. Readiness requires a live worker, at least one recent
+successful cycle, and fewer than the configured consecutive-failure threshold.
+The last successful cycle contains the exact compacted high-water marks, while
+`list_high_water_marks_page()` exposes at most 1,000 deep-validated durable marks
+through a placement-ID cursor without materializing the unbounded history. A
+synchronous `run_once()` uses the same contract for explicit jobs and
+deterministic tests, rejects overlapping cycles, and is included in the bounded
+shutdown wait.
+
 ## Deployment boundary
 
 `private-ai-cloud-iac` must still provide:
@@ -690,8 +714,9 @@ and Kueue collection access under that same budget.
 - a node DaemonSet/service invoking the implemented `cache-agent serve`
   entrypoint;
 - reconciliation that replays desired ensure/release commands after restart;
-- a scheduled caller for the implemented bounded compaction contract, with a
-  documented retirement cutoff and monitoring of per-placement high-water rows;
+- assembly and configuration of the implemented scheduled compaction runtime,
+  including an operator-approved retention age plus export of runtime status
+  and per-placement high-water monitoring;
 - reconcilers and CRD definitions that publish the implemented
   `RunnerScalingQuotaSnapshot` and `RunnerCachePlacementInventory` contracts,
   with least-privilege read RBAC for the implemented Kubernetes/Kueue reader;
@@ -715,10 +740,11 @@ Tests cover deterministic command hashing, exact generation allocation,
 admission and node binding, claim concurrency, expiry, verified fill and pin,
 idempotent replay, failure/retry, fresh fenced release, preservation of other
 pin owners, bounded compaction, post-compaction replay and successor fencing,
-and exact monotonic status projection. Real PostgreSQL tests add cross-instance
-claim races, completion/release replay, shared capacity reclamation, durable
-high-water visibility, store configuration mismatch, and projected-metadata
-corruption detection.
+scheduled cutoff/batch limits, retry/readiness/shutdown behavior, canonical
+high-water monitoring, and exact monotonic status projection. Real PostgreSQL
+tests add cross-instance claim races, completion/release replay, shared capacity
+reclamation, durable high-water visibility, store configuration mismatch, and
+projected-metadata corruption detection.
 HTTP tests cover API-key protection, local-only trust roots, node binding,
 ensure/release replay, path/failure-detail redaction, readiness sanitization,
 bounded cursor pagination, error mappings, concurrent admission, and declared

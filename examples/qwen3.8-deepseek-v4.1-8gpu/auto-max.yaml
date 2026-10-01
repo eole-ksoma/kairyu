@@ -421,16 +421,18 @@ roles:
 # runs it non-thinking; <=8 output tokens over a 4,000-character head+tail
 # view of the latest user turn, 5 s timeout. The two choices (DTO-D17) are
 # listed faster -> more thorough and their criteria text is the routing
-# policy the judge reads; `fallback: primary` keeps quality on any judge
-# failure. DTO-D17 amendment (2026-10-01): hard problems and ties go to
-# ENSEMBLE; DEEPSEEK_THINK keeps everyday requests and routine agent turns.
+# policy the judge reads. `fallback: deepseek_think` (DTO-D17 second
+# amendment): a judge timeout, backend error, or unparseable verdict must not
+# escalate to the heavier ensemble. DTO-D17 amendment (2026-10-01): hard
+# problems and ties go to ENSEMBLE; DEEPSEEK_THINK keeps everyday requests
+# and routine agent turns.
 # The tie-break lives in the criteria text because profile_judge
 # prompt_prefix/suffix switch the judge to a pre-rendered raw prompt.
 profile_judge:
   worker: tier1
   timeout_seconds: 5.0
   max_tokens: 8
-  fallback: primary
+  fallback: deepseek_think
   choices:
     - profile: deepseek_think
       label: DEEPSEEK_THINK

@@ -123,8 +123,26 @@ Open points:
   here: edit 7 touches only the Python encoder, and the kernel edits are
   those of `deepseek-v4.1-flash-6gpu`, which passed 28/28.
 
-## GPU gates on the loosened ENSEMBLE criteria (DTO-D17 amendment, 2026-10-01)
+## GPU gates on the loosened ENSEMBLE criteria (superseded by the fallback amendment)
 
-Pending re-run: readiness, `vision`, `tool-calling`, `serving-auto-max`,
-`serving-auto-max-coding`, and the browser smoke.
+These ran with `fallback: primary` and are kept for reference only. Runs are
+stored as `amend-*` under the verification-results directory above.
+
+| Gate | Result |
+|---|---|
+| `up` readiness probes | PASS |
+| `vision` | PASS: 4/4 primary; 12 DeepSeek images for 12 DeepSeek stages |
+| `tool-calling` | PASS: `bash {"command": "ls -la"}` via `deepseek_think` |
+| `serving-auto-max` | exit 0. Routes (`deepseek_think` / `primary`): c1 28/4, c8 18/14, c16 17/15, c32 22/10 |
+| `serving-auto-max-coding` | stopped during c1 (first attempt) and again for the fallback change (second attempt); no verdict |
+| browser smoke | not run |
+
+Per-route TTFT p50 (`deepseek_think` / `primary`): c1 12.81 / 2.26 s, c8
+16.58 / 6.34 s, c16 29.17 / 25.83 s, c32 38.55 / 35.77 s. Judge p50: 304,
+365, 848, 2,101 ms.
+
+## GPU gates with judge fallback `deepseek_think` (DTO-D17 second amendment, 2026-10-01)
+
+Pending: readiness, `vision`, `tool-calling`, `serving-auto-max`,
+`serving-auto-max-coding`, and the browser smoke (runs `fb-*`).
 

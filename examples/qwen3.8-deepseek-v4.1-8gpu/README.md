@@ -47,8 +47,9 @@ request; the other route does not execute at all.
 2. **Dispatch.** Kairyu attaches the verdict once, before preflight and
    admission, and builds only that route's DAG.
 3. **Fallback.** A judge timeout, an error, or any answer that is not exactly
-   one offered label sends the request to the ensemble, the quality-safe
-   route.
+   one offered label sends the request to `deepseek_think` (DTO-D17 second
+   amendment). A slow or failed judge never escalates a request to the
+   heavier ensemble.
 
 | label | route (profile) | what runs | thinking | sampling (fixed, DTO-D8) | max_tokens cap |
 |---|---|---|---|---|---|
@@ -120,7 +121,7 @@ records the verdict, the offered labels, and the judge's token usage, and
 
 The `primary` route is an eight-role ensemble in three waves: seven
 generation roles plus one audit verifier. It runs only when the judge answers
-`ENSEMBLE` (or as the fallback). Inside it, no role is skipped.
+`ENSEMBLE`. Inside it, no role is skipped.
 
 ```mermaid
 flowchart LR

@@ -715,6 +715,21 @@ five routes and four policies.
   `enable_thinking: false`.
 - **Status:** GPU gates re-run after this amendment.
 
+**DTO-D17 second amendment (owner, 2026-10-01): fallback `deepseek_think`.**
+
+- **What:** `profile_judge.fallback` changes from `primary` to
+  `deepseek_think`. A judge timeout (5 s), a backend error, an unparseable
+  verdict, or a request the judge does not see now runs one thinking
+  DeepSeek call instead of the ensemble.
+- **Why:** a judge that is slow or broken says nothing about the request's
+  difficulty. Sending such requests to the heavier route made a 5 s judge
+  delay escalate work exactly when the system is most loaded.
+- **Mechanism:** the existing `ProfileJudgeSpec.fallback` setting; `kairyu/`
+  is unchanged. `control.py` checks the served fallback against
+  `example.json` at readiness.
+- **Status:** every GPU gate is re-run on this configuration; the earlier
+  amendment's runs are kept in MEASUREMENTS.md as superseded.
+
 ## Acceptance
 
 - CPU suite green with the rewritten example pinning test

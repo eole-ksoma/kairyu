@@ -11,6 +11,7 @@ import subprocess
 import sys
 import sysconfig
 import tempfile
+import textwrap
 import zipfile
 from pathlib import Path, PurePosixPath
 
@@ -113,24 +114,61 @@ def _verify_isolated_runtime(wheel: Path, scratch: Path) -> None:
         archive.extractall(extracted)
 
     dependency_site = Path(sysconfig.get_paths()["purelib"]).resolve()
-    code = (
-        "import argparse, importlib.util; "
-        "from pathlib import Path; "
-        "import kairyu; "
-        "from kairyu.entrypoints.cli import _build_parser; "
-        "root=Path.cwd().resolve(); "
-        "module=Path(kairyu.__file__).resolve(); "
-        "assert module.is_relative_to(root), (module, root); "
-        "parser=_build_parser(); "
-        "actions=[action for action in parser._actions "
-        "if isinstance(action,argparse._SubParsersAction)]; "
-        "assert len(actions)==1; "
-        "assert set(actions[0].choices)=={'serve','validate'}; "
-        "assert 'bench' not in parser.format_help().lower(); "
-        "assert importlib.util.find_spec('evals') is None; "
-        "assert importlib.util.find_spec('evidence') is None; "
-        "assert importlib.util.find_spec('verification') is None; "
-        "print(module)"
+    code = textwrap.dedent(
+        """
+        import argparse
+        import importlib
+        import importlib.util
+        from pathlib import Path
+
+        import kairyu
+        from kairyu.entrypoints.cli import _build_parser
+
+        def command_tree(parser):
+            actions = [
+                action
+                for action in parser._actions
+                if isinstance(action, argparse._SubParsersAction)
+            ]
+            assert len(actions) <= 1, actions
+            if not actions:
+                return {}
+            return {
+                name: command_tree(child)
+                for name, child in actions[0].choices.items()
+            }
+
+        root = Path.cwd().resolve()
+        module = Path(kairyu.__file__).resolve()
+        assert module.is_relative_to(root), (module, root)
+        parser = _build_parser()
+        expected_tree = {
+            "artifact": {"admit": {}, "validate": {}},
+            "cache-agent": {"serve": {}},
+            "placement-admission": {"serve": {}},
+            "placement-authority": {"serve": {}},
+            "serve": {},
+            "validate": {},
+        }
+        actual_tree = command_tree(parser)
+        assert actual_tree == expected_tree, actual_tree
+        assert "bench" not in parser.format_help().lower()
+        command_modules = (
+            "kairyu.artifacts",
+            "kairyu.deploy.builder",
+            "kairyu.deploy.validation",
+            "kairyu.runners.cache_agent_runtime",
+            "kairyu.runners.startup_admission_runtime",
+            "kairyu.runners.startup_binding_authority_production",
+        )
+        imported = [importlib.import_module(name) for name in command_modules]
+        imported_paths = [Path(item.__file__).resolve() for item in imported]
+        assert all(path.is_relative_to(root) for path in imported_paths), imported_paths
+        assert importlib.util.find_spec("evals") is None
+        assert importlib.util.find_spec("evidence") is None
+        assert importlib.util.find_spec("verification") is None
+        print(module)
+        """
     )
     result = _isolated_run(extracted, dependency_site, code)
     module_path = Path(result.stdout.strip()).resolve()

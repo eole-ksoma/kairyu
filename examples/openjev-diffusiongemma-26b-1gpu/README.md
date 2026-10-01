@@ -51,9 +51,13 @@ printed ID. The first start also compiles FlashInfer's NVFP4 MoE kernels
 (about 4 minutes); they are cached on NVMe.
 
 **Endpoints.**
-- API: `http://127.0.0.1:8010/v1`, model `diffusiongemma-26b`.
-- Chat UI: `http://127.0.0.1:3010` (local, no authentication, no effort
-  selector).
+- API: `http://127.0.0.1:8010/v1` (this host only), model
+  `diffusiongemma-26b`.
+- Chat UI: `http://<host>:3010` and playground: `http://<host>:3011` (no
+  authentication, no effort selector). Like the other examples, both bind
+  `0.0.0.0` and `run.sh up` prints them with the host's outward-facing
+  address; set `PUBLIC_HOST` to name it, or `CHAT_UI_BIND_ADDRESS=127.0.0.1`
+  to keep them local.
 
 ## How the thought is enforced
 
@@ -151,7 +155,7 @@ curl http://127.0.0.1:8010/v1/systemone -H "Content-Type: application/json" -d '
   256 more (`kairyu.yaml` `systemone:`), so a burst gets Kairyu's 429, never
   OpenJev's 529. These requests do not count against chat's 40 and never
   touch the chat replica.
-- **Playground** (`http://127.0.0.1:3011`, no authentication): enter a
+- **Playground** (`http://<host>:3011`, no authentication): enter a
   state, optional images and typed questions, then see each answer's
   probability bars, confidence, tokens, latency and OpenJev's
   `Server-Timing` split. Next to it, the same state and questions go to the

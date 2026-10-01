@@ -116,7 +116,7 @@ services:
       kairyu:
         condition: service_healthy
     ports:
-    - ${CHAT_UI_BIND_ADDRESS:-127.0.0.1}:${CHAT_UI_PORT:-3010}:8080
+    - ${CHAT_UI_BIND_ADDRESS:-0.0.0.0}:${CHAT_UI_PORT:-3010}:8080
     restart: unless-stopped
   # Jev-style System One playground: a static page, with Kairyu's API proxied
   # on the same origin (playground/nginx.conf).
@@ -129,7 +129,7 @@ services:
       kairyu:
         condition: service_healthy
     ports:
-    - ${CHAT_UI_BIND_ADDRESS:-127.0.0.1}:${PLAYGROUND_PORT:-3011}:8080
+    - ${CHAT_UI_BIND_ADDRESS:-0.0.0.0}:${PLAYGROUND_PORT:-3011}:8080
     healthcheck:
       test:
       - CMD

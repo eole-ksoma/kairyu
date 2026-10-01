@@ -75,10 +75,14 @@ published image (`openjev-think.Dockerfile`).
 - **Usage** counts the prompt once and both outputs as completion tokens.
   The answer budget (`max_tokens`, OpenJev's cap 8192) comes on top of the
   512-token thought.
-- **Errors.** A refused thought is an HTTP error. If the answer pass fails
-  after the thought has streamed, the stream is aborted. Kairyu ignores
-  mid-stream error chunks, so ending the stream normally would make a
-  truncated reply look complete.
+- **Errors.** A refused thought is an HTTP error. A request that only the
+  answer pass would refuse is checked before any thought is written: a
+  required or named `tool_choice` needs structured outputs, which vLLM does
+  not support for diffusion models, so it gets a 400 up front. Kairyu counts
+  an aborted stream as a failure of the only replica; a 400 is not counted.
+  If the answer pass still fails after the thought has streamed (a server
+  error), the stream is aborted. Kairyu ignores mid-stream error chunks, so
+  ending the stream normally would make a truncated reply look complete.
 - **Ignored and rejected fields.** OpenJev ignores `reasoning_effort` and
   `temperature`. Kairyu rejects `chat_template_kwargs` (as for every
   legacy-chat example), and rejects the sampling fields OpenJev would
@@ -92,6 +96,12 @@ is the checkpoint's template with one edit: a final assistant message is
 rendered verbatim, so a thought prefill can be continued. At startup the
 overlay refuses to run unless vLLM uses that template and it renders both
 prefills.
+
+The published image also keeps its own source tree at `/app/openjev`, and
+`/app` is the working directory, so `python -m openjev` would import that
+unpatched copy first. The overlay removes it. The build then fails unless an
+import from `/app` resolves to the patched package. `check_overlay.py`
+reproduces the CPU evidence in `MEASUREMENTS.md`.
 
 ## Configuration
 
@@ -110,7 +120,8 @@ prefills.
     message.
   - `/v1/messages/count_tokens` returns 404, because OpenJev has no
     `/tokenize`.
-  - A required or named `tool_choice` needs structured outputs, which vLLM
+  - `tool_choice` must be `auto` or `none`. A required or named tool call
+    is refused with a 400, because it needs structured outputs, which vLLM
     does not support for diffusion models.
 
 ## Verification gates

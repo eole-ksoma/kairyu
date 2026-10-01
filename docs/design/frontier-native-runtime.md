@@ -344,6 +344,10 @@ policy):
 - The overlay publishes only the capped first-pass thought as reasoning.
 - A failure after the thought has streamed aborts the stream rather than
   ending it, because Kairyu ignores mid-stream error chunks.
+- A request that only the answer pass would refuse is refused with a 400
+  before the thought. Today that is a required or named `tool_choice`, which
+  needs structured outputs. Otherwise any client could make a stream abort,
+  and the abort would eject the only replica.
 
 The checkpoint's chat template strips thoughts from every assistant message,
 so `continue_final_message` cannot continue a prefill. The example's template

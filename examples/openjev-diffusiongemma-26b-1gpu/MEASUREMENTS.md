@@ -25,8 +25,12 @@ closed on any difference.
 
 ## CPU evidence (development machine, 2026-10-01)
 
+`check_overlay.py` reproduces the template and patched-app evidence below.
+It downloads the tokenizer files and the OpenJev source at the pinned
+revisions; the run command is in its docstring.
+
 **Template edit**, checked with the checkpoint's own tokenizer
-(transformers 5.12.1):
+(`tokenizer.json` sha256 `cc8d3a0c…`, transformers 5.12.1):
 
 - All 14 conversations that do not end in an assistant message render byte
   for byte like the stock template, with thinking on and off. The cases are:
@@ -50,8 +54,8 @@ against a local fake vLLM):
 
 | Case | Result |
 |---|---|
-| Generator in use | `ThinkFirstGenerator`; startup template check passes; `<channel|>` is token 9 (one token) |
-| Request with `enable_thinking: false`, `reasoning_effort: none` | thought pass sent with thinking on, `max_tokens` 512, `stop_token_ids` [9]; answer pass prefill `<|channel>thought\n…\n<channel|>` with the caller's `max_tokens` 64 |
+| Generator in use | `ThinkFirstGenerator`; startup template check passes; `<channel|>` is token 101 (one token; `<|channel>` is 100) |
+| Request with `enable_thinking: false`, `reasoning_effort: none` | thought pass sent with thinking on, `max_tokens` 512, `stop_token_ids` [101]; answer pass prefill `<|channel>thought\n…\n<channel|>` with the caller's `max_tokens` 64 |
 | Non-stream response | `reasoning` = thought, `content` = answer, usage 20 prompt / 11 completion, of which 9 are reasoning tokens |
 | Stream | reasoning, then content, then `[DONE]`; generation slot released |
 | Refused thought (upstream 400) | HTTP 400 `invalid_request_error` before the stream starts; slot released |
@@ -66,6 +70,12 @@ environment with no warnings:
 - Kairyu is on `127.0.0.1:8010` and the Chat UI on `127.0.0.1:3010`.
 
 **Tests.** The CPU tests are in `tests/unit/test_openjev_1gpu_example.py`.
+
+**Correction (2026-10-01).** An earlier ad-hoc run of the patched-app check
+reported `<channel|>` as token 9. That run loaded the tokenizer without
+`tokenizer.json`, an LFS file it had not downloaded. With `tokenizer.json`,
+the id is 101. The template rows are unaffected, because rendering is
+string-level and both runs agree.
 
 ## GPU gates (pending)
 

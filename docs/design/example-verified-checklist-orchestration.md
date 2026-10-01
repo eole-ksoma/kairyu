@@ -1,6 +1,6 @@
 # Checklist-Verified Answers (DeepSeek-V4.1 six-GPU + OpenJev x 2)
 
-Status: **Accepted 2026-10-01; implemented, GPU gates in progress** (see
+Status: **Accepted 2026-10-01; implemented and GPU-verified** (every gate PASS; see
 `examples/deepseek-v4.1-openjev-verified-8gpu/MEASUREMENTS.md`).
 Applies to: `examples/deepseek-v4.1-openjev-verified-8gpu/`. Framework
 mechanisms: m1 D8 (checklist verifiers) and the m11 D8 replica amendment.

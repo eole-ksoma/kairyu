@@ -1,6 +1,6 @@
 # Checklist-verified answers example (DeepSeek-V4.1 six-GPU + OpenJev x 2)
 
-Status: **Approved 2026-10-01; implemented; GPU gates in progress.**
+Status: **Approved 2026-10-01; implemented; GPU gates pass.**
 
 Accepted scope (owner, 2026-10-01):
 

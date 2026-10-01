@@ -656,11 +656,12 @@ configuration (plan
 
 ### DTO-D17 — Two routes and two policies for the V4.1 example (owner decision, 2026-10-01)
 
-Status: accepted; implemented. The GPU gates pass on 2026-10-01: readiness,
-vision, tool-calling, the generic matrix, and the browser smoke. The coding
-TTFT gate is `not_applicable` on every row, because the judge routed all
-synthetic requests to `deepseek_think`; ensemble TTFT stays unmeasured. See
-the example's MEASUREMENTS.md.
+Status: accepted; implemented, with the two amendments below. On the
+amended configuration every GPU gate passes on 2026-10-01: readiness, vision,
+tool-calling, the generic matrix, the coding matrix (ensemble TTFT gate PASS
+at c1/c8/c16/c32; c32 at 95.8 % of the limit), and the browser smoke. 4 of 128
+coding requests exceed the 900 s turn envelope after two audit refinements.
+See the example's MEASUREMENTS.md.
 
 Applies only to `examples/qwen3.8-deepseek-v4.1-8gpu/`. The V4 example keeps
 five routes and four policies.
@@ -727,8 +728,9 @@ five routes and four policies.
 - **Mechanism:** the existing `ProfileJudgeSpec.fallback` setting; `kairyu/`
   is unchanged. `control.py` checks the served fallback against
   `example.json` at readiness.
-- **Status:** every GPU gate is re-run on this configuration; the earlier
-  amendment's runs are kept in MEASUREMENTS.md as superseded.
+- **Status:** every GPU gate passes on this configuration (2026-10-01). Judge
+  timeouts: 3 of 269 judged requests, all served by `deepseek_think`. The
+  earlier amendment's runs are kept in MEASUREMENTS.md as superseded.
 
 ## Acceptance
 

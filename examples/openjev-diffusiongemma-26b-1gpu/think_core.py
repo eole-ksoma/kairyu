@@ -57,6 +57,23 @@ def _continued(upstream: dict, prefill: str) -> dict:
     }
 
 
+def check_answer_controls(upstream: dict) -> None:
+    """Refuse what only the answer pass would reject, before any thought is spent.
+
+    A required or named ``tool_choice`` needs structured outputs, which vLLM
+    does not support for diffusion models. If that were refused only in the
+    answer pass, a streamed request could only be aborted, and Kairyu counts
+    an aborted stream as a failure of the only replica.
+    """
+
+    if upstream.get("tool_choice") not in (None, "auto", "none"):
+        raise UpstreamError(
+            400,
+            "tool_choice must be 'auto' or 'none': a required or named tool call needs "
+            "structured outputs, which vLLM does not support for DiffusionGemma",
+        )
+
+
 def thought_request(upstream: dict, close_ids: Sequence[int]) -> dict:
     """The thought pass: at most THOUGHT_TOKENS tokens, stopped at the channel close."""
 
@@ -139,6 +156,7 @@ async def complete(
 ) -> dict:
     """One non-streamed chat completion: the thought pass, then the answer pass."""
 
+    check_answer_controls(upstream)
     request = _unstreamed(upstream)
     first = await _post(client, thought_request(request, close_ids))
     thought = _text(_first_choice(first, "thought").get("message") or {}).strip("\n")
@@ -177,8 +195,25 @@ async def _open(client: httpx.AsyncClient, body: dict) -> httpx.Response:
         await response.aclose()
 
 
+async def _lines(response: httpx.Response) -> AsyncIterator[str]:
+    """SSE lines split on LF only.
+
+    JSON may carry U+2028, U+2029 or U+0085 unescaped. ``str.splitlines``,
+    which httpx's ``aiter_lines`` follows, treats those as line ends and would
+    cut an event in half.
+    """
+
+    pending = b""
+    async for chunk in response.aiter_bytes():
+        *complete, pending = (pending + chunk).split(b"\n")
+        for line in complete:
+            yield line.rstrip(b"\r").decode("utf-8")
+    if pending:
+        yield pending.rstrip(b"\r").decode("utf-8")
+
+
 async def _payloads(response: httpx.Response) -> AsyncIterator[dict]:
-    async for line in response.aiter_lines():
+    async for line in _lines(response):
         if not line.startswith("data:"):
             continue
         data = line[5:].strip()
@@ -215,6 +250,7 @@ async def stream(
     complete answer.
     """
 
+    check_answer_controls(upstream)
     first = await _open(client, _streaming(thought_request(upstream, close_ids)))
     return ThinkStream(client, upstream, first, model)
 

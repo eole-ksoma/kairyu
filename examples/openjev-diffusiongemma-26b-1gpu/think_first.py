@@ -142,8 +142,10 @@ class ThinkFirstGenerator(Generator):
             raise
 
         async def cleanup() -> None:
-            await events.aclose()
-            release()
+            try:
+                await events.aclose()
+            finally:
+                release()  # even if closing the upstream raised
 
         async def body():
             try:

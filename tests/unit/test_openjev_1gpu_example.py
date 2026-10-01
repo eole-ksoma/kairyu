@@ -50,6 +50,7 @@ class FakeVllm:
     def __init__(
         self,
         *,
+        thought: str = THOUGHT,
         thought_field: str = "content",
         thought_finish: str = "stop",
         thought_tokens: int = 9,
@@ -58,6 +59,7 @@ class FakeVllm:
         answer_status: int = 200,
         thought_status: int = 200,
     ) -> None:
+        self.thought = thought
         self.thought_field = thought_field
         self.thought_finish = thought_finish
         self.thought_tokens = thought_tokens
@@ -77,7 +79,7 @@ class FakeVllm:
         if is_answer:
             message, finish, usage = self.answer_message, self.answer_finish, _usage(31, 2)
         else:
-            message = {self.thought_field: "\n" + THOUGHT}
+            message = {self.thought_field: "\n" + self.thought}
             finish, usage = self.thought_finish, _usage(20, self.thought_tokens)
         if body.get("stream"):
             return self._stream(message, finish, usage)
@@ -128,9 +130,12 @@ class FakeVllm:
                 "usage": usage,
             },
         ]
-        payload = "".join(f"data: {json.dumps(event)}\n\n" for event in events) + "data: [DONE]\n\n"
+        # Raw UTF-8 like vLLM's model_dump_json: U+2028 and friends stay unescaped.
+        payload = "".join(f"data: {json.dumps(event, ensure_ascii=False)}\n\n" for event in events)
         return httpx.Response(
-            200, content=payload.encode(), headers={"content-type": "text/event-stream"}
+            200,
+            content=(payload + "data: [DONE]\n\n").encode(),
+            headers={"content-type": "text/event-stream"},
         )
 
 
@@ -286,6 +291,25 @@ async def test_stream_sends_the_thought_then_the_answer_under_one_completion(exa
     assert chunks[-1]["usage"]["completion_tokens_details"] == {"reasoning_tokens": 9}
 
 
+async def test_stream_survives_unicode_line_separators_in_deltas(example):
+    """vLLM leaves U+2028, U+2029 and U+0085 unescaped; a str.splitlines-based reader
+    cuts the JSON there, aborts the stream and gets the only replica ejected."""
+
+    think_core = example("think_core")
+    thought, answer = "first\u2028second\u0085third", "3\u20292\u20283"
+    fake = FakeVllm(thought=thought, answer_message={"content": answer})
+    async with _client(fake) as client:
+        events = await think_core.stream(
+            client, _upstream(stream=True), [CLOSE_ID], model="diffusiongemma-26b"
+        )
+        lines = [line async for line in events]
+
+    deltas = [c["delta"] for e in _events(lines) for c in e["choices"]]
+    assert "".join(d.get("reasoning") or "" for d in deltas) == thought
+    assert "".join(d.get("content") or "" for d in deltas) == answer
+    assert lines[-1] == "data: [DONE]\n\n"
+
+
 async def test_a_refused_thought_is_an_error_before_the_stream_starts(example):
     think_core = example("think_core")
     fake = FakeVllm(thought_status=400)
@@ -297,6 +321,33 @@ async def test_a_refused_thought_is_an_error_before_the_stream_starts(example):
 
     assert refused.value.status == 400
     assert len(fake.requests) == 1
+
+
+@pytest.mark.parametrize(
+    "tool_choice", ["required", {"type": "function", "function": {"name": "bash"}}]
+)
+async def test_a_forced_tool_choice_is_refused_before_any_thought(example, tool_choice):
+    """Diffusion models cannot run the structured outputs a forced tool call needs.
+    Refused only in the answer pass, a streamed request could just be aborted,
+    which Kairyu counts as a failure of the only replica."""
+
+    think_core = example("think_core")
+    fake = FakeVllm()
+    async with _client(fake) as client:
+        with pytest.raises(think_core.UpstreamError) as streamed:
+            await think_core.stream(
+                client,
+                _upstream(stream=True, tool_choice=tool_choice),
+                [CLOSE_ID],
+                model="diffusiongemma-26b",
+            )
+        with pytest.raises(think_core.UpstreamError) as unstreamed:
+            await think_core.complete(
+                client, _upstream(tool_choice=tool_choice), [CLOSE_ID], model="diffusiongemma-26b"
+            )
+
+    assert (streamed.value.status, unstreamed.value.status) == (400, 400)
+    assert fake.requests == []
 
 
 async def test_an_answer_failure_after_the_thought_aborts_without_done(example):

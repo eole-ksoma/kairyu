@@ -17,14 +17,22 @@ RUN test "$(git -C /opt/vllm rev-parse HEAD)" = "${VLLM_REVISION}" \
     && grep -q 'compute_mm_prefix_ranges' "${vllm_dir}/model_executor/models/diffusion_gemma.py"
 
 # The pinned OpenJev source, whatever release the base image was built from:
-# patch_openjev.py's anchors are exact for this revision.
+# patch_openjev.py's anchors are exact for this revision. The base also keeps
+# its build's source tree at /app/openjev, and /app is the working directory:
+# `python -m openjev` (the entrypoint) would import that unpatched copy ahead
+# of site-packages. Remove it, so the patched install is the only openjev.
 RUN uv pip install --python /opt/venv/bin/python --no-cache --no-deps \
         --reinstall-package openjev \
-        "openjev @ git+https://github.com/razorback16/openjev@${OPENJEV_REVISION}"
+        "openjev @ git+https://github.com/razorback16/openjev@${OPENJEV_REVISION}" \
+    && rm -rf /app/openjev
 
+# Checked from /app, where the entrypoint runs: the import must resolve to
+# the patched package in site-packages.
 COPY think_core.py think_first.py patch_openjev.py /opt/kairyu/
 RUN python /opt/kairyu/patch_openjev.py --version "${OPENJEV_VERSION}" \
-    && python -c "import openjev.api, openjev.think_first"
+    && cd /app \
+    && python -c "import openjev.api, openjev.think_first as m; \
+assert '/site-packages/openjev/' in m.__file__, m.__file__"
 
 # Baked in, so the image ID attests the template vLLM renders with.
 COPY chat_template.jinja /etc/kairyu/diffusiongemma-think.jinja

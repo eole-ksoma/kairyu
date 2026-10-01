@@ -111,6 +111,7 @@ def _checklist(spec: ChecklistSpec | None) -> ChecklistConfig | None:
                 stage=check.stage,
                 group=check.group,
                 semantic_fallback=check.semantic_fallback,
+                tags=check.tags,
             )
             for check in spec.checks
         ),
@@ -128,6 +129,7 @@ def _checklist(spec: ChecklistSpec | None) -> ChecklistConfig | None:
                 criteria_true=question.criteria_true,
                 criteria_false=question.criteria_false,
                 context=question.context,
+                tags=question.tags,
             )
             for question in spec.questions
         ),
@@ -318,6 +320,16 @@ def build_orchestrator(
                 for choice in spec.profile_judge.choices
             ),
             fallback=spec.profile_judge.fallback,
+            question=spec.profile_judge.question,
+            prefer_label=(
+                spec.profile_judge.prefer.label if spec.profile_judge.prefer is not None else None
+            ),
+            prefer_min_probability=(
+                spec.profile_judge.prefer.min_probability
+                if spec.profile_judge.prefer is not None
+                else 0.5
+            ),
+            max_message_chars=spec.profile_judge.max_message_chars,
         )
         if spec.profile_judge is not None
         else None

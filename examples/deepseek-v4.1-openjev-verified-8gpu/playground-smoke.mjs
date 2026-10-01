@@ -15,7 +15,11 @@ const browser = await chromium.launch();
 try {
 	const page = await browser.newPage();
 	const failures = [];
+	const models = [];
 	page.on('requestfailed', (request) => failures.push(request.url()));
+	page.on('request', (request) => {
+		if (request.url().endsWith('/v1/chat/completions')) models.push(request.postDataJSON()?.model);
+	});
 	await page.goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
 	await page.fill('#prompt', 'List three primary colors as a comma-separated line, nothing else.');
 	await page.click('#send');
@@ -34,6 +38,10 @@ try {
 		throw new Error(`unexpected badge ${JSON.stringify(label)}`);
 	}
 	if (failures.length) throw new Error(`same-origin requests failed: ${failures.join(', ')}`);
+	// The answer page always takes the verified path.
+	if (JSON.stringify(models) !== JSON.stringify(['kairyu-verified-always'])) {
+		throw new Error(`answer page used models ${JSON.stringify(models)}`);
+	}
 	console.log(JSON.stringify({ ok: true, badge: label, answer: answer.slice(0, 120) }));
 } finally {
 	await browser.close();

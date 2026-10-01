@@ -19,8 +19,9 @@ pools:
         capabilities:
           allow_prompt_kinds:
           - multimodal
-          # V4.1 thinks unless a request turns it off: roles without an
-          # effort (the state builder) are sent enable_thinking: false.
+          # V4.1 thinks unless a request turns it off; a role without an
+          # effort would be sent enable_thinking: false (every role of this
+          # example inherits the caller's effort, default high).
           allow_chat_template_kwargs:
           - enable_thinking
         image_input_policy:
@@ -67,10 +68,15 @@ systemone:
     timeout_s: 300
     max_body_bytes: 50331648
 orchestrators:
+  # Jev routes each request: verified DAG or one thinking DeepSeek answer.
   kairyu-verified:
     spec: /etc/kairyu/verified.yaml
+  # Every request takes the verified DAG (answer page, guarantee gates).
+  kairyu-verified-always:
+    spec: /etc/kairyu/verified-always.yaml
 public_models:
 - kairyu-verified
+- kairyu-verified-always
 # The DeepSeek pool is an internal L1 resource, not a public model.
 legacy_chat_models:
 - deepseek-v4.1-flash

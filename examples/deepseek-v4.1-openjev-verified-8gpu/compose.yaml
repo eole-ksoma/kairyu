@@ -199,6 +199,7 @@ services:
       target: /var/lib/kairyu/placement
     - ./kairyu.yaml:/etc/kairyu/kairyu.yaml:ro
     - ./verified.yaml:/etc/kairyu/verified.yaml:ro
+    - ./verified-always.yaml:/etc/kairyu/verified-always.yaml:ro
     depends_on:
       deepseek:
         condition: service_healthy
@@ -218,6 +219,36 @@ services:
       interval: 5s
       timeout: 3s
       retries: 120
+    restart: unless-stopped
+  # Open WebUI: both public models (kairyu-verified routes per request,
+  # kairyu-verified-always always verifies). The guarantee shows in the
+  # folded internal-work section ("Verification").
+  chat-ui:
+    image: ${OPEN_WEBUI_IMAGE}
+    environment:
+      OPENAI_API_BASE_URL: http://kairyu:8000/v1
+      OPENAI_API_KEY: sk-local-kairyu
+      DEFAULT_MODELS: kairyu-verified
+      DEFAULT_MODEL_PARAMS: '{"max_tokens":65536,"stream_response":true}'
+      ENABLE_PERSISTENT_CONFIG: 'false'
+      RESET_CONFIG_ON_START: 'true'
+      ENABLE_SIGNUP: 'false'
+      ENABLE_LOGIN_FORM: 'false'
+      WEBUI_AUTH: 'false'
+      WEBUI_URL: ${WEBUI_URL:-http://localhost:3012}
+      WEBUI_ADMIN_NAME: ${WEBUI_ADMIN_NAME:-Kairyu Admin}
+      ENABLE_OLLAMA_API: 'false'
+      ENABLE_EVALUATION_ARENA_MODELS: 'false'
+      RAG_EMBEDDING_ENGINE: ''
+    volumes:
+    - type: bind
+      source: ${WEBUI_STORAGE_PATH}
+      target: /app/backend/data
+    depends_on:
+      kairyu:
+        condition: service_healthy
+    ports:
+    - ${CHAT_UI_BIND_ADDRESS:-0.0.0.0}:${CHAT_UI_PORT:-3012}:8080
     restart: unless-stopped
   # The answer page: a static chat page that shows each answer's guarantee
   # flag and requirement probabilities, with Kairyu's API on the same origin.

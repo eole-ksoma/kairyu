@@ -1,0 +1,866 @@
+[
+ {
+  "label": "VERIFIED",
+  "category": "expert",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Derive the solution of the 1D heat equation on [0, L] with u(0,t)=u(L,t)=0 and u(x,0)=f(x), and state the conditions under which the Fourier series converges uniformly."
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "expert",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Our Kubernetes StatefulSet with a PostgreSQL primary/replica pair loses writes after a node drain. Explain the likely failure modes around fencing and synchronous_commit, and give a corrected configuration."
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "expert",
+  "messages": [
+   {
+    "role": "user",
+    "content": "IFRS 16 と ASC 842 で、セール・アンド・リースバック取引の会計処理がどう異なるか、売却の要件判定から利得の認識まで具体的に説明してください。"
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "expert",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Prove that every finite integral domain is a field, then show where the argument fails for infinite integral domains."
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "expert",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Explain why this lock-free queue has an ABA problem and rewrite it safely in C++20:\n\nstruct Node{int v; Node* next;};\nstd::atomic<Node*> head;\nvoid push(Node* n){ n->next = head.load(); while(!head.compare_exchange_weak(n->next, n)); }\nNode* pop(){ Node* h = head.load(); while(h && !head.compare_exchange_weak(h, h->next)); return h; }"
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "expert",
+  "messages": [
+   {
+    "role": "user",
+    "content": "量子化誤差を考慮した上で、INT8 の GEMM で FP16 と同等の精度を保つためのスケーリング戦略（per-channel / per-token）を、数式を使って比較してください。"
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "expert",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Compare the asymptotic behaviour of the Akra–Bazzi method and the master theorem for T(n)=2T(n/3)+T(n/4)+n log n and give the tight bound."
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "expert",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What are the exact differences between TLS 1.2 and TLS 1.3 key schedules, and why does 0-RTT data lose forward secrecy?"
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "many_requirements",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a product announcement for our note-taking app. Requirements: 1) exactly 3 paragraphs, 2) under 180 words, 3) mention offline sync and end-to-end encryption, 4) no exclamation marks, 5) end with a call to action that includes the URL notes.example.com, 6) written for a business audience."
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "many_requirements",
+  "messages": [
+   {
+    "role": "user",
+    "content": "社内向けの障害報告書を書いてください。条件：①時系列は表形式、②原因・影響・暫定対応・恒久対策の4節、③影響ユーザー数は 1,240 人と明記、④敬体、⑤全体で800字以内、⑥最後に再発防止のチェックリストを箇条書きで5項目。"
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "many_requirements",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Create a weekly meal plan: 7 days, 3 meals each, vegetarian, no nuts, under 2,000 kcal per day with the calories listed per meal, a shopping list grouped by aisle, and no ingredient repeated more than three times in the week."
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "many_requirements",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Draft an API design for a booking service: REST endpoints for create/read/cancel, idempotency keys, pagination with cursors, error codes as an RFC 7807 table, rate limits per tenant, and an OpenAPI 3.1 snippet for the create endpoint."
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "many_requirements",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a Python function that parses ISO 8601 durations. It must support years through seconds, reject negative values, return a datetime.timedelta, raise ValueError with the offending token, include type hints and docstring, and come with pytest tests covering 8 cases."
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "many_requirements",
+  "messages": [
+   {
+    "role": "user",
+    "content": "採用面接の質問リストを作って：エンジニア職、技術質問10問・行動面接5問、各質問に評価観点を1行、日本語、Markdown の表、難易度を3段階で付ける。"
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "many_requirements",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Summarize the attached quarterly results for the board in five bullet points, each under 20 words, include revenue, gross margin and churn with their quarter-over-quarter change, and finish with one risk and one opportunity.\n\nQ3: revenue $12.4M (Q2 $11.1M), gross margin 71% (Q2 69%), churn 2.9% (Q2 3.4%), new logos 41, net retention 112%."
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "many_requirements",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Translate this privacy notice into formal Japanese, keep every section number, keep all legal terms consistent, do not translate product names, and add a glossary of five key terms at the end.\n\n1. Data we collect: account data, usage data.\n2. Purpose: providing the Service, security.\n3. Retention: 24 months after account closure.\n4. Your rights: access, rectification, erasure."
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "error_feedback",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What's the deadline for filing a US federal tax return for 2024?"
+   },
+   {
+    "role": "assistant",
+    "content": "It is March 15, 2025."
+   },
+   {
+    "role": "user",
+    "content": "That's the corporate S-corp date, not individuals. Please give me the correct deadline for individuals and the extension date."
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "error_feedback",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Convert 72 °F to Celsius."
+   },
+   {
+    "role": "assistant",
+    "content": "72 °F is 25 °C."
+   },
+   {
+    "role": "user",
+    "content": "No, that's wrong. Redo the calculation and show the steps."
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "error_feedback",
+  "messages": [
+   {
+    "role": "user",
+    "content": "このSQLを直して: SELECT name, COUNT(*) FROM users GROUP BY id;"
+   },
+   {
+    "role": "assistant",
+    "content": "SELECT name, COUNT(*) FROM users;"
+   },
+   {
+    "role": "user",
+    "content": "それだと集計がおかしいです。さっきも間違えていたので、今度は正しく動くものをお願いします。"
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "error_feedback",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Which Python version introduced match statements?"
+   },
+   {
+    "role": "assistant",
+    "content": "Python 3.8."
+   },
+   {
+    "role": "user",
+    "content": "Wrong. Check again."
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "error_feedback",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Give me the Big-O of building a binary heap from n elements."
+   },
+   {
+    "role": "assistant",
+    "content": "O(n log n)."
+   },
+   {
+    "role": "user",
+    "content": "My professor says that's not tight. Please correct it and justify."
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "error_feedback",
+  "messages": [
+   {
+    "role": "user",
+    "content": "How many business days are between 2025-03-03 and 2025-03-31 inclusive?"
+   },
+   {
+    "role": "assistant",
+    "content": "There are 21 business days."
+   },
+   {
+    "role": "user",
+    "content": "I counted differently. Recount carefully, I'm putting this in a contract."
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "error_feedback",
+  "messages": [
+   {
+    "role": "user",
+    "content": "翻訳して: 'The invoice is payable within 30 days of receipt.'"
+   },
+   {
+    "role": "assistant",
+    "content": "請求書は30日以内に支払われます。"
+   },
+   {
+    "role": "user",
+    "content": "「受領から」が抜けています。契約書に載るので正確に訳し直してください。"
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "error_feedback",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What does git rebase --onto main feature~3 feature do?"
+   },
+   {
+    "role": "assistant",
+    "content": "It moves the last three commits of main onto feature."
+   },
+   {
+    "role": "user",
+    "content": "You have it backwards. Explain it properly this time."
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "frustration",
+  "messages": [
+   {
+    "role": "user",
+    "content": "I've asked three times now and the script still crashes. I need a version that actually runs on Python 3.11 today, no more guesses:\n\nimport json\ndata = json.load(open('cfg.json'))\nprint(data['servers'][0]['host'])"
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "frustration",
+  "messages": [
+   {
+    "role": "user",
+    "content": "もう何回目ですか。本番が止まっていて上司に詰められています。nginx の 502 の原因の切り分け手順を、今度こそ正確に教えてください。"
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "frustration",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Seriously, this is the last chance before my client meeting in 20 minutes. Give me the correct formula for compound annual growth rate and apply it to 2.1M → 3.4M over 4 years."
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "frustration",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Your previous answers wasted my whole afternoon. I need the exact steps to rotate an AWS access key without downtime."
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "frustration",
+  "messages": [
+   {
+    "role": "user",
+    "content": "いい加減にしてほしい。Excel で重複行を削除して最新日付だけ残す方法、ちゃんと動くやつを教えて。"
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "frustration",
+  "messages": [
+   {
+    "role": "user",
+    "content": "I'm really stressed — my thesis is due tomorrow and the citation format keeps coming out wrong. APA 7 reference for a journal article with 3 authors and a DOI, please get it exactly right."
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "frustration",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Stop giving me vague answers. What exact command lists listening TCP ports with the owning process on Ubuntu 22.04?"
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "frustration",
+  "messages": [
+   {
+    "role": "user",
+    "content": "This is urgent and I can't afford another mistake: what's the correct way to undo a pushed commit on a shared main branch?"
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "high_stakes",
+  "messages": [
+   {
+    "role": "user",
+    "content": "My 4-year-old (16 kg) has a fever. What is the correct single dose of children's ibuprofen (100 mg/5 mL), and how often can it be given?"
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "high_stakes",
+  "messages": [
+   {
+    "role": "user",
+    "content": "賃貸契約の更新拒絶について、貸主側から正当事由なしに更新を拒めるのか、借地借家法の条文に沿って教えてください。"
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "high_stakes",
+  "messages": [
+   {
+    "role": "user",
+    "content": "I'm wiring a 240 V circuit for an EV charger at 32 A continuous. What breaker and copper wire gauge does the NEC require?"
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "high_stakes",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Is it legal for my employer in California to withhold my final paycheck because I didn't return my laptop?"
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "high_stakes",
+  "messages": [
+   {
+    "role": "user",
+    "content": "How should I set file permissions and ownership for SSH private keys and authorized_keys so sshd accepts them and nothing leaks?"
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "high_stakes",
+  "messages": [
+   {
+    "role": "user",
+    "content": "確定申告で、医療費控除の対象になる費用とならない費用を、具体例付きで正確に教えてください。"
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "high_stakes",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What are the drug interactions between warfarin and common over-the-counter painkillers?"
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "high_stakes",
+  "messages": [
+   {
+    "role": "user",
+    "content": "We're about to run a database migration that drops a column used by billing. What's a safe rollout plan with rollback?"
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "explicit_accuracy",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Double-check every number before answering: what were the populations of Tokyo, Delhi and Shanghai in the UN's 2018 World Urbanization Prospects?"
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "explicit_accuracy",
+  "messages": [
+   {
+    "role": "user",
+    "content": "このプレスリリースはそのまま公開します。誤字・事実誤認がないか全部確認して修正版を出してください：\n弊社は2024年4月1日に設立10周年を迎えました。創業以来、累計導入社数は1,2000社を突破しています。"
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "explicit_accuracy",
+  "messages": [
+   {
+    "role": "user",
+    "content": "I'm sending this email to the CEO in five minutes, it must be flawless: rewrite 'we has decided to postpone the launch to Q3 due to supplier issue' professionally."
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "explicit_accuracy",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Cite your sources: what is the current FDA-recommended maximum daily intake of acetaminophen for healthy adults?"
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "explicit_accuracy",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Give me the exact command I can paste into production to delete files older than 30 days in /var/log/app without touching subdirectories."
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "explicit_accuracy",
+  "messages": [
+   {
+    "role": "user",
+    "content": "論文に載せるので正確に：Transformer の原論文のタイトル・著者・発表年・会議名を教えて。"
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "explicit_accuracy",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Verify this calculation for an invoice: 37 hours at $85/h plus 8.25% tax. What's the total?"
+   }
+  ]
+ },
+ {
+  "label": "VERIFIED",
+  "category": "explicit_accuracy",
+  "messages": [
+   {
+    "role": "user",
+    "content": "I'll sign this tomorrow. Does this clause let them terminate without notice? 'Either party may terminate this Agreement upon written notice if the other party materially breaches and fails to cure within thirty (30) days.'"
+   }
+  ]
+ },
+ {
+  "label": "THINK",
+  "category": "everyday",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi! How are you today?"
+   }
+  ]
+ },
+ {
+  "label": "THINK",
+  "category": "everyday",
+  "messages": [
+   {
+    "role": "user",
+    "content": "おはよう！今日もよろしく。"
+   }
+  ]
+ },
+ {
+  "label": "THINK",
+  "category": "everyday",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Tell me a fun fact about octopuses."
+   }
+  ]
+ },
+ {
+  "label": "THINK",
+  "category": "everyday",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What's the capital of Canada?"
+   }
+  ]
+ },
+ {
+  "label": "THINK",
+  "category": "everyday",
+  "messages": [
+   {
+    "role": "user",
+    "content": "日本で一番高い山は？"
+   }
+  ]
+ },
+ {
+  "label": "THINK",
+  "category": "everyday",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Give me five name ideas for a coffee shop."
+   }
+  ]
+ },
+ {
+  "label": "THINK",
+  "category": "everyday",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Rephrase this to sound friendlier: 'Send me the file.'"
+   }
+  ]
+ },
+ {
+  "label": "THINK",
+  "category": "everyday",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Translate 'good morning' into Spanish."
+   }
+  ]
+ },
+ {
+  "label": "THINK",
+  "category": "everyday",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What does HTTP stand for?"
+   }
+  ]
+ },
+ {
+  "label": "THINK",
+  "category": "everyday",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Explain what a black hole is in simple terms."
+   }
+  ]
+ },
+ {
+  "label": "THINK",
+  "category": "everyday",
+  "messages": [
+   {
+    "role": "user",
+    "content": "週末の暇つぶしのアイデアを3つちょうだい。"
+   }
+  ]
+ },
+ {
+  "label": "THINK",
+  "category": "everyday",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a haiku about autumn."
+   }
+  ]
+ },
+ {
+  "label": "THINK",
+  "category": "everyday",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What's the difference between a list and a tuple in Python, briefly?"
+   }
+  ]
+ },
+ {
+  "label": "THINK",
+  "category": "everyday",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Summarize the plot of Cinderella in two sentences."
+   }
+  ]
+ },
+ {
+  "label": "THINK",
+  "category": "everyday",
+  "messages": [
+   {
+    "role": "user",
+    "content": "How many legs does a spider have?"
+   }
+  ]
+ },
+ {
+  "label": "THINK",
+  "category": "everyday",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Suggest a title for my blog post about houseplants."
+   }
+  ]
+ },
+ {
+  "label": "THINK",
+  "category": "everyday",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Can you make this sentence shorter: 'I am writing in order to let you know that I will be late.'"
+   }
+  ]
+ },
+ {
+  "label": "THINK",
+  "category": "everyday",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What's a good stretching routine for the morning?"
+   }
+  ]
+ },
+ {
+  "label": "THINK",
+  "category": "everyday",
+  "messages": [
+   {
+    "role": "user",
+    "content": "猫と犬、どっちが飼いやすい？ざっくりでいいよ。"
+   }
+  ]
+ },
+ {
+  "label": "THINK",
+  "category": "everyday",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Tell me a joke about programmers."
+   }
+  ]
+ },
+ {
+  "label": "THINK",
+  "category": "everyday",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What year did the first iPhone come out?"
+   }
+  ]
+ },
+ {
+  "label": "THINK",
+  "category": "everyday",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Brainstorm three themes for a birthday party."
+   }
+  ]
+ },
+ {
+  "label": "THINK",
+  "category": "everyday",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Is tomato a fruit or a vegetable?"
+   }
+  ]
+ },
+ {
+  "label": "THINK",
+  "category": "everyday",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Recommend a classic novel to read on vacation."
+   }
+  ]
+ },
+ {
+  "label": "THINK",
+  "category": "everyday",
+  "messages": [
+   {
+    "role": "user",
+    "content": "「ありがとう」を英語でカジュアルに言うと？"
+   }
+  ]
+ },
+ {
+  "label": "THINK",
+  "category": "everyday",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What's the boiling point of water in Fahrenheit?"
+   }
+  ]
+ },
+ {
+  "label": "THINK",
+  "category": "everyday",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Give me a random motivational quote."
+   }
+  ]
+ },
+ {
+  "label": "THINK",
+  "category": "everyday",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Explain what an API is to a 10-year-old."
+   }
+  ]
+ },
+ {
+  "label": "THINK",
+  "category": "everyday",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What should I name my goldfish?"
+   }
+  ]
+ },
+ {
+  "label": "THINK",
+  "category": "everyday",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Describe the color blue to someone in one sentence."
+   }
+  ]
+ },
+ {
+  "label": "THINK",
+  "category": "everyday",
+  "messages": [
+   {
+    "role": "user",
+    "content": "How do I say 'cheers' in German?"
+   }
+  ]
+ },
+ {
+  "label": "THINK",
+  "category": "everyday",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a short limerick about a cat."
+   }
+  ]
+ }
+]

@@ -1477,6 +1477,13 @@ class Conductor:
         identity = self._worker_trace.get(spec.worker) or WorkerTraceIdentity(
             engine=spec.worker
         )
+        metadata = dict(metadata or {})
+        if operation == "generation" and spec.role_type != "executor":
+            # The effort each generation was dispatched with, so a deployment
+            # can check that a request-level effort reached every stage.
+            effort = self._role_reasoning_effort(spec)
+            if effort is not None:
+                metadata.setdefault("reasoning_effort", effort)
         event = TraceEvent(
             node=spec.name,
             kind=kind,
@@ -1491,7 +1498,7 @@ class Conductor:
             timing=timing,
             usage=usage,
             budget=budget,
-            metadata=dict(metadata or {}),
+            metadata=metadata,
             error=error,
         )
         # Every conductor trace event funnels through here, so this is the
@@ -1632,6 +1639,8 @@ class Conductor:
         if not self._expose_intermediate_outputs:
             return None
         sections = [output.as_markdown() for output in run.intermediate_outputs]
+        if run.verification is not None:
+            sections.append(run.verification.as_markdown())
         if not include_final_attribution:
             return "\n\n---\n\n".join(sections) or None
         final = self._final_output_unit(run)
@@ -3451,6 +3460,11 @@ class Conductor:
         await self._run_unit_safe(run, session, query, final, event_sink=sink)
         for event in pending:
             yield event
+        if self._expose_intermediate_outputs and run.verification is not None:
+            yield ConductorEvent(
+                kind="reasoning",
+                text=f"{run.verification.as_markdown()}\n\n---\n\n",
+            )
         continuation = run.outputs.get(final.name)
         if continuation is None:
             # Skipped (budget, public budget, verified-complete head) or

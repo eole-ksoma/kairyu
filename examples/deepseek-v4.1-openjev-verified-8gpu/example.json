@@ -25,7 +25,6 @@
       "gpu_ids": [6, 7]
     }
   },
-  "public_model": "kairyu-verified",
   "orchestration": {
     "spec": "verified.yaml",
     "roles": ["extract", "requirements_check", "generator", "answer", "state_builder", "checklist"],
@@ -75,6 +74,12 @@
     "max_concurrency": 256,
     "max_queue": 256
   },
+  "webui": {
+    "image": "ghcr.io/open-webui/open-webui:v0.11.0-slim@sha256:3698bd4e9628b7ae3768808721098616e669b4a05a6bceb2f5da2d84a3282a01",
+    "port": 3012,
+    "reasoning_effort_levels": ["default", "low", "high", "max"]
+  },
+  "public_models": ["kairyu-verified", "kairyu-verified-always"],
   "playground": {
     "image": "nginx:1.29-alpine@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de",
     "port": 3013

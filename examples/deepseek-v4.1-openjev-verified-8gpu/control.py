@@ -30,7 +30,9 @@ DEEPSEEK_GPU_IDS: list[int] = [int(index) for index in DEEPSEEK["gpu_ids"]]
 DP_RANK_GPU_IDS: list[list[int]] = [list(group) for group in DEEPSEEK["dp_rank_gpu_ids"]]
 OPENJEV_GPU_IDS: list[int] = [int(index) for index in SPEC["allocation"]["openjev"]["gpu_ids"]]
 OPENJEV_SERVICES = [f"openjev-{replica}" for replica in range(len(OPENJEV_GPU_IDS))]
-PUBLIC_MODEL = SPEC["public_model"]
+PUBLIC_MODELS: list[str] = list(SPEC["public_models"])
+# kairyu-verified: Jev routes per request; kairyu-verified-always: always verified.
+ROUTED_MODEL, ALWAYS_MODEL = PUBLIC_MODELS
 DEEPSEEK_SERVED = SPEC["deepseek"]["served_name"]
 
 
@@ -102,6 +104,7 @@ def _storage_paths() -> dict[str, Path]:
         "openjev_models": environment / "models" / "openjev",
         "deepseek_cache": environment / "compile-cache" / "deepseek",
         "placement_log": environment / "placement-log",
+        "webui": environment / "webui-data",
         **{
             f"openjev_cache_{replica}": environment / "compile-cache" / f"openjev-{replica}"
             for replica in range(len(OPENJEV_GPU_IDS))
@@ -134,6 +137,10 @@ def _compose_env() -> dict[str, str]:
             "DEEPSEEK_VLLM_IMAGE": os.environ.get("DEEPSEEK_VLLM_IMAGE", SPEC["deepseek"]["image"]),
             "OPENJEV_IMAGE": os.environ.get("OPENJEV_IMAGE", SPEC["openjev"]["image"]),
             "PLAYGROUND_IMAGE": os.environ.get("PLAYGROUND_IMAGE", SPEC["playground"]["image"]),
+            "OPEN_WEBUI_IMAGE": os.environ.get("OPEN_WEBUI_IMAGE", SPEC["webui"]["image"]),
+            "WEBUI_STORAGE_PATH": str(paths["webui"]),
+            "CHAT_UI_PORT": os.environ.get("CHAT_UI_PORT", str(SPEC["webui"]["port"])),
+            "CHAT_UI_BIND_ADDRESS": os.environ.get("CHAT_UI_BIND_ADDRESS", "0.0.0.0"),
             "API_PORT": os.environ.get("API_PORT", str(SPEC["api_port"])),
             "PLAYGROUND_PORT": os.environ.get("PLAYGROUND_PORT", str(SPEC["playground"]["port"])),
             "PLAYGROUND_BIND_ADDRESS": os.environ.get("PLAYGROUND_BIND_ADDRESS", "0.0.0.0"),
@@ -505,8 +512,8 @@ def validate_ready(api_url: str) -> None:
         healthy = _healthy_replicas(_text_url(f"{api_url}/metrics"), DEEPSEEK_SERVED)
     except (KeyError, OSError, ValueError, urllib.error.URLError) as error:
         raise SystemExit(f"Kairyu readiness evidence is incomplete: {error}") from error
-    if ready.get("status") != "ready" or models != {PUBLIC_MODEL}:
-        raise SystemExit(f"Kairyu must serve exactly [{PUBLIC_MODEL!r}], got {sorted(models)!r}")
+    if ready.get("status") != "ready" or models != set(PUBLIC_MODELS):
+        raise SystemExit(f"Kairyu must serve exactly {PUBLIC_MODELS!r}, got {sorted(models)!r}")
     if healthy != 1:
         raise SystemExit(f"DeepSeek pool must report 1 healthy replica, got {healthy!r}")
 
@@ -631,9 +638,11 @@ def _validate_openjev_replicas() -> None:
             raise SystemExit(f"{service} System One probe failed: {error or captured.stderr}")
 
 
-def verified_request(content: str, **overrides) -> dict:
+def verified_request(content: str, *, model: str = ALWAYS_MODEL, **overrides) -> dict:
+    """A chat request; the always-verified model unless ``model`` says otherwise."""
+
     payload = {
-        "model": PUBLIC_MODEL,
+        "model": model,
         "messages": [{"role": "user", "content": content}],
         "max_tokens": 32768,
     }
@@ -674,6 +683,65 @@ def validate_verified_answer(api_url: str) -> None:
     )
 
 
+_CHAT_UI_EFFORT_FILTER_ID = "reasoning_effort"
+_CHAT_UI_EFFORT_LEVELS: list[str] = list(SPEC["webui"]["reasoning_effort_levels"])
+
+
+def _webui_api(ui_url: str, path: str, *, token: str | None = None, payload: dict | None = None):
+    headers = {"Content-Type": "application/json"}
+    if token is not None:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(
+        f"{ui_url}{path}",
+        data=json.dumps(payload).encode() if payload is not None else None,
+        headers=headers,
+        method="POST" if payload is not None else "GET",
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        return json.loads(response.read())
+
+
+def provision_chat_ui(ui_url: str) -> None:
+    """Install the Reasoning Effort dropdown and check both models are offered."""
+
+    filter_source = (HERE / "webui-reasoning-effort-filter.py").read_text(encoding="utf-8")
+    base = f"/api/v1/functions/id/{_CHAT_UI_EFFORT_FILTER_ID}"
+    try:
+        signin = _webui_api(ui_url, "/api/v1/auths/signin", payload={"email": "", "password": ""})
+        if not isinstance(signin, dict) or signin.get("role") != "admin" or not signin.get("token"):
+            raise SystemExit("Chat UI signin did not return the auth-disabled admin session")
+        token = signin["token"]
+        listed = _webui_api(ui_url, "/api/v1/functions/", token=token)
+        existing = next((row for row in listed if row.get("id") == _CHAT_UI_EFFORT_FILTER_ID), None)
+        body = {
+            "id": _CHAT_UI_EFFORT_FILTER_ID,
+            "name": "Reasoning Effort",
+            "content": filter_source,
+            "meta": {"description": "Reasoning effort for every DeepSeek step."},
+        }
+        if existing is None:
+            state = _webui_api(ui_url, "/api/v1/functions/create", token=token, payload=body)
+        else:
+            updated = _webui_api(ui_url, f"{base}/update", token=token, payload=body)
+            state = {**existing, **(updated or {})}
+        # The toggle endpoints flip state, so call them only while a flag is off.
+        if not state.get("is_active"):
+            state = _webui_api(ui_url, f"{base}/toggle", token=token, payload={})
+        if not state.get("is_global"):
+            state = _webui_api(ui_url, f"{base}/toggle/global", token=token, payload={})
+        spec = _webui_api(ui_url, f"{base}/valves/user/spec", token=token)
+        enum = spec.get("properties", {}).get("reasoning_effort", {}).get("enum")
+        offered = {row["id"] for row in _webui_api(ui_url, "/api/models", token=token)["data"]}
+    except (KeyError, OSError, TypeError, ValueError, urllib.error.URLError) as error:
+        raise SystemExit(f"Chat UI provisioning failed: {error}") from error
+    if not (state.get("is_active") and state.get("is_global")):
+        raise SystemExit("Chat UI effort selector could not be activated globally")
+    if enum != _CHAT_UI_EFFORT_LEVELS:
+        raise SystemExit(f"Chat UI effort selector must expose {_CHAT_UI_EFFORT_LEVELS!r}")
+    if not set(PUBLIC_MODELS) <= offered:
+        raise SystemExit(f"Chat UI must offer {PUBLIC_MODELS!r}, got {sorted(offered)!r}")
+
+
 def validate_serving(env: dict[str, str]) -> None:
     api_url = f"http://127.0.0.1:{env['API_PORT']}"
     validate_ready(api_url)
@@ -707,6 +775,7 @@ def up() -> None:
     env = _compose_env()
     bind = env["PLAYGROUND_BIND_ADDRESS"]
     ui_host = _public_ui_host() if bind == "0.0.0.0" else bind
+    env.setdefault("WEBUI_URL", f"http://{ui_host}:{env['CHAT_UI_PORT']}")
     _preflight(env)
     _ensure_deepseek_image(env)
     _ensure_openjev_image(env)
@@ -727,9 +796,11 @@ def up() -> None:
         env=env,
     )
     validate_serving(env)
+    provision_chat_ui(f"http://127.0.0.1:{env['CHAT_UI_PORT']}")
     print("\nEnvironment is ready.")
-    print(f"OpenAI API: http://127.0.0.1:{env['API_PORT']}/v1 (model {PUBLIC_MODEL})")
-    print(f"Playground: http://{ui_host}:{env['PLAYGROUND_PORT']} (no authentication)")
+    print(f"Chat UI:     http://{ui_host}:{env['CHAT_UI_PORT']} (Open WebUI, no authentication)")
+    print(f"Answer page: http://{ui_host}:{env['PLAYGROUND_PORT']} ({ALWAYS_MODEL})")
+    print(f"OpenAI API:  http://{ui_host}:{env['PLAYGROUND_PORT']}/v1 (models {PUBLIC_MODELS})")
     print(
         "Each answer carries kairyu_verification: guaranteed true with every "
         "requirement's p, or false with the reason (refinement_limit, "

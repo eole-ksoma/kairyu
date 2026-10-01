@@ -43,7 +43,7 @@
 <body>
 <main>
   <h1>Verified Answers</h1>
-  <p class="sub">DeepSeek-V4.1 writes the answer; OpenJev scores every requirement; Kairyu
+  <p class="sub">Every request takes the verified path (model kairyu-verified-always). DeepSeek-V4.1 writes the answer; OpenJev scores every requirement; Kairyu
     publishes it with a guarantee flag only when every requirement passes.</p>
   <textarea id="prompt" placeholder="Ask anything. Paste material (documents, tool output) into the request."></textarea>
   <div class="row">
@@ -96,7 +96,7 @@ $("send").onclick = async () => {
   $("send").disabled = true;
   $("status").textContent = "Answering and verifying…";
   const started = performance.now();
-  const payload = { model: "kairyu-verified", messages: [{ role: "user", content }], max_tokens: 32768 };
+  const payload = { model: "kairyu-verified-always", messages: [{ role: "user", content }], max_tokens: 32768 };
   if ($("effort").value) payload.reasoning_effort = $("effort").value;
   try {
     const response = await fetch("/v1/chat/completions", {

@@ -93,9 +93,11 @@ class ChecklistCheck:
     # When an item's primitive or parameters are unusable, ask System One
     # whether the subject satisfies the item's proposition instead of failing.
     semantic_fallback: bool = False
+    tags: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "params", dict(self.params))
+        object.__setattr__(self, "tags", dict(self.tags))
         if self.stage not in {"pre", "post"}:
             raise ValueError(f"check {self.id!r}: stage must be 'pre' or 'post'")
         if self.foreach is None:
@@ -136,9 +138,13 @@ class ChecklistQuestion:
     criteria_true: str = ""
     criteria_false: str = ""
     context: Mapping[str, str] = field(default_factory=dict)
+    # Report-only labels rendered per item (for example the item's origin);
+    # they never reach System One.
+    tags: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "context", dict(self.context))
+        object.__setattr__(self, "tags", dict(self.tags))
         if self.expect not in {"yes", "no"}:
             raise ValueError(f"question {self.id!r}: expect must be 'yes' or 'no'")
         if self.threshold is not None and not 0.0 <= self.threshold <= 1.0:
@@ -292,6 +298,7 @@ class ChecklistItem:
     # False when a deterministic failure ended the attempt before this item
     # was read; it is reported (the checklist stays complete) but not scored.
     judged: bool = True
+    tags: Mapping[str, str] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -303,6 +310,7 @@ class ChecklistItem:
             "p": round(self.p, 6) if self.judged else None,
             "passed": self.passed,
             "judged": self.judged,
+            **({"tags": dict(self.tags)} if self.tags else {}),
         }
 
 
@@ -326,6 +334,27 @@ class VerificationReport:
     threshold: float | None
     items: tuple[ChecklistItem, ...] = ()
     attempts: int = 0
+
+    def as_markdown(self) -> str:
+        """A readable summary for clients that only show reasoning text."""
+
+        lines = [
+            "### Verification",
+            "",
+            f"- Guaranteed: {'yes' if self.guaranteed else 'no'}",
+        ]
+        if self.reason:
+            lines.append(f"- Reason: {self.reason}")
+        if self.threshold is not None:
+            lines.append(f"- Threshold: p >= {self.threshold}")
+        lines.append(f"- Attempts: {self.attempts}")
+        if self.items:
+            lines.append("")
+        for item in self.items:
+            score = f"p={item.p:.3f}" if item.judged else "not judged"
+            mark = "PASS" if item.passed else "FAIL"
+            lines.append(f"- [{item.id}] {mark} {score} — {item.proposition}")
+        return "\n".join(lines)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -441,6 +470,7 @@ class _PendingQuestion:
     expect: str
     threshold: float
     members: tuple[str, ...]
+    tags: Mapping[str, str] = field(default_factory=dict)
 
 
 def requirement_question(
@@ -529,6 +559,7 @@ def _run_checks(
                             expect="yes",
                             threshold=config.threshold,
                             members=(),
+                            tags={key: render(value, binding) for key, value in check.tags.items()},
                         )
                     )
                     continue
@@ -555,6 +586,7 @@ def _run_checks(
                     p=1.0 if outcome.passed else 0.0,
                     passed=outcome.passed,
                     detail=outcome.detail,
+                    tags={key: render(value, binding) for key, value in check.tags.items()},
                 )
             )
     return items, fallbacks
@@ -575,6 +607,7 @@ def _pending_questions(
                     sources=_sources(binding, question.sources_key),
                     group=question.group,
                     payload=_question_payload(config, question, binding, proposition),
+                    tags={key: render(value, binding) for key, value in question.tags.items()},
                     expect=question.expect,
                     threshold=(
                         config.threshold if question.threshold is None else question.threshold
@@ -687,6 +720,7 @@ def _aggregate(
                 p=p,
                 passed=p >= first.threshold,
                 members=first.members,
+                tags=first.tags,
             )
         )
     return items
@@ -771,6 +805,7 @@ class ChecklistRun:
                         detail="not judged: a deterministic check failed",
                         members=entry.members,
                         judged=False,
+                        tags=entry.tags,
                     ),
                 )
         items = (*self._items, *unjudged.values())

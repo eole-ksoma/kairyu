@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from dataclasses import asdict, dataclass, replace
@@ -47,6 +48,7 @@ from kairyu.orchestration.features import latest_user_view
 from kairyu.orchestration.moa import _build_moa_setup, _MoASetup
 from kairyu.orchestration.request import (
     OrchestrationRequest,
+    conversation_messages,
     default_orchestration_request,
 )
 from kairyu.orchestration.router import RouteDecision, Router, RuleRouter
@@ -215,10 +217,27 @@ class ProfileJudge:
     prompt_suffix: str = ""
     choices: tuple[ProfileChoice, ...] = ()
     fallback: str = "primary"
+    # System One judgment (m1 D9), used when ``worker`` is a System One
+    # decision worker: the route is read as one ``choice`` question over the
+    # conversation. ``question`` is its instructions; ``prefer_label`` wins
+    # whenever its probability reaches ``prefer_min_probability`` (else the
+    # most probable route); each message is cut to ``max_message_chars``.
+    question: str = ""
+    prefer_label: str | None = None
+    prefer_min_probability: float = 0.5
+    max_message_chars: int = 4000
 
     def __post_init__(self) -> None:
         if len(self.choices) < 2:
             raise ValueError("profile_judge requires at least two choices")
+        if self.prefer_label is not None and self.prefer_label not in {
+            choice.label for choice in self.choices
+        }:
+            raise ValueError("profile_judge prefer label must be one of its choices")
+        if not 0.0 <= self.prefer_min_probability <= 1.0:
+            raise ValueError("profile_judge prefer_min_probability must be in [0, 1]")
+        if self.max_message_chars < 1:
+            raise ValueError("profile_judge max_message_chars must be positive")
         labels = [choice.label for choice in self.choices]
         if len(set(labels)) != len(labels):
             raise ValueError("profile_judge choice labels must be unique")
@@ -448,10 +467,16 @@ class Orchestrator:
         # Judgment is attached to the call at the serving boundary; profile
         # selection itself stays a pure function of the call.
         self._profile_judge = profile_judge
+        # System One (Jev wire API) backends read by checklist verifiers and
+        # by a System One profile judge.
+        self._decision_workers = dict(decision_workers or {})
         if profile_judge is not None:
             if self._extra_profiles is None:
                 raise ValueError("profile_judge requires at least one alternative profile")
-            if profile_judge.worker not in self._engines:
+            if (
+                profile_judge.worker not in self._engines
+                and profile_judge.worker not in self._decision_workers
+            ):
                 raise ValueError(
                     f"profile_judge references unknown worker {profile_judge.worker!r}"
                 )
@@ -489,8 +514,6 @@ class Orchestrator:
         # not the HTTP app that owns metrics, constructs orchestrators.
         self._stage_observer: Callable[[TraceEvent], None] | None = None
         self._execution_workers = dict(execution_workers or {})
-        # System One (Jev wire API) backends read by checklist verifiers.
-        self._decision_workers = dict(decision_workers or {})
         supplied_executor_descriptors = dict(executor_descriptors or {})
         self._executor_descriptors = {
             name: supplied_executor_descriptors.get(
@@ -900,6 +923,9 @@ class Orchestrator:
         call = self._request(request)
         if not self.will_judge_role_profile(call):
             return call
+        assert self._profile_judge is not None
+        if self._profile_judge.worker in self._decision_workers:
+            return await self._judge_role_profile_systemone(call)
         judge_request = self._profile_judge_request(call)
         queued_at = utc_now_iso()
         assert self._profile_judge is not None
@@ -968,6 +994,123 @@ class Orchestrator:
                 "verdict": verdict,
                 "offered": [choice.label for choice in offered],
                 "fallback": None if verdict is not None else "unparseable_verdict",
+            },
+        )
+        if self._stage_observer is not None:
+            self._stage_observer(event)
+        return replace(
+            call,
+            role_profile_judgment=verdict,
+            role_profile_judge_event=event,
+        )
+
+    def _systemone_judge_body(self, call: OrchestrationRequest) -> dict[str, object]:
+        """The Jev request for a route: the conversation and one choice question."""
+
+        judge = self._profile_judge
+        assert judge is not None
+        messages = conversation_messages(call.prompt)
+        if messages is None:
+            conversation: object = call.prompt[: judge.max_message_chars]
+        else:
+            conversation = [
+                {**message, "content": message["content"][: judge.max_message_chars]}
+                if isinstance(message, dict) and isinstance(message.get("content"), str)
+                else message
+                for message in messages
+            ]
+        offered = self._offered_choices(call)
+        return {
+            "model": "",
+            "state": {
+                "conversation": conversation,
+                "tool_calling": bool(call.tools or call.tools_in_prompt),
+                "image_attached": call.multimodal_prompt is not None,
+            },
+            "questions": {
+                "route": {
+                    "type": "choice",
+                    "instructions": judge.question
+                    or "Which route should answer the latest user request?",
+                    "criteria": {choice.label: choice.criteria for choice in offered},
+                }
+            },
+        }
+
+    async def _judge_role_profile_systemone(
+        self,
+        call: OrchestrationRequest,
+    ) -> OrchestrationRequest:
+        """Route by System One probabilities (m1 D9)."""
+
+        judge = self._profile_judge
+        assert judge is not None
+        offered = self._offered_choices(call)
+        backend = self._decision_workers[judge.worker]
+        queued_at = started_at = utc_now_iso()
+        probabilities: dict[str, float] | None = None
+        usage = None
+        failure = "backend_error"
+        try:
+            reply = await asyncio.wait_for(
+                backend.decide(self._systemone_judge_body(call)),
+                timeout=judge.timeout_seconds,
+            )
+            if reply.status == 200:
+                answer = json.loads(reply.body)["answers"]["route"]
+                raw = answer["probabilities"]
+                probabilities = {
+                    choice.label: float(raw[choice.label]) for choice in offered
+                }
+                usage = TraceUsage(
+                    prompt_tokens=reply.input_tokens or 0,
+                    completion_tokens=reply.output_tokens or 0,
+                    cached_tokens=0,
+                )
+            else:
+                failure = f"status_{reply.status}"
+        except (KeyError, TypeError, ValueError):
+            failure = "unparseable_verdict"
+        except Exception:
+            failure = "backend_error"
+        verdict = None
+        if probabilities is not None:
+            label = max(offered, key=lambda choice: probabilities[choice.label]).label
+            if (
+                judge.prefer_label is not None
+                and judge.prefer_label in probabilities
+                and probabilities[judge.prefer_label] >= judge.prefer_min_probability
+            ):
+                label = judge.prefer_label
+            verdict = next(choice.profile for choice in offered if choice.label == label)
+        event = TraceEvent(
+            node="profile_judge",
+            kind="judged" if verdict is not None else "fallback",
+            detail=(
+                f"profile: {verdict}"
+                if verdict is not None
+                else f"System One {failure}; fallback profile applies"
+            ),
+            operation="classification",
+            status="success" if verdict is not None else "failed",
+            role="profile_judge",
+            worker=judge.worker,
+            engine=judge.worker,
+            model=None,
+            timing=TraceTiming(
+                queued_at=queued_at,
+                started_at=started_at,
+                completed_at=utc_now_iso(),
+            ),
+            usage=usage,
+            metadata={
+                "verdict": verdict,
+                "offered": [choice.label for choice in offered],
+                "fallback": None if verdict is not None else failure,
+                **{
+                    f"p_{label}": round(value, 6)
+                    for label, value in (probabilities or {}).items()
+                },
             },
         )
         if self._stage_observer is not None:
@@ -1684,16 +1827,23 @@ class Orchestrator:
         call = self._request(request)
         if self.will_judge_role_profile(call):
             assert self._profile_judge is not None
-            judge_bound = backend_admission_upper_bound(
-                self._engines[self._profile_judge.worker],
-                self._profile_judge_request(call),
-            )
+            if self._profile_judge.worker in self._decision_workers:
+                # A System One read bills at most its input (no output without
+                # think), and input tokens never exceed the body's bytes.
+                judge_tokens = len(
+                    json.dumps(self._systemone_judge_body(call), ensure_ascii=False).encode()
+                )
+            else:
+                judge_tokens = backend_admission_upper_bound(
+                    self._engines[self._profile_judge.worker],
+                    self._profile_judge_request(call),
+                ).tokens
             profile_bounds = (
                 self.admission_upper_bound(replace(call, role_profile_judgment=profile))
                 for profile in self._profiles
             )
             return AdmissionUpperBound(
-                tokens=judge_bound.tokens + max(bound.tokens for bound in profile_bounds),
+                tokens=judge_tokens + max(bound.tokens for bound in profile_bounds),
                 refundable_on_exact_usage=False,
             )
         internal = self._internal_sampling_params(call)

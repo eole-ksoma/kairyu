@@ -135,7 +135,7 @@ def _query(request: str) -> str:
     """The exact L2 {query} Kairyu renders for a one-turn chat request."""
 
     chat = ChatCompletionRequest(
-        model=SPEC["public_model"], messages=[{"role": "user", "content": request}]
+        model=SPEC["public_models"][1], messages=[{"role": "user", "content": request}]
     )
     return validate_orchestration_chat_input(chat).prompt
 
@@ -189,7 +189,7 @@ def _requirement_checklist() -> ChecklistConfig:
     questions are left out, because InFoBench labels requirements only.
     """
 
-    spec = load_spec(HERE / "verified.yaml")
+    spec = load_spec(HERE / "verified-always.yaml")
     node = next(role for role in spec.roles if role.name == "checklist")
     config = role_spec(node).checklist
     assert config is not None

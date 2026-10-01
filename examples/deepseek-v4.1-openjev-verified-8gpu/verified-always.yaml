@@ -1,7 +1,5 @@
 # Checklist-verified answers (VCO-D1..D9, docs/design/example-verified-checklist-orchestration.md).
-# Model kairyu-verified: Jev routes each request to this DAG (VERIFIED) or to
-# deepseek_think (one thinking DeepSeek answer); the DAG below is identical
-# to verified-always.yaml (a CPU test keeps them in sync).
+# Model kairyu-verified-always: every request takes this DAG.
 #
 #   wave 1  extract (DeepSeek, JSON)  --verified by-->  requirements_check (OpenJev + checks)
 #           generator (DeepSeek, sees only the conversation)
@@ -440,66 +438,8 @@ roles:
       feedback_header: "Unmet conditions:"
       feedback_item: "- [{id}] {proposition} (instruction units: {sources}; p={p}){detail}"
 
-# Jev route judge (VCO-D7, m1 D9): one System One choice over the whole
-# conversation. Accuracy first: VERIFIED wins whenever its probability reaches
-# min_probability (tau_route, MEASUREMENTS.md); a judge that cannot answer
-# routes to deepseek_think, since the verified DAG would be unjudgeable too.
-profile_judge:
-  worker: jev
-  timeout_seconds: 10.0
-  fallback: deepseek_think
-  max_message_chars: 4000
-  question: >-
-    Which route should answer the latest user request in this conversation?
-    The verified route checks the answer against every requirement before
-    replying and is slower; the think route answers directly.
-  prefer: {label: VERIFIED, min_probability: 0.3}
-  choices:
-    - profile: deepseek_think
-      label: THINK
-      criteria: >-
-        everyday requests where a careful direct answer is enough: greetings
-        and chit-chat, short factual questions, rewording, translation or
-        formatting of short text, simple explanations and brainstorming, with
-        no sign that an error would be costly
-    - profile: primary
-      label: VERIFIED
-      criteria: >-
-        requests that need an answer as accurate as possible: difficult or
-        highly specialised questions; requests with many separate
-        requirements or constraints; conversations where earlier answers were
-        corrected or criticised, so another mistake is not acceptable; a user
-        who is frustrated, impatient or under pressure; high-stakes domains
-        (medical, legal, financial, safety, security); explicit demands for
-        correctness, verification, sources or exact numbers; answers that
-        will be published, sent, signed, executed or used for a decision;
-        long multi-part deliverables with exact format or length rules
-
-profiles:
-  - name: deepseek_think
-    roles:
-      - name: deepseek_think_answer
-        worker: deepseek
-        role_type: publisher
-        reasoning_effort: inherit
-        sampling: {temperature: 1.0, top_p: 0.95, max_tokens: 262144}
-        prompt: |-
-          [deepseek_think_answer] Write the complete final answer to the request
-          below, in exactly the reply format the conversation demands: if it
-          requires a specific structure (for example a JSON envelope with fixed
-          fields), produce precisely that structure and nothing else; if it asks
-          for an exact, fixed, or trivially short output, write exactly that
-          output. If the conversation context ends with a tool result, answer
-          the user's request using that result directly. If the conversation
-          requires calling an external tool or function next, emit exactly that
-          call in the format the conversation specifies. Output only the answer
-          itself and do not describe any internal pipeline.
-          --- REQUEST ---
-          {query}
-          --- END REQUEST ---
-
-# Every request reaches the judge (zero markers always meets the
-# multi-agent rule), so no request skips routing.
+# Every request takes the verified DAG: a guarantee is never skipped for a
+# short request (zero markers always meets the multi-agent rule).
 router:
   kind: rules
   thresholds: {multi_step_markers: 0}

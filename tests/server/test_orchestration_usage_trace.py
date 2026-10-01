@@ -1028,6 +1028,7 @@ def test_checklist_verification_reaches_the_client_without_trace_opt_in(tmp_path
                 {"tier1": backend, "tier2": backend},
                 roles=roles,
                 decision_workers={"jev": _AlwaysYes()},
+                expose_intermediate_outputs=True,
             )
         },
         settings=ServerSettings(usage_ledger_path=str(tmp_path / "usage.jsonl")),
@@ -1054,3 +1055,13 @@ def test_checklist_verification_reaches_the_client_without_trace_opt_in(tmp_path
     assert verification["guaranteed"] is True
     assert verification["requirements"][0]["id"] == "R1"
     assert verification["requirements"][0]["p"] == pytest.approx(0.97)
+    # Clients that show only reasoning text (Open WebUI) see the same outcome.
+    if stream:
+        reasoning = "".join(
+            (choice.get("delta") or {}).get("reasoning_content") or ""
+            for payload in _sse_payloads(response.text)
+            for choice in payload.get("choices", [])
+        )
+    else:
+        reasoning = response.json()["choices"][0]["message"]["reasoning_content"]
+    assert "### Verification" in reasoning and "- Guaranteed: yes" in reasoning

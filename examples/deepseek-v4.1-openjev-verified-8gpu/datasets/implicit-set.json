@@ -1,0 +1,332 @@
+[
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "上司に、来週金曜に休みを取りたいとメールで伝えたい。文面を作って。"
+   }
+  ],
+  "expected_implicit": [
+   "敬語・丁寧な表現で書かれている",
+   "休みの日付（来週金曜）が明記されている"
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Fix the bug in this function so it returns the average:\n\ndef avg(xs):\n    return sum(xs) / len(xs) - 1"
+   }
+  ],
+  "expected_implicit": [
+   "keeps the function name and signature avg(xs)",
+   "the result is runnable Python"
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Translate our restaurant menu into English:\n- 唐揚げ定食 980円\n- 焼き魚定食 1,200円\n- 味噌汁 200円"
+   }
+  ],
+  "expected_implicit": [
+   "every price is kept unchanged",
+   "every menu item is kept"
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a reply to this customer complaint: 'My order arrived broken and nobody answered my emails for a week.'"
+   }
+  ],
+  "expected_implicit": [
+   "apologises to the customer",
+   "offers a concrete remedy or next step",
+   "polite, professional tone"
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "子ども向けに光合成を説明して。"
+   }
+  ],
+  "expected_implicit": [
+   "子どもが理解できる平易な言葉で書かれている",
+   "専門用語を使う場合は説明されている"
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Shorten this paragraph for our website: 'Our company has been providing reliable plumbing services to residential and commercial customers across the greater Austin area since 1998, with licensed technicians available 24/7.'"
+   }
+  ],
+  "expected_implicit": [
+   "keeps the key facts (since 1998, Austin, 24/7, licensed)",
+   "is shorter than the original"
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Convert this to Python 3: print 'hello %s' % name"
+   }
+  ],
+  "expected_implicit": [
+   "the output is valid Python 3",
+   "preserves the behaviour (prints hello followed by the name)"
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Make a packing list for my 3-day business trip to Singapore in July."
+   }
+  ],
+  "expected_implicit": [
+   "fits hot, humid weather",
+   "includes business attire"
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "友人の結婚式のスピーチを考えて。"
+   }
+  ],
+  "expected_implicit": [
+   "祝福の言葉が含まれている",
+   "結婚式にふさわしくない話題（別れ・不幸など）を避けている"
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write SQL to get each customer's latest order from orders(id, customer_id, created_at)."
+   }
+  ],
+  "expected_implicit": [
+   "returns exactly one row per customer",
+   "uses the given table and column names"
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Rewrite this error message for end users: 'NullPointerException at UserService.java:142'"
+   }
+  ],
+  "expected_implicit": [
+   "contains no stack trace or internal class names",
+   "tells the user what they can do next"
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Summarize this meeting transcript for my team.\n\nA: We'll ship v2 on May 10. B: QA needs two more days. A: Then May 12. C: I'll update the release notes by Friday."
+   }
+  ],
+  "expected_implicit": [
+   "keeps the decisions and dates (May 12, Friday)",
+   "keeps who owns which action"
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Translate this into Japanese for a formal business letter: 'We look forward to working with you.'"
+   }
+  ],
+  "expected_implicit": [
+   "uses formal business Japanese (敬語)",
+   "keeps the meaning of looking forward to cooperation"
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Create a workout plan for a beginner with bad knees."
+   }
+  ],
+  "expected_implicit": [
+   "avoids high-impact exercises on the knees",
+   "is beginner-level"
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "このコードにコメントを付けて：\nfor i in range(10):\n    if i % 2 == 0:\n        print(i)"
+   }
+  ],
+  "expected_implicit": [
+   "コード自体の動作を変えていない",
+   "コメントは日本語"
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Draft a tweet announcing our new feature."
+   }
+  ],
+  "expected_implicit": [
+   "fits within the tweet length limit (280 characters)"
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Explain recursion with an example in JavaScript."
+   }
+  ],
+  "expected_implicit": [
+   "the example is valid JavaScript",
+   "the example terminates (has a base case)"
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a cover letter for a junior data analyst position."
+   }
+  ],
+  "expected_implicit": [
+   "professional tone",
+   "addressed to a hiring manager or company"
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Turn these notes into a polite reminder email to a client: invoice #4471, $2,300, due last Friday."
+   }
+  ],
+  "expected_implicit": [
+   "keeps invoice number, amount and due date",
+   "polite tone"
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "駅から会社までの道順を、初めて来るお客様向けに書いて。最寄りは渋谷駅ハチ公口です。"
+   }
+  ],
+  "expected_implicit": [
+   "初めて来る人にわかる具体的な目印や順序がある",
+   "丁寧な表現"
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is 17 * 19?"
+   }
+  ],
+  "expected_implicit": []
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Name three primary colors."
+   }
+  ],
+  "expected_implicit": []
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "How many days are in a leap year?"
+   }
+  ],
+  "expected_implicit": []
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "「りんご」を英語で言うと？"
+   }
+  ],
+  "expected_implicit": []
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the chemical symbol for gold?"
+   }
+  ],
+  "expected_implicit": []
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "List the planets of the solar system in order."
+   }
+  ],
+  "expected_implicit": []
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Spell 'necessary' backwards."
+   }
+  ],
+  "expected_implicit": []
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is 2 to the power of 10?"
+   }
+  ],
+  "expected_implicit": []
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "日本の首都はどこ？"
+   }
+  ],
+  "expected_implicit": []
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Who wrote 'Romeo and Juliet'?"
+   }
+  ],
+  "expected_implicit": []
+ }
+]

@@ -8,10 +8,12 @@ L1 services would receive and what the caller gets back.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 
 import httpx
+import pytest
 import yaml
 
 from kairyu.deploy.builder import build_app_from_spec
@@ -32,11 +34,18 @@ CHECKLIST = {
         {"id": "U2", "text": "in one word"},
     ],
     "requirements": [
-        {"id": "R1", "proposition": "names Paris", "kind": "semantic", "sources": ["U1"]},
+        {
+            "id": "R1",
+            "proposition": "names Paris",
+            "kind": "semantic",
+            "origin": "explicit",
+            "sources": ["U1"],
+        },
         {
             "id": "R2",
             "proposition": "the answer is one word",
             "kind": "deterministic",
+            "origin": "explicit",
             "sources": ["U2"],
             "check": {"primitive": "regex", "params": {"pattern": "^\\s*\\S+\\s*$"}},
         },
@@ -51,13 +60,13 @@ def _text(body: dict) -> str:
     )
 
 
-def _deepseek(seen: list[dict], *, draft: str):
+def _deepseek(seen: list[dict], *, draft: str, checklist: dict | None = None):
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         seen.append(body)
         text = _text(body)
         if text.startswith("[extract]"):
-            answer = json.dumps(CHECKLIST)
+            answer = json.dumps(checklist or CHECKLIST)
         elif text.startswith("[state_builder]"):
             answer = json.dumps(
                 {"claims": [{"id": "c1", "text": "Paris", "basis": "general", "evidence": ""}]}
@@ -84,14 +93,26 @@ def _deepseek(seen: list[dict], *, draft: str):
     return handler
 
 
-def _openjev(reads: list[dict]):
+def _openjev(
+    reads: list[dict], *, route: str = "VERIFIED", implicit: float = 0.9999, down: bool = False
+):
+    def answer(question: dict) -> dict:
+        text = json.dumps(question)
+        if question["type"] == "choice":
+            other = next(label for label in question["criteria"] if label != route)
+            return {"type": "choice", "probabilities": {route: 0.9, other: 0.1}}
+        if "same thing" in text:
+            return {"noul": 0.0001}
+        if "did not say it" in text:
+            return {"noul": implicit}
+        return {"noul": 0.9999}
+
     def handler(request: httpx.Request) -> httpx.Response:
+        if down:
+            raise httpx.ConnectError("both OpenJev replicas are down", request=request)
         body = json.loads(request.content)
         reads.append({"replica": request.url.host, **body})
-        answers = {
-            key: {"noul": 0.0001 if "same thing" in json.dumps(question) else 0.9999}
-            for key, question in body["questions"].items()
-        }
+        answers = {key: answer(question) for key, question in body["questions"].items()}
         return httpx.Response(
             200, json={"answers": answers, "usage": {"input_tokens": 50, "output_tokens": 0}}
         )
@@ -99,14 +120,24 @@ def _openjev(reads: list[dict]):
     return handler
 
 
-def _orchestrator(seen: list[dict], reads: list[dict], *, draft: str):
+def _orchestrator(
+    seen: list[dict],
+    reads: list[dict],
+    *,
+    draft: str,
+    spec: str = "verified-always.yaml",
+    route: str = "VERIFIED",
+    implicit: float = 0.9999,
+    checklist: dict | None = None,
+    jev_down: bool = False,
+):
     deployment = load_deployment_spec(
         (EXAMPLE / "kairyu.yaml").read_text(), resolve_credentials=False
     )
     engines = {
         name: OpenAICompatBackend(
             **pool.replicas[0].options,
-            transport=httpx.MockTransport(_deepseek(seen, draft=draft)),
+            transport=httpx.MockTransport(_deepseek(seen, draft=draft, checklist=checklist)),
         )
         for name, pool in deployment.pools.items()
     }
@@ -114,12 +145,14 @@ def _orchestrator(seen: list[dict], reads: list[dict], *, draft: str):
         name: HTTPSystemOneBackend(
             base_urls=section.base_urls,
             upstream_model=section.upstream_model,
-            transport=httpx.MockTransport(_openjev(reads)),
+            transport=httpx.MockTransport(
+                _openjev(reads, route=route, implicit=implicit, down=jev_down)
+            ),
         )
         for name, section in deployment.systemone.items()
     }
     return build_orchestrator(
-        load_spec(EXAMPLE / "verified.yaml"), engine_refs=engines, systemone_refs=judges
+        load_spec(EXAMPLE / spec), engine_refs=engines, systemone_refs=judges
     )
 
 
@@ -142,6 +175,7 @@ def test_gateway_builds_from_the_example_configs(tmp_path: Path) -> None:
         (EXAMPLE / "kairyu.yaml")
         .read_text()
         .replace("/etc/kairyu/verified.yaml", str(EXAMPLE / "verified.yaml"))
+        .replace("/etc/kairyu/verified-always.yaml", str(EXAMPLE / "verified-always.yaml"))
         .replace("/var/lib/kairyu/placement", str(tmp_path))
     )
     build_app_from_spec(load_deployment_spec(raw, resolve_credentials=False), EXAMPLE)
@@ -178,11 +212,10 @@ async def test_a_one_word_draft_is_published_with_a_guarantee() -> None:
     assert "Return only the assistant response body" not in extract_text
     assert by_role["extract"]["response_format"]["type"] == "json_schema"
     assert by_role["state_builder"]["response_format"]["type"] == "json_schema"
-    # V4.1 thinks by default: the claim lister runs in chat mode, the
-    # extractor and the generator think.
-    assert by_role["state_builder"]["chat_template_kwargs"] == {"enable_thinking": False}
-    assert by_role["extract"]["reasoning_effort"] == "high"
-    assert "chat_template_kwargs" not in by_role["extract"]
+    # Every DeepSeek step thinks at the request's effort (default high).
+    for role in ("state_builder", "extract"):
+        assert by_role[role]["reasoning_effort"] == "high"
+        assert "chat_template_kwargs" not in by_role[role]
     assert {read["replica"] for read in reads} <= {"openjev-0", "openjev-1"}
     # The judge gets the conversation as role-tagged messages and the
     # answer's checklist as JSON values, never as one escaped text blob.
@@ -229,3 +262,84 @@ def test_compose_gpus_match_the_allocation() -> None:
 
     assert gpus("deepseek") == spec["allocation"]["deepseek"]["gpu_ids"]
     assert [*gpus("openjev-0"), *gpus("openjev-1")] == spec["allocation"]["openjev"]["gpu_ids"]
+
+
+def test_both_models_share_one_verified_dag() -> None:
+    routed = yaml.safe_load((EXAMPLE / "verified.yaml").read_text())
+    always = yaml.safe_load((EXAMPLE / "verified-always.yaml").read_text())
+    assert routed["roles"] == always["roles"]
+    assert "profile_judge" not in always and not always.get("profiles")
+
+
+@pytest.mark.parametrize(("route", "served"), [("VERIFIED", "verified"), ("THINK", "think")])
+@pytest.mark.parametrize("effort", [None, "low", "max"])
+async def test_jev_routes_and_every_deepseek_call_thinks_at_the_callers_effort(
+    route, served, effort
+) -> None:
+    seen: list[dict] = []
+    reads: list[dict] = []
+    orchestrator = _orchestrator(seen, reads, draft="Paris", spec="verified.yaml", route=route)
+    call = _call("Name the capital of France in one word.")
+    if effort is not None:
+        call = dataclasses.replace(call, reasoning_effort=effort)
+
+    call = await orchestrator.judge_role_profile(call)
+    result = await orchestrator.run(call)
+
+    route_read = next(read for read in reads if "route" in read["questions"])
+    assert route_read["state"]["conversation"][-1]["role"] == "user"
+    if served == "verified":
+        assert result.verification is not None and result.verification.guaranteed
+    else:
+        assert result.verification is None
+        assert [_text(body).split("]")[0] for body in seen] == ["[deepseek_think_answer"]
+    # One effort for every DeepSeek step, default high (75).
+    assert {body.get("reasoning_effort") for body in seen} == {effort or "high"}
+
+
+async def test_an_unavailable_jev_routes_to_the_think_answer() -> None:
+    seen: list[dict] = []
+    orchestrator = _orchestrator(seen, [], draft="Paris", spec="verified.yaml", jev_down=True)
+
+    call = await orchestrator.judge_role_profile(_call("Name the capital of France."))
+    await orchestrator.run(call)
+
+    assert call.role_profile_judgment is None
+    assert [_text(body).split("]")[0] for body in seen] == ["[deepseek_think_answer"]
+
+
+@pytest.mark.parametrize(("p_expected", "kept"), [(0.9999, True), (0.05, False)])
+async def test_implicit_requirements_stay_only_when_jev_finds_them_expected(
+    p_expected, kept
+) -> None:
+    checklist = {
+        **CHECKLIST,
+        "requirements": [
+            *CHECKLIST["requirements"],
+            {
+                "id": "R3",
+                "proposition": "the answer is in English",
+                "kind": "semantic",
+                "origin": "implicit",
+                "sources": ["U1"],
+            },
+        ],
+    }
+    seen: list[dict] = []
+    reads: list[dict] = []
+    orchestrator = _orchestrator(
+        seen, reads, draft="Paris", implicit=p_expected, checklist=checklist
+    )
+
+    result = await orchestrator.run(_call("Name the capital of France in one word."))
+
+    implicit_questions = [
+        question
+        for read in reads
+        for question in read["questions"].values()
+        if "did not say it" in json.dumps(question)
+    ]
+    assert len(implicit_questions) == 1
+    assert "R3: the answer is in English" in json.dumps(implicit_questions[0])
+    judged = {item.id for item in result.verification.items}
+    assert ("R3" in judged) is kept

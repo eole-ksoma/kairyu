@@ -132,6 +132,7 @@ class ChecklistCheckSpec(BaseModel):
     stage: Literal["pre", "post"] = "pre"
     group: str = "checklist"
     semantic_fallback: bool = False
+    tags: dict[str, str] = Field(default_factory=dict)
 
 
 class ChecklistQuestionSpec(BaseModel):
@@ -153,6 +154,7 @@ class ChecklistQuestionSpec(BaseModel):
     criteria_true: str = ""
     criteria_false: str = ""
     context: dict[str, str] = Field(default_factory=dict)
+    tags: dict[str, str] = Field(default_factory=dict)
 
 
 class StateSectionSpec(BaseModel):
@@ -448,6 +450,13 @@ class ProfileChoiceSpec(BaseModel):
     criteria: str = Field(min_length=1)
 
 
+class ProfileJudgePreferSpec(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    label: str = Field(min_length=1)
+    min_probability: float = Field(ge=0.0, le=1.0)
+
+
 class ProfileJudgeSpec(BaseModel):
     """LLM route selection among the role profiles (issue #509, generalized by
     DTO-D13).
@@ -467,6 +476,12 @@ class ProfileJudgeSpec(BaseModel):
     prompt_suffix: str = ""
     choices: tuple[ProfileChoiceSpec, ...] = Field(min_length=2)
     fallback: str = "primary"
+    # System One judgment (m1 D9) when ``worker`` is a systemone_ref worker:
+    # the route is one choice question; ``prefer`` routes to its label when
+    # that label's probability reaches ``min_probability``.
+    question: str = ""
+    prefer: ProfileJudgePreferSpec | None = None
+    max_message_chars: int = Field(default=4000, ge=1, le=1_000_000)
 
     @model_validator(mode="after")
     def _choices_are_distinct(self) -> ProfileJudgeSpec:
@@ -581,8 +596,14 @@ class OrchestratorSpec(BaseModel):
                     f"profile_judge references unknown worker "
                     f"{self.profile_judge.worker!r}"
                 )
-            if self.profile_judge.worker in executor_workers | decision_workers:
-                raise ValueError("profile_judge worker must be a generation worker")
+            if self.profile_judge.worker in executor_workers:
+                raise ValueError(
+                    "profile_judge worker must be a generation or systemone_ref worker"
+                )
+            if self.profile_judge.prefer is not None and self.profile_judge.prefer.label not in {
+                choice.label for choice in self.profile_judge.choices
+            }:
+                raise ValueError("profile_judge prefer label must be one of its choices")
         for profile, roles in (
             ("roles", self.roles),
             *((f"profiles.{spec.name}", spec.roles) for spec in self.profiles),

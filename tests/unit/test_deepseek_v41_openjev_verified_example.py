@@ -60,7 +60,9 @@ def _text(body: dict) -> str:
     )
 
 
-def _deepseek(seen: list[dict], *, draft: str, checklist: dict | None = None):
+def _deepseek(
+    seen: list[dict], *, draft: str, checklist: dict | None = None, draft_finish: str = "stop"
+):
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         seen.append(body)
@@ -75,6 +77,7 @@ def _deepseek(seen: list[dict], *, draft: str, checklist: dict | None = None):
             answer = "Paris"
         else:
             answer = draft
+        finish = draft_finish if answer == draft else "stop"
         return httpx.Response(
             200,
             json={
@@ -83,7 +86,7 @@ def _deepseek(seen: list[dict], *, draft: str, checklist: dict | None = None):
                     {
                         "index": 0,
                         "message": {"role": "assistant", "content": answer},
-                        "finish_reason": "stop",
+                        "finish_reason": finish,
                     }
                 ],
                 "usage": {"prompt_tokens": 16, "completion_tokens": 4, "total_tokens": 20},
@@ -100,8 +103,10 @@ def _openjev(
     implicit: float = 0.9999,
     down: bool = False,
     sufficiency: float = 0.9999,
+    needs: str | None = None,
+    unneeded: str | None = None,
 ):
-    def answer(question: dict) -> dict:
+    def answer(question: dict, state: dict) -> dict:
         text = json.dumps(question)
         if question["type"] == "choice":
             other = next(label for label in question["criteria"] if label != route)
@@ -111,7 +116,11 @@ def _openjev(
         if "did not say it" in text:
             return {"noul": implicit}
         if "fully cover this instruction unit" in text:
+            if needs is not None:
+                return {"noul": 0.9999 if needs in json.dumps(state) else 0.0}
             return {"noul": sufficiency}
+        if unneeded is not None and unneeded in text and "ask for this condition" in text:
+            return {"noul": 0.4}
         return {"noul": 0.9999}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -119,7 +128,9 @@ def _openjev(
             raise httpx.ConnectError("both OpenJev replicas are down", request=request)
         body = json.loads(request.content)
         reads.append({"replica": request.url.host, **body})
-        answers = {key: answer(question) for key, question in body["questions"].items()}
+        answers = {
+            key: answer(question, body["state"]) for key, question in body["questions"].items()
+        }
         return httpx.Response(
             200, json={"answers": answers, "usage": {"input_tokens": 50, "output_tokens": 0}}
         )
@@ -138,6 +149,9 @@ def _orchestrator(
     checklist: dict | None = None,
     jev_down: bool = False,
     sufficiency: float = 0.9999,
+    needs: str | None = None,
+    unneeded: str | None = None,
+    draft_finish: str = "stop",
 ):
     deployment = load_deployment_spec(
         (EXAMPLE / "kairyu.yaml").read_text(), resolve_credentials=False
@@ -145,7 +159,9 @@ def _orchestrator(
     engines = {
         name: OpenAICompatBackend(
             **pool.replicas[0].options,
-            transport=httpx.MockTransport(_deepseek(seen, draft=draft, checklist=checklist)),
+            transport=httpx.MockTransport(
+                _deepseek(seen, draft=draft, checklist=checklist, draft_finish=draft_finish)
+            ),
         )
         for name, pool in deployment.pools.items()
     }
@@ -155,15 +171,19 @@ def _orchestrator(
             upstream_model=section.upstream_model,
             transport=httpx.MockTransport(
                 _openjev(
-                    reads, route=route, implicit=implicit, down=jev_down, sufficiency=sufficiency
+                    reads,
+                    route=route,
+                    implicit=implicit,
+                    down=jev_down,
+                    sufficiency=sufficiency,
+                    needs=needs,
+                    unneeded=unneeded,
                 )
             ),
         )
         for name, section in deployment.systemone.items()
     }
-    return build_orchestrator(
-        load_spec(EXAMPLE / spec), engine_refs=engines, systemone_refs=judges
-    )
+    return build_orchestrator(load_spec(EXAMPLE / spec), engine_refs=engines, systemone_refs=judges)
 
 
 def _call(content: str, **sampling) -> OrchestrationRequest:
@@ -400,3 +420,54 @@ async def test_duplicate_deterministic_conditions_keep_their_own_checks() -> Non
     by_id = {item.id: item for item in result.verification.items}
     assert by_id["R2"].passed is False
     assert result.verification.guaranteed is False
+
+
+async def test_a_passing_checklist_is_reconfirmed_after_curation_changes_it() -> None:
+    # Review P1 (round 2): curation drops R2 (necessity 0.4) from a set that
+    # passed; without R2 the unit is no longer covered.
+    checklist = {
+        "units": [{"id": "U1", "text": "Name the capital and the country"}],
+        "requirements": [
+            {
+                "id": "R1",
+                "proposition": "names Paris",
+                "kind": "semantic",
+                "origin": "explicit",
+                "sources": ["U1"],
+            },
+            {
+                "id": "R2",
+                "proposition": "names France",
+                "kind": "semantic",
+                "origin": "explicit",
+                "sources": ["U1"],
+            },
+        ],
+    }
+    orchestrator = _orchestrator(
+        [], [], draft="Paris", checklist=checklist, needs="names France", unneeded="names France"
+    )
+
+    result = await orchestrator.run(_call("Name the capital of France and the country."))
+
+    assert result.verification.guaranteed is False
+    assert result.verification.reason == "requirements_unconfirmed"
+
+
+async def test_n_greater_than_one_is_refused_on_the_real_dag() -> None:
+    # Review P2 (round 2): the final unit is the seeded answer, not the
+    # inline state builder.
+    orchestrator = _orchestrator([], [], draft="Paris")
+
+    with pytest.raises(ValueError, match="n > 1"):
+        await orchestrator.run(_call("Name the capital of France.", n=2))
+
+
+async def test_an_unverified_draft_keeps_its_finish_reason() -> None:
+    # Review P2 (round 2): the judge is down; the published draft was cut.
+    orchestrator = _orchestrator([], [], draft="Paris", jev_down=True, draft_finish="length")
+
+    result = await orchestrator.run(_call("Name the capital of France."))
+
+    assert result.verification.reason == "judge_unavailable"
+    assert result.completions[0].finish_reason == "length"

@@ -238,6 +238,40 @@ mechanism, independent of the example. (4) The mechanism knows checks,
 questions, thresholds and outcomes; which requirements exist, their wording,
 thresholds, repair prompts and curation policy stay in the example's YAML.
 
+### D9. System One profile judge (2026-10-01)
+
+Status: accepted by the owner (2026-10-01); CPU tests in
+`tests/unit/test_profile_judge_systemone.py`; GPU evidence in
+`examples/deepseek-v4.1-openjev-verified-8gpu/MEASUREMENTS.md` (`routing`).
+
+A `profile_judge` whose `worker` is a `systemone_ref` worker routes by System
+One probabilities instead of a generated label. Kairyu sends the
+role-tagged conversation (each message cut to `max_message_chars`, plus
+tool/image flags) as the state and one `choice` question whose criteria are
+the choices' criteria. `prefer: {label, min_probability}` selects that
+label whenever its probability reaches the floor (an accuracy-first
+policy), otherwise the most probable route wins. Timeouts, transport
+failures, non-200 replies and malformed answers apply `fallback`. The judge
+event records `p_<LABEL>` per route, and admission bounds the read by its
+body size (System One bills at most its input without `think`).
+
+Why (framework boundary): (1) the LLM judge reads only a generated label
+string; (2) `ProfileJudge` workers were generation engines only, so a
+calibrated System One classifier could not route; (3) any DSL can route
+on Jev-style probabilities with this; (4) the labels, criteria and floor
+stay in the example.
+
+Additions in the same change: generation trace events record their
+`reasoning_effort`; checklist items carry report `tags`; a final-unit
+checklist appends a "Verification" section to exposed internal work; an
+upstream checklist that ends without PASS is judged again on its curated
+output and failures in its `guarantee_groups` block the run's guarantee
+(`requirements_unconfirmed`); curation merges only `merge_only_where`
+items; `items_in_sources` can restrict evidence to `message_roles`; a
+seeded final unit republishes its seed's completion metadata and refuses
+`n > 1`; a failed System One read cancels its siblings and completed reads
+keep their usage (PR #616 review).
+
 ## 3. Out of scope for M1 (deferred with reasons)
 
 - Custom scheduler / KV manager / CUDA graphs / spec decode / quantized load — M2/M3.

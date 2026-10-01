@@ -126,11 +126,52 @@ the answer text is never altered. The example's answer page (nginx on
 :3013, Kairyu's API on the same origin) shows the badge, the reason, and the
 requirement table with each p.
 
+### VCO-D7 — Jev routing and the think route (2026-10-01)
+
+Two public models: `kairyu-verified` lets Jev (m1 D9) choose between the
+verified DAG (VERIFIED) and `deepseek_think`, one thinking DeepSeek answer
+(THINK); `kairyu-verified-always` keeps every request on the verified DAG and
+backs the answer page and the guarantee gates. VERIFIED criteria: difficult
+or specialised questions, many requirements, earlier answers corrected,
+a frustrated or pressured user, high-stakes domains, explicit demands for
+correctness or sources, output that will be published, sent, signed or
+executed, and long multi-part deliverables. Owner decision: accuracy first
+(`prefer: VERIFIED` at tau_route; missed accuracy-critical requests < 10 %).
+An unjudgeable route falls back to `deepseek_think`, since the verified DAG
+could not be judged either. The publisher's private reasoning is withheld
+by Kairyu's multi-stage contract on both routes.
+
+### VCO-D8 — Implicit requirements (2026-10-01)
+
+The extractor adds conditions the situation clearly presupposes (origin
+`implicit`, attached to the units they serve) next to the stated ones. Each
+implicit condition gets its own necessity read ("does the user expect this
+even though they did not say it?") and curation drops it below 0.5, so it
+enters the guarantee only when Jev judges it expected. Coverage and
+exclusivity checks apply unchanged; sufficiency stays on the stated units.
+
+### VCO-D9 — One effort for every DeepSeek step (2026-10-01)
+
+Owner requirement: whatever the route, every DeepSeek role (extract,
+generator, repair, state builder, think answer) runs at the caller's
+`reasoning_effort` (API field or the Open WebUI dropdown), default high
+(75). Open WebUI offers both models and shows the guarantee in the folded
+"Verification" section.
+
+### VCO-D10 — Review amendment (PR #616, 2026-10-01)
+
+A requirement checklist still failing sufficiency after re-extraction and
+curation blocks the guarantee (`requirements_unconfirmed`); deterministic
+conditions are never merged; execution claims need tool-result evidence;
+`n > 1` is refused on the verified models.
+
 ## Limitations
 
 - A guaranteed answer is not streamed before its checklist finishes (time to
   first token is the whole pipeline).
 - Tool-calling turns are not this example's surface: the published answer is
   the generator's text; tools in the request are context only.
+- The routing set is author-labelled with clear-cut categories; borderline
+  requests are not measured by it.
 - Thresholds other than tau_hi (0.5 for necessity, sufficiency and
   exclusivity) are defaults, not calibrated.

@@ -302,6 +302,32 @@ class RoleSpec:
                 )
 
 
+def inline_bound_role_names(roles: tuple[RoleSpec, ...]) -> frozenset[str]:
+    """Roles a verifier runs inline on every attempt of its target.
+
+    Executors a verifier depends on, and generation roles a checklist
+    verifier depends on that themselves depend on its target. They are not
+    DAG units, so they can never be the final unit.
+    """
+
+    by_name = {role.name: role for role in roles}
+    bound: set[str] = set()
+    for verifier in roles:
+        if verifier.role_type != "verifier" or verifier.verifies is None:
+            continue
+        for dep in verifier.depends_on:
+            role = by_name.get(dep)
+            if role is None or dep == verifier.verifies:
+                continue
+            if role.role_type == "executor" or (
+                verifier.checklist is not None
+                and role.role_type not in {"verifier", "head"}
+                and verifier.verifies in role.depends_on
+            ):
+                bound.add(dep)
+    return frozenset(bound)
+
+
 @dataclass(frozen=True)
 class ConductorResult:
     final_text: str
@@ -684,6 +710,7 @@ class Conductor:
                 self._inline_roles[verifier.verifies] = inline
                 for spec in inline:
                     self._inline_executor_target[spec.name] = verifier.verifies
+        assert set(self._inline_executor_target) == inline_bound_role_names(self._roles)
         self._units = tuple(
             role
             for role in self._roles
@@ -2299,11 +2326,15 @@ class Conductor:
         *,
         is_final_unit: bool,
     ) -> None:
+        completions = completions or (
+            CompletionOutput(index=0, text=text, token_ids=(), finish_reason="stop"),
+        )
         run.outputs[spec.name] = text
+        # A later seed or the wire must see the published text's own choice,
+        # never the rejected attempt that generated last.
+        run.role_completions[spec.name] = completions
         if is_final_unit:
-            run.final_completions = completions or (
-                CompletionOutput(index=0, text=text, token_ids=(), finish_reason="stop"),
-            )
+            run.final_completions = completions
             # The backend count belonged to the last attempt, not this text;
             # public usage falls back to the m9 approximation.
             run.final_unit_completion_tokens = None
@@ -2362,7 +2393,11 @@ class Conductor:
             source = config.unverified_from
             if source and source in run.outputs:
                 self._publish_attempt(
-                    run, spec, run.outputs[source], (), is_final_unit=is_final_unit
+                    run,
+                    spec,
+                    run.outputs[source],
+                    run.role_completions.get(source, ()),
+                    is_final_unit=is_final_unit,
                 )
             if is_final_unit:
                 run.verification = unverified_report(
@@ -2440,11 +2475,17 @@ class Conductor:
                 run, spec, chosen[0], chosen[1], is_final_unit=is_final_unit
             )
             published = chosen[2]
+        changed = False
         if config.curate is not None:
-            run.outputs[spec.name] = curate(
-                config.curate, run.outputs[spec.name], published.items
-            )
-        if not is_final_unit and not verdict.passed:
+            before = run.outputs[spec.name]
+            curated = curate(config.curate, before, published.items)
+            changed = curated != before
+            if changed:
+                self._publish_attempt(run, spec, curated, (), is_final_unit=is_final_unit)
+        # A FAIL left as is, or any set the curation changed (dropped,
+        # merged or padded items), is judged again: the PASS was given to a
+        # different set than the one downstream roles will use.
+        if not is_final_unit and (not verdict.passed or changed):
             await self._confirm_after_curation(
                 run, session, query, spec, verifier, depth, published, event_sink
             )

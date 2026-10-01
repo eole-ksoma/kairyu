@@ -137,9 +137,7 @@ async def test_seeded_draft_that_passes_publishes_with_a_guarantee():
         {"generator": ["The answer is 42."], "claims": [_claims("The answer is 42.")]}
     )
     judge = FakeSystemOne({})
-    conductor = Conductor(
-        _answer_roles(), {"gen": backend}, decision_workers={"judge": judge}
-    )
+    conductor = Conductor(_answer_roles(), {"gen": backend}, decision_workers={"judge": judge})
 
     result = await conductor.run("What is six times seven?", budget=Budget(max_steps=12))
 
@@ -175,9 +173,7 @@ async def test_deterministic_failure_repairs_before_any_judge_read():
         }
     )
     judge = FakeSystemOne({})
-    conductor = Conductor(
-        _answer_roles(), {"gen": backend}, decision_workers={"judge": judge}
-    )
+    conductor = Conductor(_answer_roles(), {"gen": backend}, decision_workers={"judge": judge})
 
     result = await conductor.run("What is six times seven?", budget=Budget(max_steps=12))
 
@@ -200,9 +196,7 @@ async def test_exhausted_refinements_publish_the_latest_attempt_that_passed_chec
         }
     )
     judge = FakeSystemOne({"says the": 0.3})
-    conductor = Conductor(
-        _answer_roles(), {"gen": backend}, decision_workers={"judge": judge}
-    )
+    conductor = Conductor(_answer_roles(), {"gen": backend}, decision_workers={"judge": judge})
 
     result = await conductor.run("What is six times seven?", budget=Budget(max_steps=16))
 
@@ -377,9 +371,7 @@ async def test_a_failed_read_cancels_its_siblings_and_keeps_their_usage():
                 raise
 
     config = ChecklistConfig(
-        questions=tuple(
-            ChecklistQuestion(id=f"R{n}", proposition=f"p{n}") for n in range(3)
-        ),
+        questions=tuple(ChecklistQuestion(id=f"R{n}", proposition=f"p{n}") for n in range(3)),
         state=(StateSection("answer", "answer"),),
         max_questions_per_call=1,
     )
@@ -415,3 +407,59 @@ async def test_a_seeded_answer_keeps_its_seeds_finish_reason():
     result = await conductor.run("What is six times seven?", budget=Budget(max_steps=12))
 
     assert result.completions[0].finish_reason == "length"
+
+
+async def test_a_downstream_seed_publishes_the_attempt_the_verifier_kept():
+    # Review P1 (round 2): the verifier falls back to its first attempt;
+    # a later seed must not republish the rejected retry's text.
+    backend = RoutedBackend({"source": ["good answer"], "fix": ["bad answer"]})
+    judge = FakeSystemOne({"good answer": 0.1})
+    roles = (
+        RoleSpec(
+            name="source",
+            worker="gen",
+            prompt="[source] {query}",
+            refine_prompt="[fix] {previous}\n{feedback}",
+        ),
+        RoleSpec(
+            name="check",
+            worker="judge",
+            prompt="",
+            role_type="verifier",
+            verifies="source",
+            depends_on=("source",),
+            checklist=ChecklistConfig(
+                checks=(
+                    ChecklistCheck(
+                        id="R1",
+                        proposition="is good",
+                        primitive="contains",
+                        params={"text": "good"},
+                    ),
+                ),
+                questions=(
+                    ChecklistQuestion(
+                        id="R2", proposition="judged", ask="Is it right?", context={"t": "{source}"}
+                    ),
+                ),
+                state=(StateSection("source", "source"),),
+                threshold=0.9,
+                max_refinements=1,
+                on_exhausted="latest_checks_passed",
+            ),
+        ),
+        RoleSpec(
+            name="answer",
+            worker="gen",
+            prompt="",
+            depends_on=("source",),
+            seed_from="source",
+            refine_prompt="[unused] {previous}",
+        ),
+    )
+    conductor = Conductor(roles, {"gen": backend}, decision_workers={"judge": judge})
+
+    result = await conductor.run("q", budget=Budget(max_steps=8))
+
+    assert result.final_text == "good answer"
+    assert result.completions[0].text == "good answer"

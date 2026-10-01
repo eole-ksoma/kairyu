@@ -106,6 +106,11 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
 
+### 2026-10-01 — [amendment] System One second review round (PR #614)
+- What: `/v1/systemone` normalizes `samples`/`think`/`steps` ("32", 32.0) before reserving and forwarding (422 otherwise) and reserves `sequential` reads' repeated schema. The OpenJev overlay ends a thought cut at 512 with a budget sentence (budget forcing): empty answers after a cut thought 13/40 → 0/40; `l1` 8/8. Overlay re-pinned `5e8e2e08`; every gate passes.
+- Why: owner re-review: type changes and `sequential` still slipped past the reservation, and an answer pass could reopen a thought and return empty. vLLM refuses token bans for diffusion models, so the thought is closed in text.
+- Refs: m11 D8 metering; example `MEASUREMENTS.md` "Second review-fix rerun"
+
 ### 2026-10-01 — [amendment] System One review fixes (PR #614)
 - What: `/v1/systemone` reserves the billed upper bound (questions as separate reads, think × samples), enforces each model's body limit, 502s unless both usage counts are valid, and tenant 429s use Jev's shape. The OpenJev overlay refuses empty `stop`/out-of-range `top_logprobs` before the thought; preflight exempts only the GPU the L1 holds; playground fixes. Gates pass on overlay `46530fa7`; `l1` thought-cut-then-answer fails intermittently (2/4, answer pass reopens a thought) — open finding.
 - Why: owner review: the old bound let one request bill 13× a tenant's bucket, and answer-only refusals after the thought ejected the only replica.

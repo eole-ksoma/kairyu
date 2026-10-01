@@ -142,6 +142,10 @@ async def test_systemone_admission_is_bounded_and_separate_from_chat():
         ({"state": "s", "questions": QUESTIONS}, {"authorization": "Bearer k"},
          422, [{"type": "string_type", "loc": ["body", "model"],
                 "msg": "Input should be a valid string"}]),
+        ({"model": "openjev-0.1", "state": "s", "questions": QUESTIONS, "samples": "many"},
+         {"authorization": "Bearer k"},
+         422, [{"type": "int_parsing", "loc": ["body", "samples"],
+                "msg": "Input should be a valid integer"}]),
         ({"model": "openjev-0.1", "state": "s", "questions": QUESTIONS}, {},
          401, {"error_type": "authentication_error", "message": "missing or invalid API key"}),
     ],
@@ -216,6 +220,14 @@ async def test_unmeterable_upstream_replies_are_not_billed(
         # 32 samples of a 4,096-token thought bill far more than 10,000 tokens
         (TenantLimits(tokens_per_minute=10_000, token_burst=10_000),
          {"state": "s", "questions": {"q": {"type": "noul"}}, "samples": 32, "think": 4096}, 1),
+        # the upstream reads "32" and 4096.0 as numbers too
+        (TenantLimits(tokens_per_minute=10_000, token_burst=10_000),
+         {"state": "s", "questions": {"q": {"type": "noul"}}, "samples": "32", "think": 4096.0},
+         1),
+        # a sequential read repeats every question in each group's prompt
+        (TenantLimits(tokens_per_minute=150_000, token_burst=150_000),
+         {"state": "s", "sequential": True, "questions": {
+             f"q{i}": {"type": "noul", "instructions": "x" * 512} for i in range(128)}}, 1),
         (TenantLimits(requests_per_minute=1, request_burst=1),
          {"state": "s", "questions": QUESTIONS}, 2),
     ],

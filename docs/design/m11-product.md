@@ -639,7 +639,11 @@ does not reimplement reads.
 - **Metering.** Before dispatch a tenant reserves an upper bound on what the
   request can bill: every question may be its own read carrying the state,
   and with `think` each read writes a thought and then reads prompt +
-  thought once per sample (unbilled server re-reads are not reserved). The
+  thought once per sample, and a `sequential` read repeats every question and
+  the answers so far in each group's prompt (unbilled server re-reads are not
+  reserved). `samples`, `think` and `steps` are normalized to ints the way
+  the upstream parses them ("32", 32.0) before reserving and forwarding;
+  other representations get a 422. The
   reservation is refunded unless the upstream answers 200; then
   `usage.input_tokens` and `usage.output_tokens` are recorded. A 200 whose
   two counts are not both valid becomes a 502, so no answer leaves unbilled

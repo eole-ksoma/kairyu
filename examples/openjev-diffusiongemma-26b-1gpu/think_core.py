@@ -33,6 +33,9 @@ NOT_ANSWER = frozenset({"role", "reasoning", "reasoning_content"})
 ERROR_TEXT_LIMIT = 500
 # OpenJev's image starts vLLM with --max-logprobs 32 (docker/entrypoint.sh).
 MAX_LOGPROBS = 32
+BUDGET_REACHED = (
+    "\n\nI have reached my thinking budget, so I will stop thinking and give my final answer now."
+)
 
 
 class UpstreamError(Exception):
@@ -112,10 +115,18 @@ def thought_request(upstream: dict, close_ids: Sequence[int]) -> dict:
     }
 
 
-def answer_request(upstream: dict, thought: str) -> dict:
-    """The answer pass: the caller's request, continued after the closed thought."""
+def answer_request(upstream: dict, thought: str, *, cut: bool = False) -> dict:
+    """The answer pass: the caller's request, continued after the closed thought.
 
-    return _continued(upstream, f"{THOUGHT_OPEN}{thought}\n{THOUGHT_CLOSE}")
+    A thought cut at the budget ends mid-sentence, and the model then tends to
+    reopen a thought in the answer pass and spend the answer budget there
+    (13 of 40 on the GPU host). Ending a cut thought with BUDGET_REACHED, as
+    budget forcing does, stopped that (0 of 40). Only the answer prompt
+    carries it; the published reasoning stays the model's own thought.
+    """
+
+    ending = BUDGET_REACHED if cut else ""
+    return _continued(upstream, f"{THOUGHT_OPEN}{thought}{ending}\n{THOUGHT_CLOSE}")
 
 
 def merge_usage(thought: dict, answer: dict) -> dict:
@@ -181,8 +192,10 @@ async def complete(
     check_answer_controls(upstream)
     request = _unstreamed(upstream)
     first = await _post(client, thought_request(request, close_ids))
-    thought = _text(_first_choice(first, "thought").get("message") or {}).strip("\n")
-    second = await _post(client, answer_request(request, thought))
+    thought_choice = _first_choice(first, "thought")
+    thought = _text(thought_choice.get("message") or {}).strip("\n")
+    cut = thought_choice.get("finish_reason") == "length"
+    second = await _post(client, answer_request(request, thought, cut=cut))
     choice = dict(_first_choice(second, "answer"))
     message = {
         key: value
@@ -323,16 +336,20 @@ class ThinkStream:
             yield event(delta({"role": "assistant", "content": ""}))
             parts: list[str] = []
             thought_usage: dict = {}
+            cut = False
             async for payload in _payloads(self._responses[0]):
                 thought_usage = payload.get("usage") or thought_usage
                 for choice in payload.get("choices") or ():
+                    cut = cut or choice.get("finish_reason") == "length"
                     text = _text(choice.get("delta") or {})
                     text = text if parts else text.lstrip("\n")
                     if text:
                         parts.append(text)
                         yield event(delta({"reasoning": text}))
             thought = "".join(parts).rstrip("\n")
-            second = await _open(self._client, _streaming(answer_request(self._upstream, thought)))
+            second = await _open(
+                self._client, _streaming(answer_request(self._upstream, thought, cut=cut))
+            )
             self._responses.append(second)
             answer_usage: dict = {}
             async for payload in _payloads(second):

@@ -10,6 +10,7 @@ Jev's shapes: a FastAPI-style ``{"detail": [...]}`` list for a malformed body,
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -30,6 +31,10 @@ _IMAGE_TOKEN_BOUND = 1024
 # System prompt and answer scaffold around each read, beyond the state and
 # the group's own questions (OpenJev bills about 100 for three questions).
 _READ_OVERHEAD_TOKENS = 512
+# One earlier answer as a sequential read repeats it ("id: label").
+_ANSWER_TOKEN_BOUND = 64
+# Options whose number sizes the work; normalized before reserving.
+_COUNT_OPTIONS = ("samples", "think", "steps")
 
 
 @dataclass(frozen=True)
@@ -68,9 +73,38 @@ def _invalid(loc: list, kind: str, message: str) -> JSONResponse:
     return JSONResponse({"detail": [{"type": kind, "loc": loc, "msg": message}]}, status_code=422)
 
 
-def _option(body: dict, name: str, default: int) -> int:
-    value = body.get(name)
-    return value if isinstance(value, int) and not isinstance(value, bool) else default
+_WHOLE_NUMBER = re.compile(r"\s*[+-]?\d+(\.0*)?\s*")
+
+
+def _whole_number(value: object) -> int | None:
+    """``value`` as an int when a Pydantic int field would accept it, else None."""
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str) and _WHOLE_NUMBER.fullmatch(value):
+        return int(float(value))
+    return None
+
+
+def _normalize_counts(body: dict) -> JSONResponse | None:
+    """Rewrite the resource-sizing options as ints, or refuse them before dispatch.
+
+    The upstream parses "32" or 32.0 as 32, so the reservation must see the
+    same number it will run; anything else is refused rather than forwarded.
+    """
+
+    for name in _COUNT_OPTIONS:
+        if body.get(name) is None:
+            continue
+        number = _whole_number(body[name])
+        if number is None:
+            return _invalid(["body", name], "int_parsing", "Input should be a valid integer")
+        body[name] = number
+    return None
 
 
 def _work_bound(body: dict) -> int:
@@ -79,8 +113,9 @@ def _work_bound(body: dict) -> int:
     UTF-8 bytes bound tokens. A server may read every question in its own
     group: each group's prompt carries the state, and with ``think`` each
     group writes a thought, reads its prompt once to do so, and then reads
-    prompt + thought once per sample. Re-reads a server adds by its own
-    policy are not billed (OpenJev), so they are not reserved.
+    prompt + thought once per sample. A ``sequential`` read carries every
+    question and the answers so far in each group's prompt. Re-reads a server
+    adds by its own policy are not billed (OpenJev), so they are not reserved.
     """
 
     images = body.get("images")
@@ -92,9 +127,13 @@ def _work_bound(body: dict) -> int:
         if isinstance(questions, dict) and questions
         else [0]
     )
-    prompts = sum(_READ_OVERHEAD_TOKENS + state + size for size in sizes)
-    reads = max(1, _option(body, "samples", 1))
-    think = max(0, _option(body, "think", 0))
+    if body.get("sequential") in (None, False):
+        prompts = sum(_READ_OVERHEAD_TOKENS + state + size for size in sizes)
+    else:  # any other value may mean sequential to the upstream
+        schema = sum(sizes) + _ANSWER_TOKEN_BOUND * len(sizes)
+        prompts = len(sizes) * (_READ_OVERHEAD_TOKENS + state + schema)
+    reads = max(1, body.get("samples") or 1)
+    think = max(0, body.get("think") or 0)
     input_tokens = (reads + (1 if think else 0)) * prompts + reads * len(sizes) * think
     return input_tokens + len(sizes) * think
 
@@ -142,6 +181,9 @@ def add_systemone_route(app: FastAPI, models: Mapping[str, SystemOneModel]) -> N
                 {"detail": f"at most {model.max_questions} questions per request"},
                 status_code=400,
             )
+        refused = _normalize_counts(body)  # the reserved and the forwarded numbers agree
+        if refused is not None:
+            return refused
         owner = getattr(http_request.state, "tenant", None) or "default"
         admission = getattr(http_request.state, "tenant_admission", None)
         if admission is not None:

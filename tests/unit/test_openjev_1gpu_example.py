@@ -227,11 +227,25 @@ async def test_a_thought_cut_at_the_budget_still_gets_an_answer(example):
         body = await think_core.complete(
             client, _upstream(), [CLOSE_ID], model="diffusiongemma-26b"
         )
+        events = await think_core.stream(
+            client, _upstream(stream=True), [CLOSE_ID], model="diffusiongemma-26b"
+        )
+        lines = [line async for line in events]
 
+    streamed = [c["delta"] for e in _events(lines) for c in e["choices"]]
+    assert "".join(d.get("content") or "" for d in streamed) == "323"
+    assert fake.requests[3]["messages"][-1] == fake.requests[1]["messages"][-1]
+    del fake.requests[2:]
     assert len(fake.requests) == 2
     assert body["choices"][0]["message"]["content"] == "323"
     assert body["choices"][0]["finish_reason"] == "stop"
     assert body["usage"]["completion_tokens_details"] == {"reasoning_tokens": 512}
+    # A cut thought is closed with the budget sentence, or the model tends to
+    # reopen a thought and spend the answer budget there (13/40 on the GPU host).
+    assert fake.requests[1]["messages"][-1]["content"] == (
+        f"<|channel>thought\n{THOUGHT}{think_core.BUDGET_REACHED}\n<channel|>"
+    )
+    assert body["choices"][0]["message"]["reasoning"] == THOUGHT
 
 
 async def test_tool_calls_from_the_answer_pass_reach_the_caller_with_the_thought(example):

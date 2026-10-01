@@ -2,10 +2,10 @@
 
 Status: **GPU-verified (2026-10-01).** Every gate passed on one RTX PRO 6000
 Blackwell Server Edition (GPU 0) with served config
-`eafbfa94d9376e069a2f39b32b303d13d00c83b7af049d5237ff0c22164893ba`. After the
-review fixes (served config `705655a434d181bcac765ccb1b2bd34e26a1d06533cd3066b824ed22ab1574ce`,
-overlay `sha256:46530fa7…`) every gate passes again except one intermittent
-`l1` case, which is an open finding (see "Review-fix rerun" below). The CPU
+`eafbfa94d9376e069a2f39b32b303d13d00c83b7af049d5237ff0c22164893ba`, and
+again after both review rounds with served config
+`6b5a1807d4abc3a167ec021e1783a301350b4470f2a627b283b40359ed635e2e`
+(overlay `sha256:5e8e2e08…`; see "Second review-fix rerun" below). The CPU
 evidence below was recorded first, on the development machine.
 
 ## Pins
@@ -15,7 +15,7 @@ evidence below was recorded first, on the development machine.
 | OpenJev source | `dcd20947b5ddad5be4a8f5aed6aa6dd245653823` (package 0.5.0) |
 | Base image | `razorback16/openjev:0.5.1@sha256:65f88680e0093c9229d8cc55c0d2f279db27aba78a7ce74ea762b8f2da82d47d`, image ID `sha256:b219be87fdde14896b0029edabe5586b2e99c89380784a9ec73f1405a0453757` |
 | vLLM in the base | `1b3b88ec2b7457aa030db4d0e7d8aaf04f6d0fb8`, with OpenJev's logprob-id cap 512 and vision prefix-LM patch (from the image's build history) |
-| Overlay image ID | `sha256:46530fa771b908dbfa9e2ea2a663899beea32bd99c1da376abcab6bd849a3138` (review fixes; the first GPU pass used `sha256:1c14bdf6…`) |
+| Overlay image ID | `sha256:5e8e2e0838c29fecaa868dbd5b41ae123a0ecadf1f7db030725afc404f0aff60` (second review round; earlier passes used `sha256:1c14bdf6…` and `sha256:46530fa7…`) |
 | Kairyu gateway image (final runs) | `sha256:69a1ece39192531c04aa6ffd6aa5abb45e8a9b75a18cc8bcb97ac4e482e5e288`, built from this branch (`/v1/systemone`, m11 D8) |
 | Playground | `nginx:1.29-alpine@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de` |
 | Checkpoint | `nvidia/diffusiongemma-26B-A4B-it-NVFP4@ec4ff3df205028f4e81c954c2227f9312b3ec2ea` |
@@ -181,7 +181,41 @@ answers tenant 429s in Jev's shape (PR #614 review).
 | `systemone-live` | PASS (12 passed, 4 skipped) |
 | `systemone-serving` | PASS: through Kairyu 13.1 / 39.6 / 42.6 / 39.1 req/s at c1/16/32/64, direct 11.4 / 35.0 / 31.9 / 32.5 |
 | `systemone-isolation` | PASS: 512 × 200, 128 × 429, no 529, in 17.5 s; chat answered; replica healthy |
-| `l1` | **Intermittent FAIL (2 of 4 runs)** in `thought_cut_at_budget`: after the thought is cut at 512, the answer pass sometimes opens a new thought and spends its whole 256-token budget there (`finish_reason: length`, 768 completion tokens). The overlay drops a reopened thought by design, so the answer is empty. The other cases pass in every run. Not caused by the review fixes (the request sets no stop or logprobs); the first GPU pass happened to pass it. Open |
+| `l1` | **Intermittent FAIL (2 of 4 runs), fixed in the second round below** in `thought_cut_at_budget`: after the thought is cut at 512, the answer pass sometimes opens a new thought and spends its whole 256-token budget there (`finish_reason: length`, 768 completion tokens). The overlay drops a reopened thought by design, so the answer is empty. The other cases pass in every run. Not caused by the review fixes (the request sets no stop or logprobs); the first GPU pass happened to pass it. Open |
+
+### Second review-fix rerun (2026-10-01, `rev2-*`)
+
+**Empty answer after a cut thought.** Measured on the GPU host by sending the
+two passes to vLLM directly, with the same thought for every variant of the
+answer pass (`l1`'s long-thought prompt and a coding prompt, 40 thoughts,
+all cut at 512, answer cap 1024):
+
+| Answer pass | Empty answers |
+|---|---:|
+| `enable_thinking: true` (before) | 13 / 40 |
+| `enable_thinking: false` | 4 / 40 |
+| cut thought ended with the budget sentence, thinking on (adopted) | **0 / 40** |
+| cut thought ended with the budget sentence, thinking off | 0 / 40 |
+
+Banning the thought-open token is not possible: vLLM refuses `logit_bias`,
+`bad_words` and `allowed_token_ids` for diffusion models (HTTP 400).
+Stopping on that token and retrying the answer pass did not converge (about
+half of first attempts reopened; 4 of 40 never answered in 4 attempts). The
+overlay now ends a thought cut at the budget with "I have reached my
+thinking budget, so I will stop thinking and give my final answer now."
+before closing it (budget forcing). Only the answer prompt carries the
+sentence; the published reasoning stays the model's own thought.
+
+| Gate | Result |
+|---|---|
+| `l1` | PASS in 8 of 8 runs. The long-thought prompt answers `160000` right after the cut thought in 7 runs (519 completion tokens) and gives the squares list in 1 |
+| `think`, `tool-calling`, `vision`, `cancellation`, `systemone-live`, `systemone-isolation` | PASS (isolation: 512 × 200, 128 × 429, no 529, 19.3 s) |
+| `serving` | PASS: c1 476.0 / c8 1,477.5 / c16 1,565.2 / c32 1,764.3 tok/s, 32/32 each, all `stop` |
+| `systemone-serving` | PASS: through Kairyu 10.1 / 35.7 / 33.9 / 30.3 req/s at c1/16/32/64, direct 9.0 / 31.4 / 29.8 / 28.2 |
+
+Kairyu now also normalizes `samples`/`think`/`steps` the way the upstream
+parses them ("32", 32.0) before reserving and forwarding, refuses other
+representations with 422, and reserves a `sequential` read's repeated schema.
 
 ### Degenerate endings (D2)
 

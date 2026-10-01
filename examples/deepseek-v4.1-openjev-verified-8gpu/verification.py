@@ -8,6 +8,7 @@ model-volumes/<environment>/results/<gate>-<UTC>.json.
   l1            DeepSeek grammar-constrained JSON on every DP rank (thinking and
                 chat) and System One on each OpenJev replica
   calibrate     tau_hi on InFoBench expert labels (calibrate.py)
+  calibrate-g1  per-kind G1 thresholds on RAGTruth / PRM800K / FEVER (calibrate_g1.py)
   requirements  extracted checklists cover InFoBench's gold decomposed questions
   repair        constraint-heavy requests: repairs happen and every guaranteed
                 answer meets the stated constraint (independent check)
@@ -299,6 +300,10 @@ def gate_l1(env: dict[str, str]) -> None:
 
 def gate_calibrate(_env: dict[str, str]) -> None:
     subprocess.run([sys.executable, str(HERE / "calibrate.py")], check=True)
+
+
+def gate_calibrate_g1(_env: dict[str, str]) -> None:
+    subprocess.run([sys.executable, str(HERE / "calibrate_g1.py")], check=True)
 
 
 _COVERAGE_PROMPT = """For each GOLD question below, decide whether the CHECKLIST contains a \
@@ -978,6 +983,7 @@ def gate_serving_routed(env: dict[str, str], *, budget_s: float = 14400) -> None
 GATES = {
     "l1": gate_l1,
     "calibrate": gate_calibrate,
+    "calibrate-g1": gate_calibrate_g1,
     "requirements": gate_requirements,
     "repair": gate_repair,
     "structured": gate_structured,

@@ -224,7 +224,7 @@ async def test_a_one_word_draft_is_published_with_a_guarantee() -> None:
     assert {item["id"] for item in report["requirements"]} == {
         "R1",
         "R2",
-        "G1",
+        "G1-general",
         "G1-excerpts",
         "G2",
         "G3",

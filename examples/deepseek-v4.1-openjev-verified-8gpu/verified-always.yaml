@@ -430,10 +430,63 @@ roles:
           tags: {origin: "{item[origin]}"}
           context:
             instruction_units: "{item[sources]}"
-        - id: G1
+        # G1, one requirement per claim kind, each with its own threshold
+        # (calibrate_g1.py, alpha = 0.10 at 95 %, answer level). The two
+        # G1-source questions are one requirement: p is their minimum.
+        - id: G1-source
           tags: {origin: common}
-          proposition: every claim in the answer is grounded
-          foreach: {role: state_builder, path: claims}
+          proposition: every material-based claim in the answer is grounded
+          foreach: {role: state_builder, path: claims, where: {basis: source}}
+          # RAGTruth
+          threshold: 0.9966
+          ask: Is this claim of the answer supported?
+          criteria_true: >-
+            Its evidence states it (source or action claim), it follows correctly
+            from its evidence (computation), or it is well-established knowledge
+            (general)
+          criteria_false: The claim is not supported in that way
+          context:
+            claim: "{item[text]}"
+            basis: "{item[basis]}"
+            evidence: "{item[evidence]}"
+        - id: G1-source
+          tags: {origin: common}
+          proposition: every material-based claim in the answer is grounded
+          foreach: {role: state_builder, path: claims, where: {basis: action}}
+          # RAGTruth (same requirement)
+          threshold: 0.9966
+          ask: Is this claim of the answer supported?
+          criteria_true: >-
+            Its evidence states it (source or action claim), it follows correctly
+            from its evidence (computation), or it is well-established knowledge
+            (general)
+          criteria_false: The claim is not supported in that way
+          context:
+            claim: "{item[text]}"
+            basis: "{item[basis]}"
+            evidence: "{item[evidence]}"
+        - id: G1-computation
+          tags: {origin: common}
+          proposition: every derived claim in the answer is correct
+          foreach: {role: state_builder, path: claims, where: {basis: computation}}
+          # PRM800K
+          threshold: 0.9966
+          ask: Is this claim of the answer supported?
+          criteria_true: >-
+            Its evidence states it (source or action claim), it follows correctly
+            from its evidence (computation), or it is well-established knowledge
+            (general)
+          criteria_false: The claim is not supported in that way
+          context:
+            claim: "{item[text]}"
+            basis: "{item[basis]}"
+            evidence: "{item[evidence]}"
+        - id: G1-general
+          tags: {origin: common}
+          proposition: every general-knowledge claim in the answer is true
+          foreach: {role: state_builder, path: claims, where: {basis: general}}
+          # FEVER
+          threshold: 0.9966
           ask: Is this claim of the answer supported?
           criteria_true: >-
             Its evidence states it (source or action claim), it follows correctly

@@ -35,6 +35,8 @@ _READ_OVERHEAD_TOKENS = 512
 _ANSWER_TOKEN_BOUND = 64
 # Options whose number sizes the work; normalized before reserving.
 _COUNT_OPTIONS = ("samples", "think", "steps")
+# The largest reservation a float holds exactly.
+_MAX_RESERVATION = 2**53
 
 
 @dataclass(frozen=True)
@@ -141,7 +143,9 @@ def _work_bound(body: dict) -> int:
     reads = max(1, body.get("samples") or 1)
     think = max(0, body.get("think") or 0)
     input_tokens = (reads + (1 if think else 0)) * prompts + reads * len(sizes) * think
-    return input_tokens + len(sizes) * think
+    # Tenant buckets count in float; a bound past 2**53 (a 309-digit samples)
+    # would overflow there. Capped, it still exceeds every bucket.
+    return min(input_tokens + len(sizes) * think, _MAX_RESERVATION)
 
 
 def systemone_model_cards(models: Mapping[str, SystemOneModel]) -> list[dict]:

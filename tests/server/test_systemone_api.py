@@ -229,6 +229,9 @@ async def test_unmeterable_upstream_replies_are_not_billed(
         (TenantLimits(tokens_per_minute=10_000, token_burst=10_000),
          {"state": "s", "questions": {"q": {"type": "noul"}}, "samples": "32", "think": 4096.0},
          1),
+        # a count far past any float still reaches the bucket as a refusal, not a 500
+        (TenantLimits(tokens_per_minute=10_000, token_burst=10_000),
+         {"state": "s", "questions": QUESTIONS, "samples": "9" * 309}, 1),
         # a sequential read repeats every question in each group's prompt
         (TenantLimits(tokens_per_minute=150_000, token_burst=150_000),
          {"state": "s", "sequential": True, "questions": {

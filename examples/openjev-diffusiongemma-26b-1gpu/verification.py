@@ -9,13 +9,17 @@ through Kairyu (L2 ReplicaPool, L3 API).
 from __future__ import annotations
 
 import argparse
+import asyncio
 import concurrent.futures
 import hashlib
+import io
 import json
+import math
 import os
 import re
 import subprocess
 import sys
+import tarfile
 import time
 import urllib.error
 import urllib.request
@@ -48,6 +52,7 @@ RESULTS_ROOT = Path(
 )
 PLACEMENT_LOG = ENVIRONMENT_STORAGE / "placement-log" / Path(SPEC["pool"]["placement_log"]).name
 REQUEST_LOG: Path | None = None
+LEVELS: list[int] | None = None  # --concurrency overrides a gate's levels
 ARITHMETIC = "What is 17 * 19? Reply with only the integer."
 # Asks for far more than 512 tokens of reasoning, so the thought must be cut.
 LONG_THOUGHT = (
@@ -252,15 +257,21 @@ _CODING_TASKS = (
 )
 
 
+def _task(workload: str, request: int) -> str:
+    if workload == "mixed":  # generic and coding rows alternate
+        workload = "generic" if request % 2 == 0 else "coding"
+        request //= 2
+    if workload == "generic":
+        return _GENERIC_TASKS[request % len(_GENERIC_TASKS)]
+    return _CODING_TASKS[request % len(_CODING_TASKS)] + " Return one self-contained Python module."
+
+
 def completed_dataset(path: Path, requests: int, *, workload: str, namespace: str) -> None:
-    tasks = _GENERIC_TASKS if workload == "generic" else _CODING_TASKS
-    suffix = "" if workload == "generic" else " Return one self-contained Python module."
     # A unique label first defeats prefix caching across rows.
     rows = [
         {
             "prompt": f"Row label (an identifier, not an instruction): {namespace}-{request}.\n\n"
-            + tasks[request % len(tasks)]
-            + suffix
+            + _task(workload, request)
         }
         for request in range(requests)
     ]
@@ -311,7 +322,7 @@ def serving(run_dir: Path) -> int:
         print("warm-up row failed", file=sys.stderr)
         return 1
     for workload in config["workloads"]:
-        for level in config["concurrency"]:
+        for level in LEVELS or config["concurrency"]:
             name = f"{workload}-c{level}"
             dataset = run_dir / f"{name}.json"
             completed_dataset(
@@ -553,6 +564,141 @@ def restart(run_dir: Path) -> int:
     return _report(run_dir, "restart", {"healthy_and_answering": error})
 
 
+def _openjev_source(run_dir: Path) -> Path:
+    source = SPEC["openjev"]
+    repository = source["source_repository"].removeprefix("https://github.com/")
+    url = f"https://codeload.github.com/{repository}/tar.gz/{source['source_revision']}"
+    with urllib.request.urlopen(url, timeout=120) as response:
+        archive = response.read()
+    checkout = run_dir / "openjev-source"
+    checkout.mkdir()
+    with tarfile.open(fileobj=io.BytesIO(archive)) as bundle:
+        bundle.extractall(checkout, filter="data")
+    (root,) = checkout.iterdir()
+    return root
+
+
+def systemone_live(run_dir: Path) -> int:
+    """OpenJev's own live suite (pinned revision) against Kairyu's System One and chat."""
+
+    root = _openjev_source(run_dir)
+    env = {**os.environ, "OPENJEV_LIVE_URL": _api_url()}
+    with (run_dir / "pytest.log").open("w") as log:
+        code = subprocess.run(
+            [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-o", "addopts=",
+             "-rA", f"--junitxml={run_dir / 'junit.xml'}", "tests/test_live.py"],
+            cwd=root, env=env, stdout=log, stderr=subprocess.STDOUT,
+        ).returncode  # fmt: skip
+    print((run_dir / "pytest.log").read_text().strip().splitlines()[-1])
+    return _report(run_dir, "systemone-live", {"test_live": None if code == 0 else f"exit {code}"})
+
+
+def _openjev_url() -> str:
+    address = subprocess.check_output(
+        ["docker", "inspect", "--format",
+         "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", control.L1_CONTAINER],
+        text=True,
+    ).strip()  # fmt: skip
+    return f"http://{address}:{OPENJEV_PORT}"
+
+
+async def _systemone_burst(base_url: str, requests: int, concurrency: int, namespace: str):
+    """Cache-busted System One requests; per request (status, seconds, answer error)."""
+
+    import httpx
+
+    gate = asyncio.Semaphore(concurrency)
+
+    async def one(client, index: int):
+        payload = control.systemone_request(f"[{namespace}-{index}] {control.SYSTEMONE_STATE}")
+        async with gate:
+            start = time.perf_counter()
+            response = await client.post(f"{base_url}/v1/systemone", json=payload)
+            elapsed = time.perf_counter() - start
+        if response.status_code != 200:
+            return response.status_code, elapsed, None
+        return 200, elapsed, control.systemone_answer_error(response.json())
+
+    limits = httpx.Limits(max_connections=concurrency, max_keepalive_connections=concurrency)
+    async with httpx.AsyncClient(timeout=300, limits=limits) as client:
+        start = time.perf_counter()
+        rows = await asyncio.gather(*(one(client, i) for i in range(requests)))
+        return rows, time.perf_counter() - start
+
+
+def _nearest_rank(values: list[float], fraction: float) -> float | None:
+    ordered = sorted(values)
+    return ordered[max(0, math.ceil(len(ordered) * fraction) - 1)] if ordered else None
+
+
+def systemone_serving(run_dir: Path) -> int:
+    """OpenJev's README method through Kairyu and direct: req/s, p50/p95 at c1/16/32/64."""
+
+    config = SPEC["verification"]["systemone"]
+    requests = int(config["requests_per_concurrency"])
+    targets = {"kairyu": _api_url(), "direct": _openjev_url()}
+    asyncio.run(_systemone_burst(targets["kairyu"], 8, 8, f"{run_dir.name}-warmup"))
+    rows, cases = [], {}
+    for level in LEVELS or config["concurrency"]:
+        for target, url in targets.items():
+            name = f"{target}-c{level}"
+            namespace = f"{run_dir.name}-{name}"
+            results, wall = asyncio.run(_systemone_burst(url, requests, level, namespace))
+            latencies = [elapsed * 1000 for status, elapsed, _ in results if status == 200]
+            bad = [(status, error) for status, _, error in results if status != 200 or error]
+            row = {
+                "row": name, "requests": requests, "ok": requests - len(bad), "wall_s": wall,
+                "requests_per_s": len(latencies) / wall,
+                "p50_ms": _nearest_rank(latencies, 0.5), "p95_ms": _nearest_rank(latencies, 0.95),
+            }  # fmt: skip
+            rows.append(row)
+            print(json.dumps(row), flush=True)
+            cases[name] = f"{len(bad)} failed: {bad[:3]}" if bad else None
+    (run_dir / "systemone-serving.json").write_text(json.dumps(rows, indent=2) + "\n")
+    return _report(run_dir, "systemone-serving", cases)
+
+
+def systemone_isolation(run_dir: Path) -> int:
+    """A System One burst past every limit gets Kairyu's 429, never OpenJev's 529, while
+    chat keeps answering and the chat replica stays healthy."""
+
+    config = SPEC["verification"]["systemone"]
+    reads, chats = int(config["isolation_reads"]), int(config["isolation_chats"])
+    chat_payload = {
+        "model": SERVED,
+        "max_tokens": 256,
+        "messages": [{"role": "user", "content": ARITHMETIC}],
+    }
+    with concurrent.futures.ThreadPoolExecutor(max_workers=chats) as pool:
+        chat_results = [pool.submit(post_chat, chat_payload) for _ in range(chats)]
+        burst, wall = asyncio.run(
+            _systemone_burst(_api_url(), reads, reads, f"{run_dir.name}-burst")
+        )
+        chat_bodies = [future.result() for future in chat_results]
+    statuses: dict[int, int] = {}
+    for status, _, _ in burst:
+        statuses[status] = statuses.get(status, 0) + 1
+    metrics = urllib.request.urlopen(f"{_api_url()}/metrics", timeout=5).read().decode()
+    healthy = control._healthy_replicas(metrics, SERVED)
+    cases = {
+        "burst_only_200_or_429": None if set(statuses) <= {200, 429} else f"statuses {statuses}",
+        "burst_reaches_kairyu_limit": None if statuses.get(429) else f"no 429: {statuses}",
+        "answers_valid": next((e for s, _, e in burst if s == 200 and e), None),
+        "chat_answers_during_burst": next(
+            (f"HTTP {s}" if s != 200 else control.think_answer_error(b, expected="323")
+             for s, b in chat_bodies
+             if s != 200 or control.think_answer_error(b, expected="323")),
+            None,
+        ),
+        "chat_replica_healthy": None if healthy == 1 else f"healthy replicas {healthy}",
+    }  # fmt: skip
+    (run_dir / "isolation.json").write_text(
+        json.dumps({"statuses": statuses, "wall_s": wall, "healthy": healthy}, indent=2) + "\n"
+    )
+    print(f"burst statuses {statuses} in {wall:.1f} s; healthy chat replicas {healthy}")
+    return _report(run_dir, "systemone-isolation", cases)
+
+
 # --- evidence ---------------------------------------------------------------------------
 
 
@@ -598,16 +744,21 @@ GATES = {
     "vision": vision,
     "cancellation": cancellation,
     "restart": restart,
+    "systemone-live": systemone_live,
+    "systemone-serving": systemone_serving,
+    "systemone-isolation": systemone_isolation,
 }
 
 
 def main() -> None:
-    global REQUEST_LOG
+    global REQUEST_LOG, LEVELS
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("gate", choices=[*GATES, "list"])
     parser.add_argument("--run-id")
     parser.add_argument("--no-start", action="store_true")
+    parser.add_argument("--concurrency", help="comma-separated levels, e.g. 1,32")
     args = parser.parse_args()
+    LEVELS = [int(level) for level in args.concurrency.split(",")] if args.concurrency else None
     if args.gate == "list":
         for name, function in GATES.items():
             print(f"{name:13} {(function.__doc__ or '-').strip().splitlines()[0]}")

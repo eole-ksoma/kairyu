@@ -446,6 +446,11 @@ async def test_served_configuration_reaches_openjev_and_returns_its_thought(exam
     # Above OpenJev's capacity a 529 ejects the only replica; Kairyu must answer 429 first.
     assert deployment.server.max_concurrency == spec["pool"]["max_concurrency"]
     assert replica.options.get("container_image_digest") == spec["openjev"]["image_id"]
+    # Kairyu forwards at most OpenJev's System One queue, so a burst gets 429, never 529.
+    systemone = deployment.systemone[spec["systemone"]["model"]]
+    assert systemone.aliases == frozenset(spec["systemone"]["aliases"])
+    assert systemone.max_concurrency == spec["systemone"]["max_concurrency"]
+    assert systemone.max_queue == spec["systemone"]["max_queue"]
 
     transport = httpx.MockTransport(_fake_openjev)
     async with httpx.AsyncClient(transport=transport) as probe:

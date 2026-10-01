@@ -320,8 +320,8 @@ CPU evidence in the example's `MEASUREMENTS.md`; GPU gates pending.
 GPU. The L1 is a third-party server, OpenJev (DiffusionGemma 26B-A4B NVFP4
 on vLLM `1b3b88ec`, behind OpenJev's OpenAI-style chat endpoint). L2/L3 are
 the single-replica structure: one ReplicaPool replica, the legacy OpenAI
-chat/tool path, image admission, and Open WebUI. Kairyu (`kairyu/`) is not
-changed. The replica needs only configuration:
+chat/tool path, image admission, and Open WebUI. The chat replica needs only
+configuration:
 
 - `health_url` set to OpenJev's `/health`, because Kairyu's default is
   `/readyz`;
@@ -354,5 +354,17 @@ so `continue_final_message` cannot continue a prefill. The example's template
 renders only a final assistant message verbatim. With the checkpoint
 tokenizer, every other conversation renders byte for byte like the stock
 template. At startup the overlay refuses to run unless vLLM uses that
-template and it continues both prefills. Only SHA-bound rows in the
+template and it continues both prefills, both as a string and as the
+text-part list that vLLM's `openai` content format sends (the first GPU start
+showed the list form stripping the prefill). Only SHA-bound rows in the
 example's `MEASUREMENTS.md` establish runtime and performance claims.
+
+System One amendment (2026-10-01, accepted by the owner). OpenJev's System
+One API is served through Kairyu's `/v1/systemone` (m11 D8), not as a
+ReplicaPool member: Kairyu forwards at most 256 requests and queues 256 more,
+below OpenJev's 529 point of 512 waiting requests, so a burst gets Kairyu's
+429 and never ejects the chat replica. The example's UI follows Jev: a
+System One playground on :3011 (a static page behind nginx, on Kairyu's
+origin) shows each answer's distribution, confidence, tokens, latency and
+`Server-Timing`, next to the think-first chat answer for the same state;
+Open WebUI stays on :3010 for chat.

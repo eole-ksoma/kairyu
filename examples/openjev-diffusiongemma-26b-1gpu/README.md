@@ -5,10 +5,12 @@ RTX PRO 6000 Blackwell (SM120) card. OpenJev runs vLLM with DiffusionGemma
 26B-A4B NVFP4 inside its container and answers OpenAI chat requests. Kairyu
 puts the same L2/L3 structure in front of it as the other single-model
 examples: one `ReplicaPool` replica, the OpenAI-compatible API, and Open
-WebUI.
+WebUI. Kairyu also serves OpenJev's System One API (the Jev wire format,
+`POST /v1/systemone`), with a Jev-style playground.
 
 ```text
-Open WebUI (:3010) -> Kairyu (:8010) -> ReplicaPool -> OpenJev (:8080) -> vLLM, one GPU
+Open WebUI (:3010) -> Kairyu (:8010) -> ReplicaPool        -> OpenJev (:8080) -> vLLM, one GPU
+Playground (:3011) -> Kairyu (:8010) -> /v1/systemone + chat -^
 ```
 
 **Every answer thinks first.** Each chat completion writes a thought of at
@@ -28,6 +30,9 @@ the thought off or change its budget.
 ./verify.sh vision --no-start
 ./verify.sh cancellation --no-start
 ./verify.sh restart --no-start
+./verify.sh systemone-live --no-start
+./verify.sh systemone-serving --no-start
+./verify.sh systemone-isolation --no-start
 ./run.sh down
 ```
 
@@ -124,6 +129,32 @@ reproduces the CPU evidence in `MEASUREMENTS.md`.
     is refused with a 400, because it needs structured outputs, which vLLM
     does not support for diffusion models.
 
+## System One and the playground
+
+OpenJev reads typed answers (yes/no, choice, score) straight from the
+model's probabilities. Kairyu serves that API as `POST /v1/systemone` under
+`openjev-0.1` and the aliases `openjev-latest`, `jev-latest` and
+`jev-preview`, so TypeSafe's SDKs work against `http://127.0.0.1:8010`:
+
+```sh
+curl http://127.0.0.1:8010/v1/systemone -H "Content-Type: application/json" -d '{
+  "model": "openjev-latest", "state": "I was charged twice this month.",
+  "questions": {"is_billing": {"type": "noul", "instructions": "Is this a billing issue?"}}}'
+```
+
+- **Limits.** OpenJev runs 64 reads at a time and answers 529 once 512
+  requests wait. Kairyu forwards at most 256 System One requests and queues
+  256 more (`kairyu.yaml` `systemone:`), so a burst gets Kairyu's 429, never
+  OpenJev's 529. These requests do not count against chat's 40 and never
+  touch the chat replica.
+- **Playground** (`http://127.0.0.1:3011`, no authentication): enter a
+  state, optional images and typed questions, then see each answer's
+  probability bars, confidence, tokens, latency and OpenJev's
+  `Server-Timing` split. Next to it, the same state and questions go to the
+  chat model, which thinks first (512 tokens at most) and writes its answer.
+  The page is `playground/index.html`, served by nginx with Kairyu's API on
+  the same origin (`playground/nginx.conf`).
+
 ## Verification gates
 
 `./verify.sh list` prints them; the GPU results go in `MEASUREMENTS.md`.
@@ -135,8 +166,9 @@ reproduces the CPU evidence in `MEASUREMENTS.md`.
     answered.
   - The stream order is reasoning, then content, then usage.
   - vLLM completes two requests per chat.
-- `serving`: completed answers through Kairyu at c1/8/16/32 for generic and
-  coding prompts, with placement on the single replica. Every sample must
+- `serving`: completed answers through Kairyu at c1/8/16/32 (32 requests
+  each, generic and coding prompts alternating; `--concurrency 1,32` selects
+  levels), with placement on the single replica. Every sample must
   think first and finish with `stop`. OpenJev cannot generate a fixed number
   of tokens.
 - `think`: the default request and efforts low, high and max all think and
@@ -147,6 +179,14 @@ reproduces the CPU evidence in `MEASUREMENTS.md`.
 - `cancellation`: a disconnect during the thought and during the answer
   frees Kairyu and vLLM, and a follow-up request completes.
 - `restart`: OpenJev restarts healthy and passes the readiness probes.
+- `systemone-live`: OpenJev's own `tests/test_live.py` at the pinned
+  revision, pointed at Kairyu (System One reads, images, options, chat).
+- `systemone-serving`: OpenJev's README method, through Kairyu and directly:
+  256 cache-busted requests with 3 questions at c1/16/32/64, reporting req/s
+  and p50/p95 latency.
+- `systemone-isolation`: 640 concurrent System One requests with 8 chats
+  alongside. Every read gets 200 or Kairyu's 429 (never 529), chat answers
+  correctly, and the chat replica stays healthy.
 
 ## Primary references
 

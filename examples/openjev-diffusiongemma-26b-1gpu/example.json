@@ -32,7 +32,10 @@
     "served_name": "diffusiongemma-26b",
     "max_context_tokens": 65536,
     "quantization": "nvfp4",
-    "modalities": ["text", "image"]
+    "modalities": [
+      "text",
+      "image"
+    ]
   },
   "openjev": {
     "image": "local/openjev:diffusiongemma-think512",
@@ -51,9 +54,14 @@
       "OPENJEV_GPU_UTIL": 0.9,
       "OPENJEV_GEN_MAX_TOKENS": 8192,
       "OPENJEV_GEN_MAX_INFLIGHT": 8,
-      "OPENJEV_GEN_MAX_QUEUE": 32
+      "OPENJEV_GEN_MAX_QUEUE": 32,
+      "OPENJEV_MAX_INFLIGHT": 64,
+      "OPENJEV_MAX_QUEUE": 512
     },
-    "tunable": ["OPENJEV_GEN_MAX_INFLIGHT", "OPENJEV_GEN_MAX_QUEUE"]
+    "tunable": [
+      "OPENJEV_GEN_MAX_INFLIGHT",
+      "OPENJEV_GEN_MAX_QUEUE"
+    ]
   },
   "webui": {
     "image": "ghcr.io/open-webui/open-webui:v0.11.0-slim@sha256:3698bd4e9628b7ae3768808721098616e669b4a05a6bceb2f5da2d84a3282a01",
@@ -62,9 +70,16 @@
   "api_port": 8010,
   "verification": {
     "serving": {
-      "workloads": ["generic", "coding"],
+      "workloads": [
+        "mixed"
+      ],
       "answer_max_tokens": 8192,
-      "concurrency": [1, 8, 16, 32],
+      "concurrency": [
+        1,
+        8,
+        16,
+        32
+      ],
       "requests_per_concurrency": 32
     },
     "think": {
@@ -74,6 +89,31 @@
     "vision": {
       "requests": 4,
       "max_tokens": 1024
+    },
+    "systemone": {
+      "concurrency": [
+        1,
+        16,
+        32,
+        64
+      ],
+      "requests_per_concurrency": 256,
+      "isolation_reads": 640,
+      "isolation_chats": 8
     }
+  },
+  "systemone": {
+    "model": "openjev-0.1",
+    "aliases": [
+      "openjev-latest",
+      "jev-latest",
+      "jev-preview"
+    ],
+    "max_concurrency": 256,
+    "max_queue": 256
+  },
+  "playground": {
+    "image": "nginx:1.29-alpine@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de",
+    "port": 3011
   }
 }

@@ -132,12 +132,15 @@ async def measure(args) -> int:
         "wall_s": elapsed,
         "completion_tokens_total": tokens,
         "output_tokens_per_s": tokens / elapsed,
+        # OpenJev's README reports req/s with p50/p95 latency per concurrency.
+        "requests_per_s": len(good) / elapsed,
         "concurrency": args.concurrency,
     }
     for field in ("model_ttft_ms", "content_ttft_ms", "total_ms"):
         values = [row[field] for row in good if row.get(field) is not None]
         summary[field] = {
             "p50": percentile(values, 0.5),
+            "p95": percentile(values, 0.95),
             "p99": percentile(values, 0.99),
             "samples": len(values),
         }

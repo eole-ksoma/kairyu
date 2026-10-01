@@ -34,10 +34,14 @@ def _check_spec() -> None:
         or SPEC["allocation"]["model"] != SERVED
         or not set(SPEC["openjev"]["tunable"]) <= set(settings)
         or int(settings[INFLIGHT]) + int(settings[QUEUE]) != int(SPEC["pool"]["max_concurrency"])
+        # OpenJev answers System One 529 once OPENJEV_MAX_QUEUE requests wait;
+        # Kairyu never forwards more than its own max_concurrency.
+        or int(SPEC["systemone"]["max_concurrency"]) > int(settings["OPENJEV_MAX_QUEUE"])
     ):
         raise SystemExit(
-            "example.json is inconsistent (one GPU, one replica, and OpenJev's "
-            "in-flight + queue must equal the pool's max_concurrency)"
+            "example.json is inconsistent (one GPU, one replica, OpenJev's "
+            "in-flight + queue must equal the pool's max_concurrency, and Kairyu "
+            "must forward at most OPENJEV_MAX_QUEUE System One requests)"
         )
 
 
@@ -141,6 +145,8 @@ def _compose_env() -> dict[str, str]:
             "API_PORT": os.environ.get("API_PORT", str(SPEC["api_port"])),
             "CHAT_UI_PORT": os.environ.get("CHAT_UI_PORT", str(SPEC["webui"]["port"])),
             "CHAT_UI_BIND_ADDRESS": os.environ.get("CHAT_UI_BIND_ADDRESS", "127.0.0.1"),
+            "PLAYGROUND_IMAGE": os.environ.get("PLAYGROUND_IMAGE", SPEC["playground"]["image"]),
+            "PLAYGROUND_PORT": os.environ.get("PLAYGROUND_PORT", str(SPEC["playground"]["port"])),
             "GPU_ID": os.environ.get("GPU_ID", "0"),
             # Render-safe default for down/status/logs; `up` replaces it with
             # the selected GPU's NUMA-local CPUs.
@@ -619,13 +625,68 @@ def validate_vision(api_url: str) -> None:
     print(f"image probe: {body['choices'][0]['message']['content'].strip()[:80]!r}", flush=True)
 
 
+SYSTEMONE_QUESTIONS = {
+    "urgent": {"type": "noul", "instructions": "Does the customer need a reply within the hour?"},
+    "team": {
+        "type": "choice",
+        "instructions": "Which team should handle it?",
+        "criteria": {
+            "outage": "service down",
+            "billing": "charges, refunds",
+            "feature": "requests, how-to",
+        },
+    },
+    "tone": {
+        "type": "score",
+        "instructions": "How upset is the customer?",
+        "criteria": ["calm", "annoyed", "furious"],
+    },
+}
+SYSTEMONE_STATE = "Everything is down and we have a demo with our biggest client at noon."
+
+
+def systemone_request(state: str = SYSTEMONE_STATE, model: str | None = None) -> dict:
+    return {
+        "model": model or SPEC["systemone"]["model"],
+        "state": state,
+        "questions": SYSTEMONE_QUESTIONS,
+    }
+
+
+def systemone_answer_error(body: dict) -> str | None:
+    """Why a System One answer to SYSTEMONE_QUESTIONS is not a well-formed, sensible one."""
+
+    try:
+        answers, usage = body["answers"], body["usage"]
+        team = answers["team"]
+        total = sum(team["probabilities"].values())
+        if not 0 <= answers["urgent"]["noul"] <= 1 or abs(total - 1) > 1e-3:
+            return f"probabilities out of range: {answers}"
+        if not isinstance(usage.get("input_tokens"), int) or usage["input_tokens"] < 1:
+            return f"usage {usage!r}"
+        return None
+    except (KeyError, TypeError, AttributeError) as error:
+        return f"malformed answer ({error!r}): {str(body)[:200]}"
+
+
+def validate_systemone(api_url: str) -> None:
+    for name in (SPEC["systemone"]["model"], *SPEC["systemone"]["aliases"]):
+        body = post_json(f"{api_url}/v1/systemone", systemone_request(model=name), timeout_s=120)
+        error = systemone_answer_error(body)
+        if error:
+            raise SystemExit(f"System One probe ({name}) failed: {error}")
+    print(f"System One probe: team={body['answers']['team']['choice']!r}", flush=True)
+
+
 def validate_serving(api_url: str) -> None:
-    """Readiness: pool state, think-first answers on the text and image paths, tools."""
+    """Readiness: pool state, think-first answers on the text and image paths, tools,
+    and System One answers under every model name."""
 
     validate_ready(api_url)
     _validate_arithmetic(api_url)
     validate_tool_calling(api_url)
     validate_vision(api_url)
+    validate_systemone(api_url)
 
 
 def up() -> None:
@@ -658,6 +719,7 @@ def up() -> None:
     if ui_host == "0.0.0.0":
         ui_host = "127.0.0.1"
     print(f"Chat UI:    http://{ui_host}:{env['CHAT_UI_PORT']} (no authentication)")
+    print(f"Playground: http://{ui_host}:{env['PLAYGROUND_PORT']} (System One, no authentication)")
     print(
         f"Chat model: {SERVED} (one OpenJev replica on GPU {env['GPU_ID']}; text + image "
         "input; every answer thinks first, at most 512 thought tokens)"

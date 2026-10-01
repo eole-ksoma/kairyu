@@ -58,3 +58,19 @@ pools:
     placement_log_path: /var/lib/kairyu/placement/diffusiongemma-26b.jsonl
 legacy_chat_models:
 - diffusiongemma-26b
+# OpenJev's System One API (Jev wire format). OpenJev runs 64 reads at a time
+# and answers 529 once 512 requests wait for them. Kairyu forwards at most 256
+# requests and queues 256 more, so a burst gets Kairyu's 429, never OpenJev's
+# 529. Reads never pass through the chat pool: they cannot eject the chat replica.
+systemone:
+  openjev-0.1:
+    base_url: http://openjev:8080
+    upstream_model: openjev-0.1
+    aliases: [openjev-latest, jev-latest, jev-preview]
+    description: DiffusionGemma 26B-A4B (NVFP4) read as a diffusion canvas (OpenJev)
+    max_concurrency: 256
+    max_queue: 256
+    queue_wait_s: 30
+    timeout_s: 300
+    # below OpenJev's own 64 MiB limit, as for chat
+    max_body_bytes: 50331648

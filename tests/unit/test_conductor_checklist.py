@@ -348,3 +348,70 @@ async def test_a_check_failure_still_reports_the_unread_requirements():
     repair = next(p for p in backend.prompts if p.startswith("[repair]"))
     assert "[R1]" in repair and "[R2]" not in repair
     assert judge.bodies == []
+
+
+async def test_a_failed_read_cancels_its_siblings_and_keeps_their_usage():
+    import asyncio
+
+    from kairyu.orchestration.checklist import ChecklistRun, ChecklistUnavailable
+
+    hanging = asyncio.Event()
+    cancelled = []
+
+    class SplitJev:
+        async def decide(self, body):
+            (key,) = body["questions"]
+            if key == "q0":
+                return SystemOneReply(status=529, body=b"{}", headers={})
+            if key == "q1":
+                return SystemOneReply(
+                    status=200,
+                    body=json.dumps({"answers": {"q1": {"noul": 0.9}}}).encode(),
+                    headers={},
+                    input_tokens=7,
+                )
+            try:
+                await hanging.wait()
+            except asyncio.CancelledError:
+                cancelled.append(key)
+                raise
+
+    config = ChecklistConfig(
+        questions=tuple(
+            ChecklistQuestion(id=f"R{n}", proposition=f"p{n}") for n in range(3)
+        ),
+        state=(StateSection("answer", "answer"),),
+        max_questions_per_call=1,
+    )
+    run = ChecklistRun(config, target_text="x", sources="q")
+
+    try:
+        await run.decide(SplitJev(), {"answer": "x"}, "q")
+    except ChecklistUnavailable as error:
+        usage = error.usage
+    else:
+        raise AssertionError("a 529 read must make the checklist unavailable")
+
+    # No read outlives the decision, and the completed read is still billed.
+    assert cancelled == ["q2"]
+    assert usage == (7, 0)
+
+
+async def test_a_seeded_answer_keeps_its_seeds_finish_reason():
+    class LengthBackend(RoutedBackend):
+        async def generate(self, request):
+            result = await super().generate(request)
+            completion = result.completions[0]
+            object.__setattr__(completion, "finish_reason", "length")
+            return result
+
+    backend = LengthBackend(
+        {"generator": ["The answer is 42"], "claims": [_claims("The answer is 42.")]}
+    )
+    conductor = Conductor(
+        _answer_roles(), {"gen": backend}, decision_workers={"judge": FakeSystemOne({})}
+    )
+
+    result = await conductor.run("What is six times seven?", budget=Budget(max_steps=12))
+
+    assert result.completions[0].finish_reason == "length"

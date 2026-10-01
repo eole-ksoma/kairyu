@@ -94,7 +94,12 @@ def _deepseek(seen: list[dict], *, draft: str, checklist: dict | None = None):
 
 
 def _openjev(
-    reads: list[dict], *, route: str = "VERIFIED", implicit: float = 0.9999, down: bool = False
+    reads: list[dict],
+    *,
+    route: str = "VERIFIED",
+    implicit: float = 0.9999,
+    down: bool = False,
+    sufficiency: float = 0.9999,
 ):
     def answer(question: dict) -> dict:
         text = json.dumps(question)
@@ -105,6 +110,8 @@ def _openjev(
             return {"noul": 0.0001}
         if "did not say it" in text:
             return {"noul": implicit}
+        if "fully cover this instruction unit" in text:
+            return {"noul": sufficiency}
         return {"noul": 0.9999}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -130,6 +137,7 @@ def _orchestrator(
     implicit: float = 0.9999,
     checklist: dict | None = None,
     jev_down: bool = False,
+    sufficiency: float = 0.9999,
 ):
     deployment = load_deployment_spec(
         (EXAMPLE / "kairyu.yaml").read_text(), resolve_credentials=False
@@ -146,7 +154,9 @@ def _orchestrator(
             base_urls=section.base_urls,
             upstream_model=section.upstream_model,
             transport=httpx.MockTransport(
-                _openjev(reads, route=route, implicit=implicit, down=jev_down)
+                _openjev(
+                    reads, route=route, implicit=implicit, down=jev_down, sufficiency=sufficiency
+                )
             ),
         )
         for name, section in deployment.systemone.items()
@@ -343,3 +353,50 @@ async def test_implicit_requirements_stay_only_when_jev_finds_them_expected(
     assert "R3: the answer is in English" in json.dumps(implicit_questions[0])
     judged = {item.id for item in result.verification.items}
     assert ("R3" in judged) is kept
+
+
+async def test_an_unconfirmed_requirement_set_never_yields_a_guarantee() -> None:
+    # Review P1: the extractor never covers U1 sufficiently, even after the
+    # re-extraction, so the answer passing that checklist proves nothing.
+    seen: list[dict] = []
+    orchestrator = _orchestrator(seen, [], draft="Paris", sufficiency=0.0)
+
+    result = await orchestrator.run(_call("Name the capital of France in one word."))
+
+    assert result.text == "Paris"
+    assert result.verification.guaranteed is False
+    assert result.verification.reason == "requirements_unconfirmed"
+
+
+async def test_duplicate_deterministic_conditions_keep_their_own_checks() -> None:
+    # Review P1: merging used to keep only the first check ("at most two
+    # words") and report "exactly two words" as passed for one word.
+    checklist = {
+        "units": [{"id": "U1", "text": "Answer in exactly two words"}],
+        "requirements": [
+            {
+                "id": "R1",
+                "proposition": "at most two words",
+                "kind": "deterministic",
+                "origin": "explicit",
+                "sources": ["U1"],
+                "check": {"primitive": "length", "params": {"max_words": 2}},
+            },
+            {
+                "id": "R2",
+                "proposition": "exactly two words",
+                "kind": "deterministic",
+                "origin": "explicit",
+                "sources": ["U1"],
+                "check": {"primitive": "length", "params": {"min_words": 2, "max_words": 2}},
+            },
+        ],
+    }
+    seen: list[dict] = []
+    orchestrator = _orchestrator(seen, [], draft="Paris", checklist=checklist)
+
+    result = await orchestrator.run(_call("Name the capital of France in exactly two words."))
+
+    by_id = {item.id: item for item in result.verification.items}
+    assert by_id["R2"].passed is False
+    assert result.verification.guaranteed is False

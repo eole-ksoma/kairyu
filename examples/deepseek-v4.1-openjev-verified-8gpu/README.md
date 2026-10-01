@@ -60,6 +60,9 @@ curl -s http://127.0.0.1:8013/v1/chat/completions -H 'Content-Type: application/
     overloaded); the generator's draft is returned as-is.
   - `checklist_unavailable`: the checklist could not be built or exceeded
     OpenJev's input window; the draft is returned.
+  - `requirements_unconfirmed`: the requirement checklist still left an
+    instruction unit uncovered after re-extraction and curation, so passing
+    it would prove nothing; the answer is returned without a guarantee.
 
 The answer page (`http://<host>:3013`) shows the badge, the reason and the
 requirement table; internal stages are folded below the answer.

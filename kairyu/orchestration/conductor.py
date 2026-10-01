@@ -521,6 +521,12 @@ class _RunState:
     # an unavailable judge on later stages).
     verification: VerificationReport | None = None
     decision_unavailable: str | None = None
+    # A non-final checklist whose curated output still fails a guarantee
+    # group: no answer of this run can be guaranteed.
+    guarantee_blocked: str | None = None
+    # Each role's latest public completions, so a seeded role republishes
+    # its seed's choice metadata (finish_reason) instead of inventing it.
+    role_completions: dict[str, tuple[CompletionOutput, ...]] = field(default_factory=dict)
 
 
 class _BudgetRefused(Exception):
@@ -2179,9 +2185,8 @@ class Conductor:
         now = utc_now_iso()
         return _GenerationObservation(
             text=text,
-            completions=(
-                CompletionOutput(index=0, text=text, token_ids=(), finish_reason="stop"),
-            ),
+            completions=run.role_completions.get(spec.seed_from)
+            or (CompletionOutput(index=0, text=text, token_ids=(), finish_reason="stop"),),
             timing=TraceTiming(queued_at=now, started_at=now, completed_at=now),
             usage=None,
             budget=TraceBudget.between(run.budget, run.budget),
@@ -2328,6 +2333,11 @@ class Conductor:
                 run, session, query, spec, verifier, depth, text, event_sink
             )
         except ChecklistUnavailable as unavailable:
+            if unavailable.usage != (0, 0):
+                # Completed reads of a failed decision still billed tokens.
+                run.usage[0] += unavailable.usage[0]
+                run.usage[1] += unavailable.usage[1]
+                self._observe_usage(run)
             if config.questions:
                 # A guarantee needs every checklist of the run judged: once one
                 # could not be, later checklists report unverified too.
@@ -2434,13 +2444,82 @@ class Conductor:
             run.outputs[spec.name] = curate(
                 config.curate, run.outputs[spec.name], published.items
             )
+        if not is_final_unit and not verdict.passed:
+            await self._confirm_after_curation(
+                run, session, query, spec, verifier, depth, published, event_sink
+            )
         if is_final_unit:
             run.verification = verdict_report(
                 replace(published, passed=verdict.passed),
                 threshold=config.threshold,
                 attempts=depth + 1,
             )
+            if run.guarantee_blocked is not None and run.verification.guaranteed:
+                # The answer passed, but the checklist it passed was never
+                # confirmed sufficient: a guarantee would be unfounded.
+                run.verification = replace(
+                    run.verification, guaranteed=False, reason="requirements_unconfirmed"
+                )
         return True
+
+    async def _confirm_after_curation(
+        self,
+        run: _RunState,
+        session: str,
+        query: str,
+        spec: RoleSpec,
+        verifier: RoleSpec,
+        depth: int,
+        published: ChecklistVerdict,
+        event_sink: Callable[[ConductorEvent], Awaitable[None]] | None,
+    ) -> None:
+        """Re-judge a non-final checklist that ended without PASS.
+
+        Curation may resolve its failures (dropped, merged, padded items), so
+        the curated output is judged once more; any failure left in a
+        guarantee group blocks every guarantee of this run.
+        """
+
+        config = verifier.checklist
+        assert config is not None
+        if config.curate is None:
+            residual = published
+        else:
+            try:
+                residual = await self._checklist_verdict(
+                    run, session, query, spec, verifier, depth, run.outputs[spec.name], event_sink
+                )
+            except ChecklistUnavailable as unavailable:
+                if unavailable.usage != (0, 0):
+                    run.usage[0] += unavailable.usage[0]
+                    run.usage[1] += unavailable.usage[1]
+                    self._observe_usage(run)
+                if config.questions:
+                    run.decision_unavailable = run.decision_unavailable or unavailable.reason
+                return
+        failing = [
+            item
+            for item in residual.items
+            if not item.passed
+            and (config.guarantee_groups is None or item.group in config.guarantee_groups)
+        ]
+        run.trace.append(
+            self._trace_event(
+                verifier,
+                "verified:after_curation",
+                operation="verification",
+                status="success",
+                attempt=depth,
+                detail=f"attempt={depth} unresolved={len(failing)}",
+                metadata={
+                    "pass": not failing,
+                    "unresolved": len(failing),
+                    "reads": residual.reads,
+                },
+            )
+        )
+        if failing:
+            run.guarantee_blocked = run.guarantee_blocked or verifier.name
 
     async def _run_unit(
         self,
@@ -2639,6 +2718,7 @@ class Conductor:
                 )
                 continue
             run.outputs[spec.name] = text
+            run.role_completions[spec.name] = completions
             intermediate = self._record_intermediate(run, spec, depth, observed)
             if spec.role_type == "head":
                 run.head_completion_tokens = _completion_tokens_for_public_budget(

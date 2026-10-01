@@ -167,10 +167,12 @@ roles:
     checklist:
       checks:
         - id: S0
+          group: sufficiency
           proposition: the checklist is a JSON object with units and requirements
           primitive: json_valid
           params: {required_keys: [units, requirements]}
         - id: S1
+          group: sufficiency
           proposition: every instruction unit is cited by at least one condition
           primitive: coverage
           params: {units_path: units, items_path: requirements, key: sources}
@@ -247,6 +249,10 @@ roles:
       max_refinements: 1
       on_exhausted: last
       on_unavailable: publish_unverified
+      # After curation the checklist is judged again; an instruction unit
+      # still not covered blocks the guarantee (requirements_unconfirmed).
+      # Unmerged deterministic duplicates are both checked exactly: harmless.
+      guarantee_groups: [sufficiency]
       feedback_header: "Problems:"
       feedback_item: "- [{id}] {proposition} ({group}; p={p}){detail}"
       curate:
@@ -255,6 +261,8 @@ roles:
         drop_below: 0.5
         merge_group: exclusivity
         merge_below: 0.5
+        # A deterministic condition keeps its own exact check: never merged.
+        merge_only_where: {kind: semantic}
         units_path: units
         pad:
           id: "P_{unit[id]}"
@@ -389,7 +397,7 @@ roles:
             min_chars: 1
         - id: G2
           tags: {origin: common}
-          proposition: no execution claim without a matching tool call and result
+          proposition: no execution claim without a matching tool result
           stage: post
           primitive: items_in_sources
           params:
@@ -398,6 +406,9 @@ roles:
             where: {basis: action}
             key: evidence
             min_chars: 1
+            # An execution claim is proven only by a tool result, never by an
+            # earlier user or assistant statement.
+            message_roles: [tool]
       subject: the answer
       questions:
         # Requirement form: Kairyu asks whether the answer satisfies it.

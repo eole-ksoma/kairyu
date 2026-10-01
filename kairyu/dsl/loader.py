@@ -151,6 +151,7 @@ def _checklist(spec: ChecklistSpec | None) -> ChecklistConfig | None:
         on_exhausted=spec.on_exhausted,
         on_unavailable=spec.on_unavailable,
         unverified_from=spec.unverified_from,
+        guarantee_groups=spec.guarantee_groups,
         curate=(
             None
             if spec.curate is None

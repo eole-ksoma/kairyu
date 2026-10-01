@@ -180,6 +180,7 @@ class CurationSpec(BaseModel):
     drop_below: float = Field(default=0.5, ge=0.0, le=1.0)
     merge_group: str = ""
     merge_below: float = Field(default=0.5, ge=0.0, le=1.0)
+    merge_only_where: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
     units_path: str = ""
     unit_id_key: str = "id"
     pad: dict = Field(default_factory=dict)
@@ -210,6 +211,7 @@ class ChecklistSpec(BaseModel):
     on_unavailable: Literal["error", "publish_unverified"] = "error"
     unverified_from: str = ""
     curate: CurationSpec | None = None
+    guarantee_groups: tuple[str, ...] | None = None
 
 
 class ExecutionLimitsSpec(BaseModel):

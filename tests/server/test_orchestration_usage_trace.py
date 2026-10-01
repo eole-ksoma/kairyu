@@ -1065,3 +1065,37 @@ def test_checklist_verification_reaches_the_client_without_trace_opt_in(tmp_path
     else:
         reasoning = response.json()["choices"][0]["message"]["reasoning_content"]
     assert "### Verification" in reasoning and "- Guaranteed: yes" in reasoning
+
+
+def test_a_seeded_orchestration_refuses_n_greater_than_one(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from kairyu.orchestration.conductor import RoleSpec
+
+    backend = AccountingBackend()
+    roles = (
+        RoleSpec(name="draft", worker="tier2", prompt="[draft] {query}"),
+        RoleSpec(
+            name="answer",
+            worker="tier2",
+            prompt="",
+            depends_on=("draft",),
+            seed_from="draft",
+            refine_prompt="[repair] {previous} {feedback}",
+        ),
+    )
+    app = create_legacy_app(
+        {"plain": backend},
+        orchestrators={"auto": Orchestrator({"tier1": backend, "tier2": backend}, roles=roles)},
+        settings=ServerSettings(usage_ledger_path=str(tmp_path / "usage.jsonl")),
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": "auto", "messages": [{"role": "user", "content": COMPLEX}], "n": 2},
+        )
+
+    # Review P2: one seeded draft cannot honour n choices; say so instead of
+    # silently returning one.
+    assert response.status_code == 400
+    assert "n > 1" in response.text

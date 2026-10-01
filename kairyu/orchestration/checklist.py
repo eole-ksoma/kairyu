@@ -48,10 +48,12 @@ class DecisionBackend(Protocol):
 class ChecklistUnavailable(Exception):
     """The checklist could not be judged (backend down, overloaded, malformed)."""
 
-    def __init__(self, reason: str, detail: str = "") -> None:
+    def __init__(self, reason: str, detail: str = "", usage: tuple[int, int] = (0, 0)) -> None:
         super().__init__(detail or reason)
         self.reason = reason
         self.detail = detail
+        # Tokens the reads that did complete still billed.
+        self.usage = usage
 
 
 @dataclass(frozen=True)
@@ -199,12 +201,17 @@ class CurationConfig:
     drop_below: float = 0.5
     merge_group: str = ""
     merge_below: float = 0.5
+    # Only items matching every key/value here are merged (for example
+    # {"kind": "semantic"}): merging keeps the first item's fields, so an item
+    # with its own exact check must not be folded into another.
+    merge_only_where: Mapping[str, object] = field(default_factory=dict)
     units_path: str = ""
     unit_id_key: str = "id"
     pad: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "pad", dict(self.pad))
+        object.__setattr__(self, "merge_only_where", dict(self.merge_only_where))
         if self.units_path and not self.pad:
             raise ValueError("curation units_path requires a pad item template")
 
@@ -236,9 +243,16 @@ class ChecklistConfig:
     on_unavailable: str = "error"
     unverified_from: str = ""
     curate: CurationConfig | None = None
+    # A checklist that ends without PASS is re-judged once on its curated
+    # output; failing items of these groups (all groups when None) then block
+    # the run's guarantee ("requirements_unconfirmed"). Groups a curation
+    # resolves by design (merged duplicates) can be left out.
+    guarantee_groups: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "checks", tuple(self.checks))
+        if self.guarantee_groups is not None:
+            object.__setattr__(self, "guarantee_groups", tuple(self.guarantee_groups))
         object.__setattr__(self, "questions", tuple(self.questions))
         object.__setattr__(self, "state", tuple(self.state))
         if not self.checks and not self.questions:
@@ -676,18 +690,46 @@ async def _decide(
             raise ChecklistUnavailable("judge_unavailable", str(error)) from error
         if reply.status != 200:
             raise ChecklistUnavailable("judge_unavailable", f"System One status {reply.status}")
-        return _read_probabilities(reply.body, keys), (
-            reply.input_tokens or 0,
-            reply.output_tokens or 0,
-        )
+        usage = (reply.input_tokens or 0, reply.output_tokens or 0)
+        try:
+            return _read_probabilities(reply.body, keys), usage
+        except ChecklistUnavailable as error:
+            raise ChecklistUnavailable(error.reason, error.detail, usage) from error
 
-    results = await asyncio.gather(*(one(chunk) for chunk in chunks))
+    # Every read finishes (or is cancelled) before this returns: a failure
+    # cancels the siblings, so no read outlives the request it belongs to, and
+    # the reads that did complete keep their usage.
+    tasks = [asyncio.ensure_future(one(chunk)) for chunk in chunks]
+    try:
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
     merged: dict[str, float] = {}
     prompt_tokens = completion_tokens = 0
-    for probabilities, (inputs, outputs) in results:
+    failure: BaseException | None = None
+    for task in tasks:
+        if task.cancelled():
+            continue
+        error = task.exception()
+        if error is not None:
+            if isinstance(error, ChecklistUnavailable):
+                prompt_tokens += error.usage[0]
+                completion_tokens += error.usage[1]
+            failure = failure or error
+            continue
+        probabilities, (inputs, outputs) = task.result()
         merged.update(probabilities)
         prompt_tokens += inputs
         completion_tokens += outputs
+    if failure is not None:
+        if isinstance(failure, ChecklistUnavailable):
+            raise ChecklistUnavailable(
+                failure.reason, failure.detail, (prompt_tokens, completion_tokens)
+            ) from failure
+        raise failure
     return (
         [merged[f"q{index}"] for index in range(len(questions))],
         (prompt_tokens, completion_tokens),
@@ -927,6 +969,12 @@ def curate(config: CurationConfig, text: str, items: Sequence[ChecklistItem]) ->
                 continue
             first, second = (by_id.get(member) for member in item.members)
             if first is None or second is None or first is second:
+                continue
+            if any(
+                entry.get(key) != value
+                for entry in (first, second)
+                for key, value in config.merge_only_where.items()
+            ):
                 continue
             merged_sources = list(first.get(config.sources_key) or [])
             for source in second.get(config.sources_key) or []:

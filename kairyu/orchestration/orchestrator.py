@@ -1181,6 +1181,18 @@ class Orchestrator:
         call: OrchestrationRequest,
         decision: RouteDecision | None,
     ) -> None:
+        if decision is None or decision.target == "multi_agent":
+            final = self._conductor_final_role(self._roles_for(call))
+            params = call.sampling_params
+            if final.seed_from is not None and (
+                params.n != 1 or params.best_of not in (None, 1)
+            ):
+                # A seeded final unit publishes one upstream draft; it cannot
+                # honour n independent choices, so refuse instead of silently
+                # returning one.
+                raise ValueError(
+                    "this orchestration publishes one verified draft and does not support n > 1"
+                )
         if call.multimodal_prompt is not None:
             if self._moa_samples > 0 and (decision is None or decision.target == "multi_agent"):
                 raise ValueError("multimodal orchestration does not support MoA sampling")

@@ -52,3 +52,31 @@ def test_items_in_sources_reads_another_roles_json():
 def test_unknown_primitive_is_rejected():
     with pytest.raises(CheckParameterError):
         run_check("guess", {}, CheckContext(text="", sources="", outputs={}))
+
+
+def test_execution_evidence_counts_only_tool_results():
+    conversation = (
+        "--- CONVERSATION CONTEXT JSON ---\n"
+        + json.dumps(
+            [
+                {"role": "assistant", "content": "I ran the test suite and all tests passed."},
+                {"role": "tool", "content": "pytest: 12 passed in 0.4s"},
+            ]
+        )
+        + "\n--- END CONVERSATION CONTEXT JSON ---"
+    )
+    params = {
+        "role": "state",
+        "path": "claims",
+        "key": "evidence",
+        "message_roles": ["tool"],
+    }
+
+    def outcome(evidence: str) -> bool:
+        claims = json.dumps({"claims": [{"id": "c1", "evidence": evidence}]})
+        ctx = CheckContext(text="", sources=conversation, outputs={"state": claims})
+        return run_check("items_in_sources", params, ctx).passed
+
+    assert outcome("pytest: 12 passed") is True
+    # An earlier assistant statement is not proof that anything ran.
+    assert outcome("I ran the test suite and all tests passed.") is False

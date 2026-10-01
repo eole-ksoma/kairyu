@@ -203,7 +203,13 @@ def judge(sample: dict, api_url: str, roles: dict[str, dict]) -> list[float]:
     del roles
     config = _requirement_checklist()
     requirements = [
-        {"id": f"Q{index}", "proposition": text, "kind": "semantic", "sources": ["U1"]}
+        {
+            "id": f"Q{index}",
+            "proposition": text,
+            "kind": "semantic",
+            "origin": "explicit",
+            "sources": ["U1"],
+        }
         for index, text in enumerate(sample["statements"], start=1)
     ]
     outputs = {

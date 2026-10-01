@@ -304,10 +304,38 @@ def selected_items(
     ]
 
 
+def _message_corpus(sources: str, roles: object) -> str:
+    """Sources restricted to the content of messages with the given roles.
+
+    ``roles`` reads the role-tagged conversation of Kairyu's L2 query, so an
+    execution claim can be held to tool results instead of any earlier user
+    or assistant statement; a query without that conversation has none.
+    """
+
+    from kairyu.orchestration.request import conversation_messages
+
+    if not isinstance(roles, list) or not all(isinstance(role, str) for role in roles):
+        raise CheckParameterError("parameter 'message_roles' must be a list of roles")
+    messages = conversation_messages(sources) or []
+    parts = []
+    for message in messages:
+        if not isinstance(message, Mapping) or message.get("role") not in roles:
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            content = json.dumps(content, ensure_ascii=False)
+        parts.append(content)
+    return "\n".join(parts)
+
+
 def _items_in_sources(ctx: CheckContext, params: Mapping[str, object]) -> CheckOutcome:
     key = _require(params, "key", str)
     min_chars = _optional_int(params, "min_chars") or 1
-    sources = _source_corpus(ctx.sources)
+    sources = _source_corpus(
+        ctx.sources
+        if "message_roles" not in params
+        else _message_corpus(ctx.sources, params["message_roles"])
+    )
     missing = []
     for item in selected_items(ctx.outputs, params):
         value = item.get(str(key))

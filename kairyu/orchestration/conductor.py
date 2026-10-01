@@ -9,6 +9,7 @@ gates its target with a bounded refine loop. All prompts are rendered as
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
@@ -1288,6 +1289,13 @@ class Conductor:
             # a role that analyses the request (rather than answering it)
             # never mistakes Kairyu's instructions for the user's.
             values["conversation"] = conversation_text(query)
+        if "{response_format}" in template and "response_format" not in outputs:
+            # {response_format}: the caller's output contract (JSON), so a role
+            # that analyses the request reads its wording within that format.
+            requested = self._final_sampling_params.extra_args.get("response_format")
+            values["response_format"] = (
+                "none" if requested is None else json.dumps(requested, ensure_ascii=False)
+            )
         body = template.format_map(values)
         return f"{self._shared_prefix}{body}"
 

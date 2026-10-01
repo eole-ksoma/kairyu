@@ -132,7 +132,16 @@ roles:
       - contains / not_contains {{text, ignore_case}}: a literal string
       - json_valid {{required_keys}}: the answer is a JSON value (object keys)
 
+      The caller fixed the answer's output format below ("none" when
+      free). Read the request within it: a content demand ("describe",
+      "explain", ...) is satisfied by what the format can hold, so write each
+      condition so that an answer in exactly this format can meet it, and do
+      not add conditions about the format itself.
+
       Output only the JSON object.
+      --- RESPONSE FORMAT ---
+      {response_format}
+      --- END RESPONSE FORMAT ---
       --- CONVERSATION ---
       {conversation}
       --- END CONVERSATION ---
@@ -149,6 +158,8 @@ roles:
       the latest user message), conditions are checkable statements in the
       request's language, "deterministic" only with one of the primitives
       regex, not_regex, length, contains, not_contains, json_valid.
+      Conditions must be satisfiable by an answer in the caller's output
+      format: {response_format}
       Output only the JSON object.
       --- PREVIOUS CHECKLIST ---
       {previous}

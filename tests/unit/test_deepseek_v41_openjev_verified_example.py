@@ -280,6 +280,10 @@ async def test_the_callers_response_format_constrains_draft_and_repair() -> None
 
     generator = next(body for body in seen if _text(body).startswith("Kairyu L2"))
     assert generator["response_format"] == schema
+    # The extractor reads the request within the caller's format, so it never
+    # demands content the format cannot hold.
+    extract = next(_text(body) for body in seen if _text(body).startswith("[extract]"))
+    assert json.dumps(schema) in extract
 
 
 def test_compose_gpus_match_the_allocation() -> None:

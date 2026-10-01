@@ -1,0 +1,156 @@
+"""POST /v1/systemone: the System One (Jev) wire API in front of HTTPSystemOneBackend.
+
+Kairyu resolves the model (or one of its aliases), bounds the work it admits,
+meters ``usage`` and forwards the body. The upstream owns the question schema,
+so its 400/422 answers pass through unchanged. Errors Kairyu raises itself use
+Jev's shapes: a FastAPI-style ``{"detail": [...]}`` list for a malformed body,
+``{"detail": {"error_type", "message"}}`` otherwise.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Mapping
+from dataclasses import dataclass
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, Response
+
+from kairyu.engine.systemone import (
+    HTTPSystemOneBackend,
+    SystemOneCapacityError,
+    SystemOneUnavailableError,
+)
+from kairyu.entrypoints.server.metering import record_state_usage
+
+SYSTEMONE_PATH = "/v1/systemone"
+# Tokens reserved per image before the upstream reports exact usage; a
+# DiffusionGemma image costs about 280 input tokens.
+_IMAGE_TOKEN_BOUND = 1024
+
+
+@dataclass(frozen=True)
+class SystemOneModel:
+    name: str
+    backend: HTTPSystemOneBackend
+    aliases: frozenset[str] = frozenset()
+    description: str | None = None
+    max_questions: int = 256
+    max_body_bytes: int = 64 * 1024 * 1024
+
+
+def wants_jev_envelope(path: str) -> bool:
+    return path == SYSTEMONE_PATH
+
+
+def jev_error_payload(error_type: str, message: str) -> dict:
+    return {"detail": {"error_type": error_type, "message": message}}
+
+
+def jev_error_type_for_status(status: int) -> str:
+    return {
+        401: "authentication_error",
+        403: "permission_error",
+        413: "api_usage_error",
+        429: "rate_limit_error",
+    }.get(status, "api_error")
+
+
+def _error(status: int, error_type: str, message: str, retry_after: str | None = None):
+    headers = {"retry-after": retry_after} if retry_after else None
+    return JSONResponse(jev_error_payload(error_type, message), status_code=status, headers=headers)
+
+
+def _invalid(loc: list, kind: str, message: str) -> JSONResponse:
+    return JSONResponse({"detail": [{"type": kind, "loc": loc, "msg": message}]}, status_code=422)
+
+
+def _work_bound(body: dict) -> int:
+    text = json.dumps(
+        {"state": body.get("state"), "questions": body.get("questions")}, ensure_ascii=False
+    )
+    images = body.get("images")
+    image_count = len(images) if isinstance(images, list) else 0
+    reads = body.get("samples") if isinstance(body.get("samples"), int) else 1
+    think = body.get("think") if isinstance(body.get("think"), int) else 0
+    prompt = len(text.encode()) + _IMAGE_TOKEN_BOUND * image_count
+    return max(1, prompt * max(1, reads) * (2 if think else 1) + max(0, think))
+
+
+def systemone_model_cards(models: Mapping[str, SystemOneModel]) -> list[dict]:
+    """Jev's ``/v1/models`` entries: every name a request may use."""
+
+    cards = []
+    for model in models.values():
+        for name in (model.name, *sorted(model.aliases)):
+            card = {"name": name}
+            if model.description:
+                card["description"] = model.description
+            cards.append(card)
+    return cards
+
+
+def add_systemone_route(app: FastAPI, models: Mapping[str, SystemOneModel]) -> None:
+    by_name = {name: model for model in models.values() for name in (model.name, *model.aliases)}
+
+    @app.post(SYSTEMONE_PATH)
+    async def systemone(http_request: Request):
+        try:
+            body = json.loads(await http_request.body())
+        except ValueError:
+            return _invalid(["body"], "json_invalid", "JSON decode error")
+        if not isinstance(body, dict):
+            return _invalid(["body"], "model_attributes_type", "Input should be an object")
+        name = body.get("model")
+        if not isinstance(name, str):
+            return _invalid(["body", "model"], "string_type", "Input should be a valid string")
+        model = by_name.get(name)
+        if model is None:
+            return _error(400, "api_usage_error", f"Unknown model: {name}")
+        http_request.state.model = model.name
+        questions = body.get("questions")
+        if isinstance(questions, dict) and len(questions) > model.max_questions:
+            return JSONResponse(
+                {"detail": f"at most {model.max_questions} questions per request"},
+                status_code=400,
+            )
+        owner = getattr(http_request.state, "tenant", None) or "default"
+        admission = getattr(http_request.state, "tenant_admission", None)
+        if admission is not None:
+            admitted = admission.reserve_tokens(_work_bound(body), refundable_on_exact_usage=True)
+            metrics = getattr(http_request.app.state, "metrics", None)
+            if metrics is not None:
+                metrics.record_tenant_admission(
+                    owner, source="http", admitted=admitted, reason=admission.reason
+                )
+            if not admitted:
+                return _error(
+                    429,
+                    "rate_limit_error",
+                    f"tenant {owner!r} admission limit exceeded ({admission.reason})",
+                    retry_after="1",
+                )
+            http_request.state.tenant_metric_admitted = True
+        try:
+            reply = await model.backend.decide(body)
+        except SystemOneCapacityError as error:
+            return _error(429, "rate_limit_error", str(error), retry_after="1")
+        except SystemOneUnavailableError as error:
+            return _error(503, "api_error", f"inference backend unavailable: {error}", "2")
+        if reply.status == 200:
+            if reply.input_tokens is None:
+                # an answer that cannot be metered is not passed on unbilled
+                return _error(502, "api_error", "upstream answer has no valid usage")
+            # Only answered reads are billed; any other outcome leaves the
+            # reservation undispatched, so the tenant middleware refunds it.
+            if admission is not None:
+                admission.mark_dispatched()
+            record_state_usage(
+                http_request.app.state,
+                tenant=owner,
+                model=model.name,
+                prompt_tokens=reply.input_tokens,
+                completion_tokens=reply.output_tokens or 0,
+                reservation=admission,
+            )
+        return Response(reply.body, status_code=reply.status, headers=reply.headers)

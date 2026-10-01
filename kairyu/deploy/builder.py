@@ -37,6 +37,7 @@ from kairyu.engine.embedding import (
     MockEmbeddingBackend,
 )
 from kairyu.engine.registry import create_backend
+from kairyu.engine.systemone import HTTPSystemOneBackend
 from kairyu.engine.tokenizer import (
     TokenizerChatMetadata,
     load_tokenizer_chat_metadata,
@@ -44,6 +45,7 @@ from kairyu.engine.tokenizer import (
 from kairyu.entrypoints.chat_template import ChatTemplate
 from kairyu.entrypoints.server.app import create_app
 from kairyu.entrypoints.server.settings import ServerSettings
+from kairyu.entrypoints.server.systemone_service import SystemOneModel
 from kairyu.entrypoints.server.tenancy import TenantConfig, TenantLimits
 from kairyu.models.generation import validate_generation_config_mode
 from kairyu.orchestration.execution import HttpExecutionBackend
@@ -631,6 +633,25 @@ def build_app_from_spec(
         name: _create_embedding_backend(section, base_dir)
         for name, section in spec.embeddings.items()
     }
+    systemone_models = {
+        name: SystemOneModel(
+            name=name,
+            backend=HTTPSystemOneBackend(
+                base_url=section.base_url,
+                upstream_model=section.upstream_model,
+                api_key_env=section.api_key_env,
+                timeout_s=section.timeout_s,
+                max_concurrency=section.max_concurrency,
+                max_queue=section.max_queue,
+                queue_wait_s=section.queue_wait_s,
+            ),
+            aliases=section.aliases,
+            description=section.description,
+            max_questions=section.max_questions,
+            max_body_bytes=section.max_body_bytes,
+        )
+        for name, section in spec.systemone.items()
+    }
     engines: dict[str, EngineBackend] = {
         name: create_backend(entry.backend, **entry.options) for name, entry in spec.engines.items()
     }
@@ -858,6 +879,11 @@ def build_app_from_spec(
             if name in public_models
         }
     )
+    served_systemone = {
+        name: model
+        for name, model in systemone_models.items()
+        if public_models is None or name in public_models
+    }
     served_chat_templates = {
         name: template
         for name, template in chat_templates.items()
@@ -907,6 +933,7 @@ def build_app_from_spec(
             resources = list(engines.values())
             resources.extend(execution_backends.values())
             resources.extend(embedding_backends.values())
+            resources.extend(model.backend for model in systemone_models.values())
             if orchestrator is not None:
                 resources.append(orchestrator)
             resources.extend(orchestrators.values())
@@ -933,6 +960,7 @@ def build_app_from_spec(
         chat_templates=served_chat_templates,
         tenant_config=tenant_config,
         embedding_backends=served_embeddings,
+        systemone_models=served_systemone,
         resolved_api_keys=api_keys,
         resolved_admin_keys=admin_keys,
         resolved_responses_compaction_key=responses_compaction_key,

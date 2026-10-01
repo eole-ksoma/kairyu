@@ -132,6 +132,12 @@ from kairyu.entrypoints.server.sse_encode import (
     CompletionTextSSEEncoder,
 )
 from kairyu.entrypoints.server.sse_response import sse_response
+from kairyu.entrypoints.server.systemone_service import (
+    SYSTEMONE_PATH,
+    SystemOneModel,
+    add_systemone_route,
+    systemone_model_cards,
+)
 from kairyu.orchestration.orchestrator import (
     Orchestrator,
     OrchestratorExecutionError,
@@ -1894,6 +1900,7 @@ def create_app(
     orchestrators: Mapping[str, Orchestrator] | None = None,
     tenant_config=None,
     embedding_backends: Mapping[str, EmbeddingBackend] | None = None,
+    systemone_models: Mapping[str, SystemOneModel] | None = None,
     resolved_api_keys: frozenset[str] | None = None,
     resolved_admin_keys: frozenset[str] | None = None,
     resolved_responses_compaction_key: bytes | None = None,
@@ -1958,10 +1965,16 @@ def create_app(
     health_orchestrators = dict(
         auto_models if runtime_orchestrators is None else runtime_orchestrators
     )
+    served_systemone = dict(systemone_models or {})
+    systemone_names = {
+        name for model in served_systemone.values() for name in (model.name, *model.aliases)
+    }
     collisions = (
         (set(auto_models) & set(served_engines))
         | (set(served_embedding_backends) & set(served_engines))
         | (set(served_embedding_backends) & set(auto_models))
+        | (systemone_names & (set(served_engines) | set(auto_models)))
+        | (systemone_names & set(served_embedding_backends))
     )
     if collisions:
         raise ValueError(
@@ -2032,6 +2045,8 @@ def create_app(
         chat_dispatch=_responses_chat_dispatch,
         responses_compaction_key=responses_compaction_key,
     )
+    if served_systemone:
+        add_systemone_route(app, served_systemone)
 
     # add_middleware prepends, so add innermost first: metrics -> concurrency
     # guard -> auth -> access log (outermost).
@@ -2045,6 +2060,12 @@ def create_app(
         app.add_middleware(
             ChatBodyLimitMiddleware,
             limit=settings.max_chat_body_bytes,
+        )
+    if served_systemone:
+        app.add_middleware(
+            ChatBodyLimitMiddleware,
+            limit=max(model.max_body_bytes for model in served_systemone.values()),
+            paths=(SYSTEMONE_PATH,),
         )
     if metrics is not None:
         app.add_middleware(MetricsMiddleware, metrics=metrics)
@@ -2073,6 +2094,8 @@ def create_app(
             total_limit=settings.max_concurrency,
             wait_timeout_s=settings.admission_wait_timeout_s,
             metrics=metrics,
+            # System One backends own their admission (HTTPSystemOneBackend)
+            exempt_paths=(SYSTEMONE_PATH,) if served_systemone else (),
         )
     if tenant_config is not None:
         from kairyu.entrypoints.server.tenancy import (
@@ -2231,11 +2254,18 @@ def create_app(
         return None
 
     @app.get("/v1/models")
-    async def list_models() -> ModelList:
+    async def list_models():
         names = list(served_engines) + list(auto_models) + list(served_embedding_backends)
-        return ModelList(
+        listing = ModelList(
             data=[ModelCard(id=name, max_model_len=_served_max_model_len(name)) for name in names]
         )
+        if not served_systemone:
+            return listing
+        # Jev clients read {"models": [{"name"}]}, which lists every served
+        # model as a System One server does; System One models stay out of
+        # OpenAI's data list, which chat clients offer as chat models.
+        jev_cards = [*systemone_model_cards(served_systemone), *({"name": n} for n in names)]
+        return {**listing.model_dump(), "models": jev_cards}
 
     @app.get("/v1/models/{model_id:path}")
     async def retrieve_model(model_id: str):

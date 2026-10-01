@@ -97,7 +97,11 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 - Frontier full-checkpoint 262K/1M correctness/performance evidence, DeepSeek EP4/EP8 topology lock, CUDA Graph pointer stability, MTP/DSpark selection, 30-minute soak, and failure recovery remain open
 - NVLink-profile gates blocked on H100/A100-class hardware; PCIe-switch chassis and ≥400 Gb/s RDMA NICs gate E4/E5
 - G6 remaining P-C gates still in progress
-- Runner control plane: scale actuation (WP3.3), leader-token propagation to mutations (WP3.4), deployment wiring, durable Runner status, Kubernetes mutations and runtime instrumentation remain open; `kairyu/runners` has no serving caller yet
+- Runner autoscaling WP3.1–WP3.7 and model-cache WP4.1–WP4.7/D3.1–D3.20
+  are fail-closed and CPU-tested, including signed artifact identity, verified
+  node cache, fenced pre-stage/startup/admission, live PostgreSQL/Kubernetes/Kueue
+  authority, leader-fenced CRD publication, and production runtime assembly.
+  Deployment, runtime instrumentation, and live acceptance remain open.
 - Qwen3.8-Flash-Next MTP speculative decoding stays off in `qwen3.8-flash-next-dp2-8gpu` until upstream fixes vllm#53912 (prefix caching + MTP output corruption on hybrid GDN); single-stream decode 104 vs 175 tok/s
 - DTO-D15 (2026-08-26) changed the served tiered-example config: verify.sh coding/generic gates and the digest re-pin are pending before the example status can be claimed green again
 - Human sign-off pending on M2–M4 design reviews
@@ -116,6 +120,12 @@ in `.claude/rules/progress-log.md`).
 - What: G1 split per claim kind and calibrated on 600 human-labelled answers each (RAGTruth, PRM800K, FEVER) through the production state builder and questions; no kind meets alpha 0.10 held-out (accepted violation 15-40 %, AUROC 0.69-0.89). The G1 questions now report p with threshold 0 (`guarantee: advisory`).
 - Why: owner choice (option A) — the flag must claim only what is calibrated; RAGTruth counts unsourced true additions, OpenJev misses math errors and false facts.
 - Refs: `docs/design/example-verified-checklist-orchestration.md` VCO-D11, example `calibrate_g1.py`, `MEASUREMENTS.md`, PR #616
+
+### 2026-10-01 — [progress] Runner and model-cache authority rebased on current main
+- What: rebased WP3.3–WP3.7 and WP4.1–WP4.7/D3.1–D3.20 onto current main,
+  retaining the fail-closed authority, cache, admission, lifecycle, and tests.
+- Refs: `docs/design/runner-state-v1.md`;
+  `docs/design/node-model-cache-prestage-v1.md`; `kairyu/runners/`
 
 ### 2026-10-01 — [design] Checklist verifiers in L2; checklist-verified answers example
 - What: m1 D8: a verifier may judge with deterministic checks plus System One `noul` reads (Kairyu converts requirements into Jev questions with yes/no criteria and a JSON state), threshold verdicts, seeded targets with `refine_prompt`, inline claim roles, `on_unavailable: publish_unverified`, curation, internal `response_format`, `{conversation}`, and `kairyu_verification` on responses. m11 D8: System One `base_urls` replicas. New example `deepseek-v4.1-openjev-verified-8gpu`.

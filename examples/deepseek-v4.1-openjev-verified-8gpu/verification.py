@@ -910,12 +910,14 @@ def gate_implicit(env: dict[str, str], *, budget_s: float = 5400) -> None:
                             ),
                         }
                     ],
-                    "max_tokens": 4096,
+                    # A thinking judge: the chat-mode verdict missed coverage
+                    # spread over several conditions (VCO-D8 amendment).
+                    "max_tokens": 16384,
                     "temperature": 0.0,
-                    "chat_template_kwargs": {"enable_thinking": False},
+                    "reasoning_effort": "high",
                     "response_format": {"type": "json_object"},
                 },
-                timeout_s=600,
+                timeout_s=900,
             )
             flags = json.loads(body["choices"][0]["message"]["content"]).get("covered") or []
             hit = sum(1 for flag in flags if flag is True)

@@ -160,7 +160,15 @@ ones. The extractor now walks the situation (given material to keep, the
 audience, the medium's limits, real-world circumstances, produced
 artifacts) and leaves out what any ordinary reply meets by default. On a
 separate dev set written before the change (12 + 4 controls): recall 0.875
--> 0.917, controls 0.75 -> 0.00.
+-> 0.917, controls 0.75 -> 0.00. The next gate run reached controls 0.0
+but recall 0.600 while extraction plus Jev alone reached 0.825 on the same
+set: re-extraction (after a coverage gap or duplicate) rewrote the list
+without the implicit guidance and dropped the implicit conditions. The
+refine prompt now keeps every implicit condition the problems do not name
+and carries the same guidance. The gate's coverage judge now thinks: in
+chat mode it marked "every price is kept" uncovered next to three
+conditions keeping each price (thinking judge 0.900 vs 0.825 on the same
+lists).
 
 ### VCO-D9 — One effort for every DeepSeek step (2026-10-01)
 

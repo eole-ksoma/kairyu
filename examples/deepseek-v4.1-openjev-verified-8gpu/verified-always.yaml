@@ -161,12 +161,20 @@ roles:
       Rewrite the whole checklist so that every instruction unit is covered,
       every condition follows from its sources, and no two conditions require
       the same thing. Keep the same output format and the rules (origin
-      "explicit" for stated conditions, "implicit" only for conditions the
-      situation clearly presupposes): units are the
+      "explicit" for stated conditions, "implicit" for what the situation
+      presupposes): units are the
       smallest instructions of the request (system/developer instructions and
       the latest user message), conditions are checkable statements in the
       request's language, "deterministic" only with one of the primitives
       regex, not_regex, length, contains, not_contains, json_valid.
+      Keep every implicit condition of the previous checklist that the
+      problems do not name. Implicit conditions cover what this user would
+      count as a mistake although they never said it: material the user gave
+      that must be kept exactly or keep working; the audience's register and
+      wording; the medium's limits and conventions; real-world circumstances
+      named; that a produced artifact is valid and does what it is for. Never
+      add what any ordinary reply meets by default (answering in the
+      language of the request, addressing the question).
       Conditions must be satisfiable by an answer in the caller's output
       format: {response_format}
       Output only the JSON object.

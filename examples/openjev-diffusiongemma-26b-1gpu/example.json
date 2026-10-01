@@ -36,7 +36,7 @@
   },
   "openjev": {
     "image": "local/openjev:diffusiongemma-think512",
-    "image_id": null,
+    "image_id": "sha256:1c14bdf63a9be36a9ac8ae8f4500e372dae5921f9eb4f210f730074f01156c6b",
     "dockerfile": "openjev-think.Dockerfile",
     "base_image": "razorback16/openjev:0.5.1@sha256:65f88680e0093c9229d8cc55c0d2f279db27aba78a7ce74ea762b8f2da82d47d",
     "base_image_id": "sha256:b219be87fdde14896b0029edabe5586b2e99c89380784a9ec73f1405a0453757",

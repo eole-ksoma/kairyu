@@ -20,6 +20,7 @@ revisions pinned in example.json. Run from the repository root:
 from __future__ import annotations
 
 import io
+import itertools
 import json
 import os
 import socket
@@ -130,15 +131,17 @@ def check_template(tokenizer_dir: Path) -> dict:
         "enable_thinking": True,
     }
     for name, prefill in (("thought", OPEN), ("answer", f"{OPEN}{THOUGHT}\n{CLOSE}")):
-        for tools in (None, [BASH]):
-            messages = [*question, {"role": "assistant", "content": prefill}]
+        # vLLM's 'openai' content format sends the prefill as a list of text parts.
+        for tools, shape in itertools.product((None, [BASH]), ("string", "parts")):
+            content = prefill if shape == "string" else [{"type": "text", "text": prefill}]
+            messages = [*question, {"role": "assistant", "content": content}]
             try:
                 render(stock, messages, tools, **kwargs)
                 stock_outcome = "continued"
             except ValueError as error:
                 stock_outcome = f"refused: {str(error)[:60]}"
             rendered = render(edited, messages, tools, **kwargs)
-            prefills[f"{name} pass / tools={bool(tools)}"] = {
+            prefills[f"{name} pass / tools={bool(tools)} / {shape}"] = {
                 "stock": stock_outcome,
                 "edited_ends_at_prefill": rendered.rstrip().endswith(prefill.strip()),
             }

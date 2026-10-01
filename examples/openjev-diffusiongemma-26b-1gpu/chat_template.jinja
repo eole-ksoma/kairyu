@@ -313,9 +313,10 @@
                 {%- endfor -%}
             {%- endif -%}
 
+            {%- set final_prefill = role == 'model' and loop.last -%}
             {%- set captured_content -%}
             {%- if message['content'] is string -%}
-                {%- if role == 'model' and loop.last -%}
+                {%- if final_prefill -%}
                     {#- Kairyu example edit: a final assistant message is a prefill that
                         continue_final_message extends, so it is rendered verbatim and a
                         thought prefill survives (strip_thinking would remove it). -#}
@@ -328,7 +329,11 @@
             {%- elif message['content'] is sequence -%}
                 {%- for item in message['content'] -%}
                     {%- if item['type'] == 'text' -%}
-                        {%- if role == 'model' -%}
+                        {%- if final_prefill -%}
+                            {#- Kairyu example edit: the same prefill as text parts, the shape
+                                vLLM sends with its 'openai' content format. -#}
+                            {{- item['text'] -}}
+                        {%- elif role == 'model' -%}
                             {{- strip_thinking(item['text']) -}}
                         {%- else -%}
                             {{- item['text'] | trim -}}

@@ -64,19 +64,21 @@ def check_template(
         f"{think_core.THOUGHT_OPEN}probe\n{think_core.THOUGHT_CLOSE}",
     )
     for prefill in prefills:
-        rendered = tokenizer.apply_chat_template(
-            [PROBE_TURN, {"role": "assistant", "content": prefill}],
-            chat_template=template,
-            tokenize=False,
-            add_generation_prompt=False,
-            continue_final_message=True,
-            enable_thinking=True,
-        )
-        if not rendered.rstrip().endswith(prefill.strip()):
-            raise RuntimeError(
-                f"the chat template does not continue the prefill {prefill!r}: "
-                f"...{rendered[-120:]!r}"
+        # vLLM's 'openai' content format sends a string as a list of text parts.
+        for content in (prefill, [{"type": "text", "text": prefill}]):
+            rendered = tokenizer.apply_chat_template(
+                [PROBE_TURN, {"role": "assistant", "content": content}],
+                chat_template=template,
+                tokenize=False,
+                add_generation_prompt=False,
+                continue_final_message=True,
+                enable_thinking=True,
             )
+            if not rendered.rstrip().endswith(prefill.strip()):
+                raise RuntimeError(
+                    f"the chat template does not continue the prefill {content!r}: "
+                    f"...{rendered[-120:]!r}"
+                )
 
 
 def _json_answer(body: dict) -> dict:

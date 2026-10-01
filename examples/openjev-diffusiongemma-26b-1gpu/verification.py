@@ -60,6 +60,7 @@ LONG_THOUGHT = (
     "together with its square, one per line. Then answer: what is 400 squared? "
     "Reply with only the integer."
 )
+LONG_ANSWER = "Write out every integer from 1 to 2000 in order, one per line, with no other text."
 OPENJEV_PORT, VLLM_PORT = 8080, 8000
 
 
@@ -482,7 +483,9 @@ def _cancel_during(field: str) -> dict:
         "model": SERVED,
         "stream": True,
         "max_tokens": 8192,
-        "messages": [{"role": "user", "content": "Count upwards from one, one number per line."}],
+        # A long answer: a short one finishes in vLLM before its first chunk
+        # reaches the client, leaving nothing to cancel during the answer.
+        "messages": [{"role": "user", "content": LONG_ANSWER}],
     }
     request = urllib.request.Request(
         f"{_api_url()}/v1/chat/completions",
@@ -654,7 +657,7 @@ def systemone_serving(run_dir: Path) -> int:
             rows.append(row)
             print(json.dumps(row), flush=True)
             cases[name] = f"{len(bad)} failed: {bad[:3]}" if bad else None
-    (run_dir / "systemone-serving.json").write_text(json.dumps(rows, indent=2) + "\n")
+    (run_dir / "rows.json").write_text(json.dumps(rows, indent=2) + "\n")
     return _report(run_dir, "systemone-serving", cases)
 
 

@@ -610,8 +610,9 @@ quality-proxy), scoreboard JSON+md; offline unit test with mock targets.
 ### D8 — System One (Jev wire API) surface (amendment, 2026-10-01)
 
 Status: accepted by the owner (2026-10-01); CPU tests in
-`tests/server/test_systemone_api.py`; GPU gates in
-`examples/openjev-diffusiongemma-26b-1gpu`.
+`tests/server/test_systemone_api.py`; GPU-verified with OpenJev in
+`examples/openjev-diffusiongemma-26b-1gpu` (`systemone-live`,
+`systemone-serving`, `systemone-isolation`).
 
 Kairyu serves `POST /v1/systemone`, the System One API that TypeSafe's Jev,
 OpenJev and Codiv share: a `state` and typed `questions` in, per-question

@@ -314,7 +314,7 @@ runtime and performance claims.
 
 Status: accepted by the owner (plan
 `docs/superpowers/plans/2026-10-01-openjev-diffusiongemma-1gpu-example.md`);
-CPU evidence in the example's `MEASUREMENTS.md`; GPU gates pending.
+GPU-verified 2026-10-01 (every gate in the example's `MEASUREMENTS.md`).
 
 `examples/openjev-diffusiongemma-26b-1gpu` serves one replica on one selected
 GPU. The L1 is a third-party server, OpenJev (DiffusionGemma 26B-A4B NVFP4
@@ -326,8 +326,10 @@ configuration:
 - `health_url` set to OpenJev's `/health`, because Kairyu's default is
   `/readyz`;
 - the fields OpenJev drops silently listed in `deny_sampling_fields`;
-- `max_concurrency` set to OpenJev's 8 in flight plus 32 queued. OpenJev
-  answers 529 above that, and Kairyu counts a 529 as a replica failure.
+- `max_concurrency` set to OpenJev's generations in flight plus queued
+  (40; 32 + 8 after the L1-1 measurement, OpenJev's default is 8 + 32).
+  OpenJev answers 529 above that, and Kairyu counts a 529 as a replica
+  failure.
 
 Every chat completion thinks first, with a thought of at most 512 tokens
 that callers cannot disable or resize. vLLM's `thinking_token_budget` cannot

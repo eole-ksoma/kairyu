@@ -241,11 +241,14 @@ function renderAnswer(key, q, a) {
     box.append(bar("yes", a.noul, a.noul >= 0.5), bar("no", 1 - a.noul, a.noul < 0.5));
   } else {
     const probabilities = a.probabilities || {};
-    const value = q.type === "choice" ? a.choice : `${a.score.toFixed(2)} (${a.legend ?? ""})`;
+    // a score's probabilities and legend are keyed by level index ("0", "1", ...)
+    const legend = a.legend || {};
+    const value = q.type === "choice" ? a.choice
+      : `${a.score.toFixed(2)} (≈ ${legend[Math.round(a.score)] ?? Math.round(a.score)})`;
     box.append(el("h3", {}, el("span", {text: `${key} · ${q.instructions || ""}`}),
                      el("span", {class: "val", text: value})));
     const best = Math.max(...Object.values(probabilities));
-    for (const [name, p] of Object.entries(probabilities)) box.append(bar(name, p, p === best));
+    for (const [name, p] of Object.entries(probabilities)) box.append(bar(legend[name] ?? name, p, p === best));
     if (typeof a.confidence === "number") box.append(el("div", {class: "conf", text: `confidence ${a.confidence.toFixed(3)}`}));
   }
   return box;
@@ -374,7 +377,8 @@ async function init() {
   };
   $("run").onclick = run;
   const listing = await (await fetch("/v1/models")).json();
-  for (const card of listing.models || []) {
+  const chatIds = new Set((listing.data || []).map((card) => card.id));
+  for (const card of (listing.models || []).filter((card) => !chatIds.has(card.name))) {
     $("model").append(el("option", {value: card.name, text: card.name, title: card.description || ""}));
   }
   if (listing.data?.length) chatModel = listing.data[0].id;

@@ -113,14 +113,18 @@ reproduces the CPU evidence in `MEASUREMENTS.md`.
 - **OpenJev settings** (`example.json` `openjev.settings`): OpenJev's own
   defaults, which are canvas 64, 64 sequences, a 65,536-token context, 0.9
   GPU memory, and an 8,192-token answer cap.
-- **Concurrency.** OpenJev runs 8 generations and queues 32 more. Above
-  that it answers 529, which Kairyu counts as a failure of the only replica.
-  Kairyu therefore admits at most 40 requests and answers 429 first.
-  `OPENJEV_GEN_MAX_INFLIGHT` and `OPENJEV_GEN_MAX_QUEUE` may be overridden
-  for tuning, but `control.py` refuses any pair whose sum is not 40.
-- **System One.** OpenJev's System One API (`/v1/systemone`) stays inside
-  the compose network. Kairyu serves the chat model only.
+- **Concurrency.** OpenJev runs 32 generations and queues 8 more (its
+  default is 8 and 32; 32 in flight measured +32 % output tok/s at c32 and
+  no loss at c1, see `MEASUREMENTS.md`). Above that it answers 529, which
+  Kairyu counts as a failure of the only replica. Kairyu therefore admits at
+  most 40 chat requests and answers 429 first. `OPENJEV_GEN_MAX_INFLIGHT`
+  and `OPENJEV_GEN_MAX_QUEUE` may be overridden for tuning, but `control.py`
+  refuses any pair whose sum is not 40.
+- **System One.** See [System One and the playground](#system-one-and-the-playground).
 - **Known limits.**
+  - About 1 in 1,800 coding answers repeats one character until the answer
+    cap (`MEASUREMENTS.md`, D2); it reproduced on neither the overlay nor
+    the stock image in 1,536 direct requests.
   - Kairyu's legacy chat path sends text-only history as one transcript
     message.
   - `/v1/messages/count_tokens` returns 404, because OpenJev has no

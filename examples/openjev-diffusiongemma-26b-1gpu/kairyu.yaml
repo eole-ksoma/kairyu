@@ -2,7 +2,7 @@ server:
   host: 0.0.0.0
   port: 8000
   api_keys_env: null
-  # OpenJev runs 8 generations and queues 32 more, then answers 529, which
+  # OpenJev runs 32 generations and queues 8 more, then answers 529, which
   # Kairyu counts as a failure of the only replica. At 40 in flight Kairyu
   # answers 429 first. control.py keeps OpenJev's in-flight + queue at this sum.
   max_concurrency: 40

@@ -73,7 +73,7 @@ def _invalid(loc: list, kind: str, message: str) -> JSONResponse:
     return JSONResponse({"detail": [{"type": kind, "loc": loc, "msg": message}]}, status_code=422)
 
 
-_WHOLE_NUMBER = re.compile(r"\s*[+-]?\d+(\.0*)?\s*")
+_WHOLE_NUMBER = re.compile(r"\s*([+-]?\d+)(\.0*)?\s*")
 
 
 def _whole_number(value: object) -> int | None:
@@ -85,8 +85,14 @@ def _whole_number(value: object) -> int | None:
         return value
     if isinstance(value, float) and value.is_integer():
         return int(value)
-    if isinstance(value, str) and _WHOLE_NUMBER.fullmatch(value):
-        return int(float(value))
+    match = _WHOLE_NUMBER.fullmatch(value) if isinstance(value, str) else None
+    if match is not None:
+        # the digits themselves, never through float (which overflows to inf);
+        # int() refuses strings past Python's digit limit with ValueError
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
     return None
 
 

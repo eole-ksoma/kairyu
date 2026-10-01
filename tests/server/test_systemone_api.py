@@ -146,6 +146,11 @@ async def test_systemone_admission_is_bounded_and_separate_from_chat():
          {"authorization": "Bearer k"},
          422, [{"type": "int_parsing", "loc": ["body", "samples"],
                 "msg": "Input should be a valid integer"}]),
+        # past float's range and Python's int digit limit: still a 422, not a 500
+        ({"model": "openjev-0.1", "state": "s", "questions": QUESTIONS, "samples": "9" * 5000},
+         {"authorization": "Bearer k"},
+         422, [{"type": "int_parsing", "loc": ["body", "samples"],
+                "msg": "Input should be a valid integer"}]),
         ({"model": "openjev-0.1", "state": "s", "questions": QUESTIONS}, {},
          401, {"error_type": "authentication_error", "message": "missing or invalid API key"}),
     ],

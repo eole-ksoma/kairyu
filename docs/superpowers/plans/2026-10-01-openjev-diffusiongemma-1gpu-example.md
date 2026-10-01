@@ -177,6 +177,6 @@ limitations go in `MEASUREMENTS.md`.
 ## Checklist
 
 - [x] Owner approves this plan.
-- [ ] Branch, example files and example-owned scripts, CPU tests, lint, CPU evidence.
+- [x] Branch, example files and example-owned scripts, CPU tests, lint, CPU evidence.
 - [ ] L1-0 and L1-1 on the GPU host; record every candidate.
 - [ ] Final gates; MEASUREMENTS.md; FN-D9 amendment status; PROGRESS.md.

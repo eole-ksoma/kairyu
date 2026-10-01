@@ -309,3 +309,46 @@ FlashInfer JIT caches are removed so the patched kernels are the ones
 compiled; a NaN-poisoned masked slot in the kernel gate catches a shadowed
 kernel. Only SHA-bound rows in the example's `MEASUREMENTS.md` establish
 runtime and performance claims.
+
+### OpenJev DiffusionGemma one-GPU amendment (2026-10-01)
+
+Status: accepted by the owner (plan
+`docs/superpowers/plans/2026-10-01-openjev-diffusiongemma-1gpu-example.md`);
+CPU evidence in the example's `MEASUREMENTS.md`; GPU gates pending.
+
+`examples/openjev-diffusiongemma-26b-1gpu` serves one replica on one selected
+GPU. The L1 is a third-party server, OpenJev (DiffusionGemma 26B-A4B NVFP4
+on vLLM `1b3b88ec`, behind OpenJev's OpenAI-style chat endpoint). L2/L3 are
+the single-replica structure: one ReplicaPool replica, the legacy OpenAI
+chat/tool path, image admission, and Open WebUI. Kairyu (`kairyu/`) is not
+changed. The replica needs only configuration:
+
+- `health_url` set to OpenJev's `/health`, because Kairyu's default is
+  `/readyz`;
+- the fields OpenJev drops silently listed in `deny_sampling_fields`;
+- `max_concurrency` set to OpenJev's 8 in flight plus 32 queued. OpenJev
+  answers 529 above that, and Kairyu counts a 529 as a replica failure.
+
+Every chat completion thinks first, with a thought of at most 512 tokens
+that callers cannot disable or resize. vLLM's `thinking_token_budget` cannot
+enforce this: DiffusionGemma replaces the sampler with `DiffusionSampler`,
+which never applies `ThinkingBudgetState`. The example therefore applies
+OpenJev's own System One `think` method to chat, as an L1 overlay that the
+example owns (a reasoning budget and a runtime adaptation, both example
+policy):
+
+- A thought pass continues an assistant prefill `<|channel>thought\n` with
+  `max_tokens: 512` and a stop on `<channel|>`.
+- An answer pass continues after the closed thought.
+- One generation slot covers both passes.
+- The overlay publishes only the capped first-pass thought as reasoning.
+- A failure after the thought has streamed aborts the stream rather than
+  ending it, because Kairyu ignores mid-stream error chunks.
+
+The checkpoint's chat template strips thoughts from every assistant message,
+so `continue_final_message` cannot continue a prefill. The example's template
+renders only a final assistant message verbatim. With the checkpoint
+tokenizer, every other conversation renders byte for byte like the stock
+template. At startup the overlay refuses to run unless vLLM uses that
+template and it continues both prefills. Only SHA-bound rows in the
+example's `MEASUREMENTS.md` establish runtime and performance claims.

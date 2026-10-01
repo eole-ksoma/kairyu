@@ -17,7 +17,7 @@ model-volumes/<environment>/results/<gate>-<UTC>.json.
   serving       end-to-end latency, tokens and guarantee rate at c1/c4/c8/c16
                 (all of the above use kairyu-verified-always)
   routing       Jev routes accuracy-critical conversations to the verified DAG
-  think-route   everyday requests stream from deepseek_think with reasoning
+  think-route   everyday requests stream from deepseek_think at the default effort
   effort        the caller's effort reaches every DeepSeek step on both routes
   implicit      situational requirements are extracted and kept only when expected
   serving-routed  kairyu-verified under load: route mix, latency, tokens per route
@@ -771,7 +771,13 @@ def gate_routing(env: dict[str, str], *, budget_s: float = 1800) -> None:
 
 
 def gate_think_route(env: dict[str, str], *, budget_s: float = 1800) -> None:
-    """Everyday requests stream from the think route with visible reasoning."""
+    """Everyday requests stream from the think route at the default effort.
+
+    The publisher's private reasoning is withheld by Kairyu's multi-stage
+    contract (as on the sibling ensemble's deepseek_think route), so the gate
+    checks the route, a streamed answer with its time to first token, no
+    guarantee field, and that DeepSeek ran at the default effort (high).
+    """
 
     deadline = Deadline("think-route", budget_s)
     items = [item for item in _dataset("routing-set.json") if item["label"] == "THINK"][:6]
@@ -782,27 +788,20 @@ def gate_think_route(env: dict[str, str], *, budget_s: float = 1800) -> None:
     deadline.check()
     findings = []
     for row in rows:
-        if row["status"] != 200 or not row["content"].strip():
+        if row["status"] != 200 or not row["content"].strip() or row["ttft_s"] is None:
             findings.append(f"status={row['status']} empty={not row['content'].strip()}")
-        elif row["route"] == "deepseek_think" and (
-            row["has_verification"] or not row["reasoning_chars"]
-        ):
+        elif row["route"] != "deepseek_think":
+            findings.append(f"everyday request routed to {row['route']}")
+        elif row["has_verification"] or row["efforts"] != ["high"]:
             findings.append(
-                f"think route: verification={row['has_verification']} "
-                f"reasoning={row['reasoning_chars']}"
+                f"think route: verification={row['has_verification']} efforts={row['efforts']}"
             )
-    think = [row for row in rows if row["route"] == "deepseek_think"]
-    if not think:
-        findings.append("no everyday request took the think route")
     _print_rows(rows)
+    ttfts = [row["ttft_s"] for row in rows if row["ttft_s"] is not None]
     summary = {
         **_summary(rows),
-        "think_routed": len(think),
-        "ttft_p50_s": statistics.median(
-            [row["ttft_s"] for row in think if row["ttft_s"] is not None]
-        )
-        if think
-        else None,
+        "think_routed": sum(1 for row in rows if row["route"] == "deepseek_think"),
+        "ttft_p50_s": statistics.median(ttfts) if ttfts else None,
     }
     print(json.dumps(summary, indent=2), flush=True)
     _write(

@@ -1431,11 +1431,15 @@ def test_postgres_retention_rejects_non_boolean_dry_run(store_factory) -> None:
 async def test_async_worker_renews_and_publishes_through_postgres(store_factory) -> None:
     create, _store_id = store_factory
     store = create()
-    backend = MockBackend(responses={"hello": "postgres result"}, latency_s=0.25)
+    # Inference outlasts the lease, so the result publishes only if renewals
+    # land. A 0.15 s lease left a slow CI runner's renewal round trip no
+    # margin (the lease expired and the request stayed RUNNING); 1 s keeps
+    # the renewal cadence at lease / 3 with room for a slow PostgreSQL.
+    backend = MockBackend(responses={"hello": "postgres result"}, latency_s=1.5)
     worker = AsyncRequestWorker(
         store,
         {"m": backend},
-        lease_seconds=0.15,
+        lease_seconds=1.0,
         legacy_chat_models={"m"},
     )
     request = store.submit(

@@ -20,6 +20,10 @@ have a one-sided 95 % Clopper-Pearson upper bound on the violation rate <=
 alpha on the calibration half; the held-out half (split by problem, source
 document or Wikipedia page) is reported unchanged and is the gate.
 
+Result (2026-10-02, VCO-D11): no kind reaches alpha = 0.10 on held-out
+labels, so the G1 questions are advisory (threshold 0) in verified.yaml; the
+gate passes only if a future judge or wording makes every kind calibratable.
+
 Usage: ./verify.sh calibrate-g1   (after ./run.sh up)
 """
 

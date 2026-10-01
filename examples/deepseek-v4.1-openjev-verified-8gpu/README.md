@@ -4,7 +4,7 @@ Every answer comes back with a guarantee flag. The flag is on only when the
 answer passed every requirement of a checklist that was confirmed necessary,
 sufficient and mutually exclusive with respect to the request; otherwise the
 best available answer is returned with the flag off and the reason.
-Design: `docs/design/example-verified-checklist-orchestration.md` (VCO-D1..D6);
+Design: `docs/design/example-verified-checklist-orchestration.md` (VCO-D1..D11);
 framework mechanisms: m1 D8 and the m11 D8 replica amendment.
 
 | Layer | What runs here |
@@ -52,7 +52,10 @@ curl -s http://127.0.0.1:8013/v1/chat/completions -H 'Content-Type: application/
 `kairyu_verification`:
 
 - `guaranteed: true` — every requirement passed; `requirements[]` lists each
-  one with `p`, its source instruction units and kind.
+  one with `p`, its source instruction units and kind. Items tagged
+  `guarantee: advisory` (G1-source, G1-computation, G1-general: OpenJev's
+  per-claim support) are shown with their `p` but never block the flag:
+  they failed calibration on human labels (VCO-D11).
 - `guaranteed: false` with `reason`:
   - `refinement_limit`: two repairs did not pass; the newest version that
     passed the deterministic checks is returned.
@@ -60,9 +63,6 @@ curl -s http://127.0.0.1:8013/v1/chat/completions -H 'Content-Type: application/
     overloaded); the generator's draft is returned as-is.
   - `checklist_unavailable`: the checklist could not be built or exceeded
     OpenJev's input window; the draft is returned.
-  - `requirements_unconfirmed`: the requirement checklist still left an
-    instruction unit uncovered after re-extraction and curation, so passing
-    it would prove nothing; the answer is returned without a guarantee.
   - `requirements_unconfirmed`: the requirement checklist still left an
     instruction unit uncovered after re-extraction and curation, so passing
     it would prove nothing; the answer is returned without a guarantee.
@@ -76,3 +76,7 @@ requirement table; internal stages are folded below the answer.
 - Tool-calling turns are not this example's surface (tools are context only).
 - Only τ_hi is calibrated (InFoBench, α = 0.10); the 0.5 thresholds of the
   requirement confirmation are defaults.
+- Claim-level groundedness is advisory: `./verify.sh calibrate-g1` found no
+  threshold meeting α = 0.10 on RAGTruth, PRM800K or FEVER (MEASUREMENTS.md),
+  so a guaranteed answer can still contain an unsupported claim that the
+  deterministic checks (G1-excerpts, G2, G3) do not catch.

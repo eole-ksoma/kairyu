@@ -66,8 +66,9 @@ uncovered unit with "the answer responds to this part of the request: <unit>".
 
 Request-independent requirements have their own ids and never overlap the
 extracted ones: G1 groundedness (material-based claims quote the material
-verbatim — `G1-excerpts`, deterministic — and every claim is supported —
-OpenJev per claim, minimum), G2 execution claims (an "action" claim's
+verbatim — `G1-excerpts`, deterministic — and, advisory only since
+VCO-D11, every claim is supported — OpenJev per claim kind, minimum), G2
+execution claims (an "action" claim's
 evidence must appear in the conversation, i.e. its tool call and result),
 G3 quotations in the answer appear in the conversation.
 
@@ -77,7 +78,8 @@ The Validator is the deterministic half of `checklist`: extracted
 `deterministic` conditions (an unusable primitive falls back to an OpenJev
 read of the proposition), G3 before the state builder, G1-excerpts and G2
 after it. Any violation goes to repair without an OpenJev read. The Conductor
-passes an attempt only when every item has p >= tau_hi (a check is 1 or 0).
+passes an attempt only when every item has p >= tau_hi (a check is 1 or 0);
+the advisory per-claim G1 items (VCO-D11) are reported but do not gate.
 Because the checklist was confirmed sufficient, every item passing means the
 request was met.
 
@@ -106,8 +108,8 @@ not lower the violation rate: smaller states, one question per read,
 stricter criteria, `steps`/`samples`, atomized requirements, and `think`
 all scored equal or worse AUROC (MEASUREMENTS.md).
 
-Limitation: InFoBench has no source material, so G1 uses the same tau_hi
-without its own calibration.
+Limitation: InFoBench has no source material, so G1 was not covered by this
+calibration; VCO-D11 measured it separately and made it advisory.
 
 ### VCO-D5 — Fallback
 
@@ -165,6 +167,36 @@ curation blocks the guarantee (`requirements_unconfirmed`); deterministic
 conditions are never merged; execution claims need tool-result evidence;
 `n > 1` is refused on the verified models.
 
+### VCO-D11 — Per-claim G1 is advisory (2026-10-02)
+
+Owner request: calibrate G1 on its own, per claim kind, at alpha = 0.10
+(95 %, answer level). `calibrate_g1.py` ran the production state builder
+(high effort) and the production G1 questions on 600 human-labelled answers
+per kind, split by problem / document / page: RAGTruth for source and
+action claims (any hallucination span), PRM800K phase 2 for computation (a
+-1 step; 300 + 300 balanced), FEVER for general knowledge (REFUTES).
+
+| Kind | AUROC | accepted at p >= 0.99 | violated |
+|---|---:|---:|---:|
+| G1-source (RAGTruth) | 0.694 | 157 | 37 (23.6 %) |
+| G1-computation (PRM800K) | 0.704 | 185 | 74 (40.0 %) |
+| G1-general (FEVER) | 0.893 | 251 | 38 (15.1 %) |
+
+No threshold reaches alpha on source and computation; general reaches it on
+the calibration half (tau 0.99926, 89 accepted, 4 violated) but not on the
+held-out half (99 accepted, 15 violated, upper bound 0.224). Causes seen in
+the data: RAGTruth counts true but unsourced additions as hallucinations
+while G1 accepts well-established knowledge; OpenJev does not detect
+arithmetic and reasoning errors; OpenJev is confident on false facts.
+
+Owner decision (option A): the per-claim G1 questions stay, split by kind,
+with threshold 0 and tag `guarantee: advisory`. Their p is reported in
+`kairyu_verification`, the Verification section and the answer page, but
+they neither repair nor block the guarantee. The guarantee covers the
+calibrated requirements (tau_hi) and the deterministic G1-excerpts, G2 and
+G3. Also observed: 12 of 1,800 state-builder outputs were truncated JSON
+(runaway newlines), which serving reports as `checklist_unavailable`.
+
 ## Limitations
 
 - A guaranteed answer is not streamed before its checklist finishes (time to
@@ -175,3 +207,5 @@ conditions are never merged; execution claims need tool-result evidence;
   requests are not measured by it.
 - Thresholds other than tau_hi (0.5 for necessity, sufficiency and
   exclusivity) are defaults, not calibrated.
+- Claim-level groundedness is advisory (VCO-D11): a guaranteed answer can
+  still contain an unsupported claim that no deterministic check catches.

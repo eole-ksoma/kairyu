@@ -105,6 +105,7 @@ def _openjev(
     sufficiency: float = 0.9999,
     needs: str | None = None,
     unneeded: str | None = None,
+    claim: float = 0.9999,
 ):
     def answer(question: dict, state: dict) -> dict:
         text = json.dumps(question)
@@ -121,6 +122,8 @@ def _openjev(
             return {"noul": sufficiency}
         if unneeded is not None and unneeded in text and "ask for this condition" in text:
             return {"noul": 0.4}
+        if "Is this claim of the answer supported?" in text:
+            return {"noul": claim}
         return {"noul": 0.9999}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -152,6 +155,7 @@ def _orchestrator(
     needs: str | None = None,
     unneeded: str | None = None,
     draft_finish: str = "stop",
+    claim: float = 0.9999,
 ):
     deployment = load_deployment_spec(
         (EXAMPLE / "kairyu.yaml").read_text(), resolve_credentials=False
@@ -178,6 +182,7 @@ def _orchestrator(
                     sufficiency=sufficiency,
                     needs=needs,
                     unneeded=unneeded,
+                    claim=claim,
                 )
             ),
         )
@@ -252,6 +257,22 @@ async def test_a_one_word_draft_is_published_with_a_guarantee() -> None:
     answer_read = next(read for read in reads if "answer" in read["state"])
     assert answer_read["state"]["conversation"][-1]["role"] == "user"
     assert answer_read["state"]["checklist"]["requirements"][0]["id"] == "R1"
+
+
+async def test_uncalibrated_claim_support_is_reported_but_never_blocks_the_guarantee() -> None:
+    # VCO-D11: OpenJev's per-claim G1 p failed calibration on human labels,
+    # so it is advisory: shown to the caller, never a repair or a lost flag.
+    seen: list[dict] = []
+    reads: list[dict] = []
+    orchestrator = _orchestrator(seen, reads, draft="Paris", claim=0.2)
+
+    result = await orchestrator.run(_call("Name the capital of France in one word."))
+
+    report = result.verification.as_dict()
+    assert report["guaranteed"] is True and result.verification.attempts == 1
+    g1 = next(item for item in report["requirements"] if item["id"] == "G1-general")
+    assert g1["p"] == pytest.approx(0.2) and g1["tags"]["guarantee"] == "advisory"
+    assert not any(_text(body).startswith("[repair]") for body in seen)
 
 
 async def test_a_deterministic_violation_is_repaired_then_guaranteed() -> None:

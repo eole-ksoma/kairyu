@@ -97,6 +97,34 @@ Result (alpha = 0.10, 95 % confidence): **tau_hi = 0.9966**.
 Held-out answers: 54 / 125 pass every requirement; 10 of them carry at least
 one labelled violation.
 
+## Per-claim G1 calibration (2026-10-02, VCO-D11)
+
+`./verify.sh calibrate-g1`: 600 human-labelled answers per claim kind, the
+production state builder (DeepSeek, high effort, claims grammar) and the
+production G1 questions read by both OpenJev replicas through `ChecklistRun`.
+Split by problem / source document / Wikipedia page (seed 20261001). Raw rows:
+`results/g1-calibration-20261001T161504Z.json`, `calibration/g1/tau.json`.
+
+| Kind (data) | answers (violated) | AUROC | tau 0.9 acc / viol | tau 0.99 acc / viol | tau 0.999 acc / viol | calibrated tau | held-out |
+|---|---|---:|---|---|---|---|---|
+| G1-source (RAGTruth, any span) | 599 (237) | 0.694 | 173 / 41 | 157 / 37 | 141 / 33 | none | — |
+| G1-computation (PRM800K phase 2, a -1 step; balanced) | 595 (299) | 0.704 | 198 / 78 | 185 / 74 | 178 / 69 | none | — |
+| G1-general (FEVER dev, REFUTES) | 594 (293) | 0.893 | 296 / 53 | 251 / 38 | 197 / 22 | 0.99926 (89 acc, 4 viol, ub 0.0999) | 99 acc, 15 viol, ub 0.224: FAIL |
+
+Answers passing every G1 kind at p >= 0.99: RAGTruth 138 (22 violated),
+PRM800K 196 (75), FEVER 254 (38). Accepted RAGTruth violations are mostly
+"Baseless Info" (45 spans) rather than "Conflict" (9): true but unsourced
+additions that G1's "well-established knowledge" accepts. Accepted PRM800K
+violations list the erroneous step as a claim and OpenJev calls it
+supported; FEVER violations include "Fringe debuted in 2011" at p 0.9996.
+Outcome (owner option A): the G1 questions are advisory (threshold 0).
+
+Cost: 1,800 state-builder calls, 10,557 / 8,404 / 422 median output tokens
+(RAGTruth / PRM800K / FEVER; 91 % thinking), p50 142 / 110 / 8 s at 32 in
+flight, 74 tok/s per request, 2,370-2,500 tok/s DeepSeek generation, DSpark
+acceptance 57-61 %; about 85 minutes in all. 12 state-builder outputs (0.7 %)
+were truncated JSON (runaway newlines) and are excluded.
+
 ## GPU gates on the final code (2026-10-01, `5b455dd8` plus the G3/report fixes)
 
 Raw rows: `results/{structured,requirements,serving}-2026100*T11*Z.json`,

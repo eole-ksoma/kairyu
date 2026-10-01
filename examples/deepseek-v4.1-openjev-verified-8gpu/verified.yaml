@@ -432,15 +432,17 @@ roles:
           tags: {origin: "{item[origin]}"}
           context:
             instruction_units: "{item[sources]}"
-        # G1, one requirement per claim kind, each with its own threshold
-        # (calibrate_g1.py, alpha = 0.10 at 95 %, answer level). The two
-        # G1-source questions are one requirement: p is their minimum.
+        # G1 per claim kind: advisory. OpenJev's per-claim p is reported but
+        # never blocks the guarantee (threshold 0): on human labels (RAGTruth,
+        # PRM800K, FEVER; calibrate_g1.py) no threshold kept accepted answers'
+        # violation rate <= alpha (VCO-D11). Grounding is guaranteed by the
+        # deterministic G1-excerpts, G2 and G3. The two G1-source questions
+        # are one item: p is their minimum.
         - id: G1-source
-          tags: {origin: common}
-          proposition: every material-based claim in the answer is grounded
+          tags: {origin: common, guarantee: advisory}
+          proposition: (advisory, uncalibrated) every material-based claim in the answer is grounded
           foreach: {role: state_builder, path: claims, where: {basis: source}}
-          # RAGTruth
-          threshold: 0.9966
+          threshold: 0.0
           ask: Is this claim of the answer supported?
           criteria_true: >-
             Its evidence states it (source or action claim), it follows correctly
@@ -452,11 +454,10 @@ roles:
             basis: "{item[basis]}"
             evidence: "{item[evidence]}"
         - id: G1-source
-          tags: {origin: common}
-          proposition: every material-based claim in the answer is grounded
+          tags: {origin: common, guarantee: advisory}
+          proposition: (advisory, uncalibrated) every material-based claim in the answer is grounded
           foreach: {role: state_builder, path: claims, where: {basis: action}}
-          # RAGTruth (same requirement)
-          threshold: 0.9966
+          threshold: 0.0
           ask: Is this claim of the answer supported?
           criteria_true: >-
             Its evidence states it (source or action claim), it follows correctly
@@ -468,11 +469,10 @@ roles:
             basis: "{item[basis]}"
             evidence: "{item[evidence]}"
         - id: G1-computation
-          tags: {origin: common}
-          proposition: every derived claim in the answer is correct
+          tags: {origin: common, guarantee: advisory}
+          proposition: (advisory, uncalibrated) every derived claim in the answer is correct
           foreach: {role: state_builder, path: claims, where: {basis: computation}}
-          # PRM800K
-          threshold: 0.9966
+          threshold: 0.0
           ask: Is this claim of the answer supported?
           criteria_true: >-
             Its evidence states it (source or action claim), it follows correctly
@@ -484,11 +484,10 @@ roles:
             basis: "{item[basis]}"
             evidence: "{item[evidence]}"
         - id: G1-general
-          tags: {origin: common}
-          proposition: every general-knowledge claim in the answer is true
+          tags: {origin: common, guarantee: advisory}
+          proposition: (advisory, uncalibrated) every general-knowledge claim in the answer is true
           foreach: {role: state_builder, path: claims, where: {basis: general}}
-          # FEVER
-          threshold: 0.9966
+          threshold: 0.0
           ask: Is this claim of the answer supported?
           criteria_true: >-
             Its evidence states it (source or action claim), it follows correctly

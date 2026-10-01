@@ -8,7 +8,8 @@ model-volumes/<environment>/results/<gate>-<UTC>.json.
   l1            DeepSeek grammar-constrained JSON on every DP rank (thinking and
                 chat) and System One on each OpenJev replica
   calibrate     tau_hi on InFoBench expert labels (calibrate.py)
-  calibrate-g1  per-kind G1 thresholds on RAGTruth / PRM800K / FEVER (calibrate_g1.py)
+  calibrate-g1  can per-claim G1 be calibrated (RAGTruth / PRM800K / FEVER)? today:
+                no, so G1 is advisory (calibrate_g1.py, VCO-D11)
   requirements  extracted checklists cover InFoBench's gold decomposed questions
   repair        constraint-heavy requests: repairs happen and every guaranteed
                 answer meets the stated constraint (independent check)

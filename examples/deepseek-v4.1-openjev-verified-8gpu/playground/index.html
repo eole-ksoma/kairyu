@@ -35,6 +35,7 @@
   th { color:var(--muted); font-weight:500; }
   td.p { font-variant-numeric:tabular-nums; white-space:nowrap; }
   .fail { color:var(--bad); }
+  .advisory { color:var(--muted); }
   details pre { white-space:pre-wrap; overflow-wrap:anywhere; font-size:13px; color:var(--muted); }
   .err { color:var(--bad); }
   .table-wrap { overflow-x:auto; }
@@ -63,7 +64,6 @@ const REASONS = {
   judge_unavailable: "The judge (OpenJev) was unavailable: the unverified draft",
   checklist_unavailable: "The checklist could not be built or judged: the unverified draft",
   requirements_unconfirmed: "The requirement checklist could not be confirmed sufficient: no guarantee",
-  requirements_unconfirmed: "The requirement checklist could not be confirmed sufficient: no guarantee",
   budget: "The orchestration budget ran out: the unverified draft",
 };
 function render(body, seconds) {
@@ -81,9 +81,12 @@ function render(body, seconds) {
   if (v && v.requirements?.length) {
     html += '<div class="card"><strong>Requirements</strong><div class="table-wrap"><table><tr><th>ID</th><th>Requirement</th><th>Kind</th><th>Units</th><th>p</th></tr>';
     for (const r of v.requirements) {
-      html += `<tr class="${r.passed ? "" : "fail"}"><td>${esc(r.id)}</td><td>${esc(r.proposition)}</td>`
+      // Advisory items (uncalibrated G1) are shown with their p but never gate the guarantee.
+      const advisory = r.tags?.guarantee === "advisory";
+      const mark = advisory ? "advisory" : r.passed ? "✓" : "✗";
+      html += `<tr class="${r.passed ? "" : "fail"}${advisory ? " advisory" : ""}"><td>${esc(r.id)}</td><td>${esc(r.proposition)}</td>`
         + `<td>${esc(r.kind)}</td><td>${esc((r.sources || []).join(", "))}</td>`
-        + `<td class="p">${r.judged === false ? "not judged" : `${Number(r.p).toFixed(3)} ${r.passed ? "✓" : "✗"}`}</td></tr>`;
+        + `<td class="p">${r.judged === false ? "not judged" : `${Number(r.p).toFixed(3)} ${mark}`}</td></tr>`;
     }
     html += "</table></div></div>";
   }

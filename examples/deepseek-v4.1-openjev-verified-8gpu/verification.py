@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import hashlib
 import json
 import random
 import re
@@ -316,13 +317,26 @@ CHECKLIST:
 {checklist}"""
 
 
+def _build_key() -> str:
+    """The served code and configuration: commit, uncommitted diff, example configs."""
+
+    root = HERE.parents[1]
+    digest = hashlib.sha256()
+    for command in (["git", "rev-parse", "HEAD"], ["git", "diff", "HEAD"]):
+        digest.update(subprocess.run(command, cwd=root, capture_output=True, check=True).stdout)
+    for name in ("kairyu.yaml", "verified.yaml", "verified-always.yaml"):
+        digest.update((HERE / name).read_bytes())
+    return digest.hexdigest()[:12]
+
+
 def gate_requirements(env: dict[str, str], *, count: int = 40, budget_s: float = 7200) -> None:
     """Sufficiency: the judged checklist covers InFoBench's gold questions."""
 
     deadline = Deadline("requirements", budget_s)
     rows = infobench(count, seed=1)
-    # Answers are kept so a failed coverage pass does not repeat generation.
-    answers = _results_dir() / f"requirements-answers-{count}.json"
+    # Answers are kept so a failed coverage pass does not repeat generation,
+    # but only for the code and configuration that produced them.
+    answers = _results_dir() / f"requirements-answers-{count}-{_build_key()}.json"
     if answers.is_file():
         results = json.loads(answers.read_text(encoding="utf-8"))
     else:

@@ -111,15 +111,26 @@ roles:
       the answer, in the language of the request. These conditions have
       origin "explicit".
 
-      Step 3. Add the conditions the request does not state but clearly
-      presupposes in its situation, with origin "implicit": what any competent
-      answer to this exact request is expected to respect even though nobody
-      said it (for example a polite register for a message to a superior,
-      keeping a function's signature when fixing its body, keeping every
-      number when translating a menu, answering in the user's language). Give
-      each the instruction units it belongs to as sources. Do not restate an
-      explicit condition, do not add general quality wishes ("is helpful",
-      "is accurate"), and add none when the situation presupposes nothing.
+      Step 3. Add the conditions the request does not state but its
+      situation presupposes, with origin "implicit": what this user would
+      count as a mistake although they never said it. Go through:
+      - material the user gave (numbers, names, dates, amounts, owners,
+        identifiers, code): what must be kept exactly, or keep working, when
+        the request transforms, shortens, summarizes or rewrites it;
+      - the audience and relationship (a superior, a customer, a child, end
+        users, a beginner): register, wording, what to explain or leave out;
+      - the medium or target (an email, a post, a card, a query, a language
+        or version): its limits and conventions;
+      - the real-world circumstances named (place, season, health, occasion):
+        what they rule in or out;
+      - an artifact the answer produces (code, a command, a query, a plan, an
+        example): that it is valid and does what it is for.
+      Give each the instruction units it belongs to as sources. Do not
+      restate an explicit condition, do not add general quality wishes ("is
+      helpful", "is accurate", "is clear"), and do not add what any ordinary
+      reply meets by default (answering in the language of the request,
+      addressing the question). Add none when the situation presupposes
+      nothing, as for a short factual question.
 
       Step 4. Mark a condition "deterministic" only when one primitive below
       decides it exactly, and fill in "check"; otherwise mark it "semantic"

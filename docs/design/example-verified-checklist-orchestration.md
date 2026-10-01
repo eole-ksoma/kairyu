@@ -152,6 +152,16 @@ even though they did not say it?") and curation drops it below 0.5, so it
 enters the guarantee only when Jev judges it expected. Coverage and
 exclusivity checks apply unchanged; sufficiency stays on the stated units.
 
+Amendment (2026-10-02): the first full `implicit` gate failed (recall 0.525,
+controls kept 0.8 implicit conditions each): the extractor, prompted with
+"answering in the user's language" as an example, added that default to
+every request (Jev rates it necessary at p 1.0) and missed situational
+ones. The extractor now walks the situation (given material to keep, the
+audience, the medium's limits, real-world circumstances, produced
+artifacts) and leaves out what any ordinary reply meets by default. On a
+separate dev set written before the change (12 + 4 controls): recall 0.875
+-> 0.917, controls 0.75 -> 0.00.
+
 ### VCO-D9 — One effort for every DeepSeek step (2026-10-01)
 
 Owner requirement: whatever the route, every DeepSeek role (extract,

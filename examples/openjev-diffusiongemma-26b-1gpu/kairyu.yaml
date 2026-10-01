@@ -1,0 +1,59 @@
+server:
+  host: 0.0.0.0
+  port: 8000
+  api_keys_env: null
+  # OpenJev runs 8 generations and queues 32 more, then answers 529, which
+  # Kairyu counts as a failure of the only replica. At 40 in flight Kairyu
+  # answers 429 first. control.py keeps OpenJev's in-flight + queue at this sum.
+  max_concurrency: 40
+  admission_wait_timeout_s: 600
+  # Below OpenJev's own 64 MiB request limit, so Kairyu rejects first.
+  max_chat_body_bytes: 50331648
+pools:
+  diffusiongemma-26b:
+    replicas:
+    - backend: openai
+      # OpenJev serves /health, not Kairyu's default /readyz.
+      health_url: http://openjev:8080/health
+      options:
+        base_url: http://openjev:8080/v1
+        model: diffusiongemma-26b
+        api_key_env: null
+        timeout_s: 1800
+        upstream: vllm
+        capabilities:
+          allow_prompt_kinds:
+          - multimodal
+          # OpenJev drops these silently (vLLM refuses most of them for
+          # diffusion models); Kairyu rejects them instead of ignoring them.
+          deny_sampling_fields:
+          - n
+          - seed
+          - presence_penalty
+          - frequency_penalty
+          - min_p
+          - repetition_penalty
+          - min_tokens
+          - ignore_eos
+          - skip_special_tokens
+          - stop_token_ids
+        image_input_policy:
+          max_images: 8
+          max_image_bytes: 8388608
+          max_total_image_bytes: 33554432
+          max_image_pixels: 16777216
+          max_total_image_pixels: 134217728
+          max_image_dimension: 8192
+          max_image_aspect_ratio: 200
+          max_processed_prompt_tokens: 65536
+        model_revision: ec4ff3df205028f4e81c954c2227f9312b3ec2ea
+        max_model_len: 65536
+        quantization_format: nvfp4
+        tensor_parallel_size: 1
+    unhealthy_after: 1
+    queue_depth_threshold: 0
+    prefix_index: true
+    probe_interval_s: 2.0
+    placement_log_path: /var/lib/kairyu/placement/diffusiongemma-26b.jsonl
+legacy_chat_models:
+- diffusiongemma-26b

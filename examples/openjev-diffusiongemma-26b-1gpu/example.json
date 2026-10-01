@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "environment": "openjev-diffusiongemma-26b-1gpu",
+  "hardware": {
+    "gpu_count": 1,
+    "product": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "minimum_compute_capability": 12.0,
+    "minimum_vram_mib": 90000,
+    "maximum_idle_used_mib": 1024
+  },
+  "storage": {
+    "root": "/mnt/nvme/kairyu",
+    "minimum_free_gib": 40
+  },
+  "allocation": {
+    "model": "diffusiongemma-26b",
+    "gpu_count": 1,
+    "replicas": 1
+  },
+  "pool": {
+    "max_concurrency": 40,
+    "queue_depth_threshold": 0,
+    "prefix_index": true,
+    "unhealthy_after": 1,
+    "placement_log": "/var/lib/kairyu/placement/diffusiongemma-26b.jsonl"
+  },
+  "model": {
+    "repo": "nvidia/diffusiongemma-26B-A4B-it-NVFP4",
+    "revision": "ec4ff3df205028f4e81c954c2227f9312b3ec2ea",
+    "tree_sha256": "e38de908a6b053b2a2781c37251afa41776d26a98b050d1fe7badb19139ea9b7",
+    "slug": "diffusiongemma-26b-a4b-it-nvfp4",
+    "served_name": "diffusiongemma-26b",
+    "max_context_tokens": 65536,
+    "quantization": "nvfp4",
+    "modalities": ["text", "image"]
+  },
+  "openjev": {
+    "image": "local/openjev:diffusiongemma-think512",
+    "image_id": null,
+    "dockerfile": "openjev-think.Dockerfile",
+    "base_image": "razorback16/openjev:0.5.1@sha256:65f88680e0093c9229d8cc55c0d2f279db27aba78a7ce74ea762b8f2da82d47d",
+    "base_image_id": "sha256:b219be87fdde14896b0029edabe5586b2e99c89380784a9ec73f1405a0453757",
+    "source_repository": "https://github.com/razorback16/openjev",
+    "source_revision": "dcd20947b5ddad5be4a8f5aed6aa6dd245653823",
+    "source_version": "0.5.0",
+    "vllm_source_revision": "1b3b88ec2b7457aa030db4d0e7d8aaf04f6d0fb8",
+    "settings": {
+      "OPENJEV_CANVAS": 64,
+      "OPENJEV_MAX_NUM_SEQS": 64,
+      "OPENJEV_MAX_MODEL_LEN": 65536,
+      "OPENJEV_GPU_UTIL": 0.9,
+      "OPENJEV_GEN_MAX_TOKENS": 8192,
+      "OPENJEV_GEN_MAX_INFLIGHT": 8,
+      "OPENJEV_GEN_MAX_QUEUE": 32
+    },
+    "tunable": ["OPENJEV_GEN_MAX_INFLIGHT", "OPENJEV_GEN_MAX_QUEUE"]
+  },
+  "webui": {
+    "image": "ghcr.io/open-webui/open-webui:v0.11.0-slim@sha256:3698bd4e9628b7ae3768808721098616e669b4a05a6bceb2f5da2d84a3282a01",
+    "port": 3010
+  },
+  "api_port": 8010,
+  "verification": {
+    "serving": {
+      "workloads": ["generic", "coding"],
+      "answer_max_tokens": 8192,
+      "concurrency": [1, 8, 16, 32],
+      "requests_per_concurrency": 32
+    },
+    "think": {
+      "requests_per_variant": 4,
+      "max_tokens": 1024
+    },
+    "vision": {
+      "requests": 4,
+      "max_tokens": 1024
+    }
+  }
+}

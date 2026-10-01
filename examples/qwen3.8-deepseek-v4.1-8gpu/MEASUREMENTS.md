@@ -1,6 +1,7 @@
 # qwen3.8-deepseek-v4.1-8gpu evidence
 
-Status: **CPU half complete; GPU gates pending.**
+Status: **GPU gates pass on the current configuration** (DTO-D17 with the
+loosened ENSEMBLE criteria and judge fallback `deepseek_think`, 2026-10-01).
 
 Hardware: 8 × NVIDIA RTX PRO 6000 Blackwell Server Edition (SM120, PCIe). The
 DeepSeek-V4.1-Flash L1 runs on GPUs 0–5; the two Qwen3.8-27B replicas run on
@@ -143,6 +144,65 @@ Per-route TTFT p50 (`deepseek_think` / `primary`): c1 12.81 / 2.26 s, c8
 
 ## GPU gates with judge fallback `deepseek_think` (DTO-D17 second amendment, 2026-10-01)
 
-Pending: readiness, `vision`, `tool-calling`, `serving-auto-max`,
-`serving-auto-max-coding`, and the browser smoke (runs `fb-*`).
+Runs are stored as `fb-*` under the verification-results directory above. The
+gateway was restarted at 09:31 with the new `auto-max.yaml`; the L1 services
+were not restarted.
+
+| Gate | Result |
+|---|---|
+| `up` readiness probes | PASS; `/routing` reports `fallback: deepseek_think` |
+| `vision` | PASS: 4/4 primary; 12 DeepSeek images for 12 DeepSeek stages |
+| `tool-calling` | PASS: `bash {"command": "ls -la"}` via `deepseek_think` |
+| `serving-auto-max` | exit 0. 2 judge timeouts in 128 requests (c16), both served by `deepseek_think` |
+| `serving-auto-max-coding` | exit 0. Ensemble TTFT gate PASS at c1/c8/c16/c32; 4 of 128 requests exceed the 900 s turn envelope |
+| browser smoke (`webui-browser-smoke.mjs`) | PASS |
+
+Routes are `deepseek_think` / `primary` / judge fallbacks (the fallbacks are
+included in the `deepseek_think` count). Output tok/s counts thinking; public
+tok/s counts the answer only.
+
+`serving-auto-max` (about 8K tokens in, 32 requests per row):
+
+| c | routes | wall | TTFT p50 / p99 | E2E p50 / p99 | output tok/s | public tok/s | judge p50 / p99 |
+|---|---|---|---|---|---|---|---|
+| 1 | 22 / 10 / 0 | 2,353.8 s | 11.18 / 19.99 s | 15.20 / 350.90 s | 23.9 | 4.3 | 306 / 323 ms |
+| 8 | 28 / 4 / 0 | 386.2 s | 24.58 / 52.69 s | 28.47 / 315.81 s | 170.3 | 24.2 | 363 / 4,926 ms |
+| 16 | 27 / 5 / 2 | 366.1 s | 30.19 / 64.48 s | 39.39 / 334.45 s | 153.9 | 26.1 | 960 / 5,002 ms |
+| 32 | 26 / 6 / 0 | 427.8 s | 37.33 / 51.38 s | 43.11 / 427.82 s | 130.0 | 21.6 | 1,974 / 2,135 ms |
+
+Ensemble TTFT p50 rises with concurrency (2.28 s at c1, 4.70 s, 14.73 s, 33.20 s
+at c32) because the `head` stage waits for the two Qwen replicas.
+
+`serving-auto-max-coding` (about 3.2K tokens in, 32 requests per row; the
+paired direct row sends the same dataset to the DeepSeek L1 with `max_tokens`
+512):
+
+| c | routes | wall | TTFT p50 / p99 | E2E p50 / p99 | output tok/s | public tok/s | ensemble TTFT p50 | direct TTFT p50 | gate (≤ 2×) | > 900 s |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 19 / 13 / 0 | 5,296.7 s | 6.46 / 43.30 s | 22.02 / 985.27 s | 39.9 | 2.2 | 626 ms | 3,616 ms | PASS (8.7 %) | 2 |
+| 8 | 15 / 17 / 0 | 1,065.5 s | 4.85 / 54.24 s | 128.30 / 848.17 s | 143.6 | 11.6 | 1,036 ms | 6,760 ms | PASS (7.7 %) | 0 |
+| 16 | 19 / 13 / 0 | 1,037.2 s | 16.63 / 61.53 s | 41.61 / 995.56 s | 192.1 | 11.3 | 6,654 ms | 8,411 ms | PASS (39.6 %) | 1 |
+| 32 | 18 / 14 / 0 | 963.6 s | 18.93 / 47.52 s | 43.51 / 963.61 s | 120.4 | 12.0 | 18,772 ms | 9,797 ms | PASS (95.8 %) | 1 |
+
+Observations:
+
+- **Fallback.** The judge timed out 3 times in 269 judged requests (1 in the
+  generic warmup, 2 at generic c16). All three were served by
+  `deepseek_think`; none escalated to the ensemble.
+- **Ensemble E2E depends on audit refinements.** Coding ensembles without a
+  refinement take 128–580 s; one refinement takes 541–746 s; two take
+  848–996 s. 12 of 57 coding ensembles were refined at least once. Every
+  request above the 900 s envelope (4 measured plus 1 warmup) reached the
+  two-refinement limit, and its refined synthesis ran for several minutes.
+- **The c32 TTFT margin is small.** Ensemble TTFT at c32 is 95.8 % of the
+  limit. `head` averages 19.2 s at 10.2 tok/s there, because the judge and the
+  ensemble's Qwen stages share the two Qwen replicas.
+- **The Qwen replicas bound the ensemble.** Qwen stages run at about 31–45 tok/s
+  per request (`answer_1`/`answer_2` about 85–100 s, `draft` 43–60 s); the
+  DeepSeek stages run at 70–210 tok/s.
+- **Warmups.** Both matrices send 4 warmup requests before c1. Since the
+  ENSEMBLE criteria were loosened, warmups include ensembles and take 267 s
+  (generic) and 940 s (coding) instead of 12–103 s.
+- **Not re-checked.** The head/synthesis seam formatting (stored answers are
+  truncated to 400 characters), and the SM120 kernel check (L1 unchanged).
 

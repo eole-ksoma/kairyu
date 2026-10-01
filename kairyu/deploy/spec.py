@@ -322,6 +322,33 @@ EmbeddingSection = Annotated[
 ]
 
 
+class SystemOneSection(BaseModel):
+    """One System One (Jev wire API) model forwarded to an upstream server."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    base_url: str = Field(min_length=1)
+    upstream_model: str = Field(min_length=1)
+    aliases: frozenset[str] = frozenset()
+    description: str | None = None
+    api_key_env: str | None = None
+    timeout_s: float = Field(default=300.0, gt=0, le=3600)
+    # Kairyu answers 429 before the upstream's own capacity is exhausted.
+    max_concurrency: int = Field(default=64, ge=1, le=4096)
+    max_queue: int = Field(default=0, ge=0, le=65536)
+    queue_wait_s: float = Field(default=0.0, ge=0, le=600)
+    max_questions: int = Field(default=256, ge=1, le=4096)
+    max_body_bytes: int = Field(default=64 * 1024 * 1024, ge=1)
+
+    @model_validator(mode="after")
+    def _validate(self) -> SystemOneSection:
+        if self.max_queue and not self.queue_wait_s:
+            raise ValueError("systemone max_queue requires queue_wait_s > 0")
+        if any(not alias.strip() for alias in self.aliases):
+            raise ValueError("systemone aliases must be non-empty strings")
+        return self
+
+
 class BatchSection(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -453,6 +480,7 @@ class DeploymentSpec(BaseModel):
     # executor workers via executor_ref (ECO-D1); not served models.
     executors: dict[str, ExecutorSection] = Field(default_factory=dict)
     embeddings: dict[str, EmbeddingSection] = Field(default_factory=dict)
+    systemone: dict[str, SystemOneSection] = Field(default_factory=dict)
     # Omission preserves the generic all-model server. An explicit allowlist
     # separates public dispatch from deployment-owned internal resources.
     public_models: frozenset[str] | None = None
@@ -536,6 +564,24 @@ class DeploymentSpec(BaseModel):
                 f"embedding names {sorted(embedding_overlap)} collide with "
                 "engines:/pools:/orchestrators: names; served model names must be unique"
             )
+        systemone_names: list[str] = []
+        for name, section in self.systemone.items():
+            if not name.strip():
+                raise ValueError("systemone: names must be non-empty strings")
+            systemone_names.extend((name, *section.aliases))
+        duplicate_systemone = {n for n in systemone_names if systemone_names.count(n) > 1}
+        systemone_overlap = set(systemone_names) & (
+            self.engines.keys()
+            | self.pools.keys()
+            | orchestration_names
+            | self.embeddings.keys()
+        )
+        if duplicate_systemone or systemone_overlap:
+            raise ValueError(
+                "systemone names and aliases "
+                f"{sorted(duplicate_systemone | systemone_overlap)} are not unique; "
+                "served model names must be unique"
+            )
         if self.public_models is not None:
             if not self.public_models:
                 raise ValueError("public_models must contain at least one model")
@@ -544,6 +590,7 @@ class DeploymentSpec(BaseModel):
                 *self.pools,
                 *orchestration_names,
                 *self.embeddings,
+                *self.systemone,
             }
             unknown_public = self.public_models - known_models
             if unknown_public:

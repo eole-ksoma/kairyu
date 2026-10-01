@@ -25,6 +25,11 @@ from kairyu.entrypoints.server.messages_protocol import (
     anthropic_error_type_for_status,
     wants_anthropic_envelope,
 )
+from kairyu.entrypoints.server.systemone_service import (
+    jev_error_payload,
+    jev_error_type_for_status,
+    wants_jev_envelope,
+)
 
 _ASGIApp = Callable[..., Awaitable[None]]
 
@@ -88,7 +93,8 @@ async def _send_error(
     """Render one middleware error in the envelope the route's dialect expects.
 
     ``/v1/messages`` (Anthropic Messages, issue #508) must never receive the
-    OpenAI ``{"error": ...}`` envelope; every other route keeps it unchanged.
+    OpenAI ``{"error": ...}`` envelope, and ``/v1/systemone`` answers in Jev's
+    ``{"detail": ...}`` shape; every other route keeps the OpenAI envelope.
     """
 
     if wants_anthropic_envelope(scope.get("path", "")):
@@ -97,6 +103,8 @@ async def _send_error(
             error_type=anthropic_error_type_for_status(status),
             request_id=_state(scope).get("request_id"),
         )
+    elif wants_jev_envelope(scope.get("path", "")):
+        payload = jev_error_payload(jev_error_type_for_status(status), message)
     else:
         payload = {"error": {"message": message, "type": openai_type, "code": code}}
     await _send_json(send, status, payload, headers or {})
@@ -195,6 +203,7 @@ class ConcurrencyLimitMiddleware:
         total_limit: int,
         wait_timeout_s: float | None,
         metrics=None,
+        exempt_paths: Iterable[str] = (),
     ) -> None:
         if not 1 <= limit <= total_limit:
             raise ValueError("active limit must be within the total concurrency limit")
@@ -208,6 +217,8 @@ class ConcurrencyLimitMiddleware:
         self._queue_limit = total_limit - limit
         self._wait_timeout_s = wait_timeout_s
         self._metrics = metrics
+        # routes whose backend owns its admission (System One) bypass this gate
+        self._exempt_paths = frozenset(exempt_paths)
         self._active = 0
         self._waiters: deque[asyncio.Future[None]] = deque()
 
@@ -252,7 +263,11 @@ class ConcurrencyLimitMiddleware:
         )
 
     async def __call__(self, scope: dict, receive: Callable, send: Callable) -> None:
-        if scope["type"] != "http" or not scope["path"].startswith(_GUARDED_PREFIX):
+        if (
+            scope["type"] != "http"
+            or not scope["path"].startswith(_GUARDED_PREFIX)
+            or scope["path"] in self._exempt_paths
+        ):
             await self.app(scope, receive, send)
             return
         acquired = False

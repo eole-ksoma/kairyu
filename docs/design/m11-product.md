@@ -607,6 +607,57 @@ CPU-only GitHub Actions. The clean `b8971cb` gate passed every binding check on
 Anthropic endpoints), method block (same prompts, N trials, TTFT/TPOT/
 quality-proxy), scoreboard JSON+md; offline unit test with mock targets.
 
+### D8 — System One (Jev wire API) surface (amendment, 2026-10-01)
+
+Status: accepted by the owner (2026-10-01); CPU tests in
+`tests/server/test_systemone_api.py`; GPU-verified with OpenJev in
+`examples/openjev-diffusiongemma-26b-1gpu` (`systemone-live`,
+`systemone-serving`, `systemone-isolation`).
+
+Kairyu serves `POST /v1/systemone`, the System One API that TypeSafe's Jev,
+OpenJev and Codiv share: a `state` and typed `questions` in, per-question
+probabilities, `usage` and a `Server-Timing` header out. It is a front door
+like `/v1/messages`: Kairyu forwards to one configured upstream per model and
+does not reimplement reads.
+
+- **Config.** `systemone: {name: {base_url, upstream_model, aliases,
+  max_concurrency, max_queue, queue_wait_s, timeout_s, max_questions,
+  max_body_bytes}}`. Names and aliases are unique across every served model.
+- **Not a pool member.** `HTTPSystemOneBackend` owns admission (a bounded
+  in-flight count and queue) and answers 429 before the upstream's own
+  overload answer (529). ReplicaPool is typed to generation requests and
+  counts a 529 as a replica failure; a System One read must not eject a chat
+  replica that shares the server. The route is exempt from the server-wide
+  chat `max_concurrency` gate for the same reason.
+- **Upstream owns the schema.** Kairyu checks only what routing and resource
+  bounds need (a JSON object, a string `model`, `max_questions`, and the
+  selected model's own `max_body_bytes`; the middleware bounds the largest). Upstream answers and errors pass through with `retry-after` and
+  `Server-Timing`. Kairyu's own errors use Jev's shapes: a FastAPI-style
+  `{"detail": [...]}` list for a malformed body, otherwise
+  `{"detail": {"error_type", "message"}}`, including 401/413/429 from the
+  middleware and the tenant limiter.
+- **Metering.** Before dispatch a tenant reserves an upper bound on what the
+  request can bill: every question may be its own read carrying the state,
+  and with `think` each read writes a thought and then reads prompt +
+  thought once per sample, and a `sequential` read repeats every question and
+  the answers so far in each group's prompt (unbilled server re-reads are not
+  reserved). `samples`, `think` and `steps` are normalized to ints the way
+  the upstream parses them ("32", 32.0) before reserving and forwarding;
+  other representations get a 422. The
+  reservation is refunded unless the upstream answers 200; then
+  `usage.input_tokens` and `usage.output_tokens` are recorded. A 200 whose
+  two counts are not both valid becomes a 502, so no answer leaves unbilled
+  (review amendment, PR #614).
+- **Discovery.** With System One models served, `/v1/models` also returns
+  Jev's `models: [{name, description}]` list (System One names and aliases,
+  then the other served models). System One models stay out of OpenAI's
+  `data` list, which chat clients offer as chat models.
+
+Why: the System One API is a public wire format with several independent
+servers and SDKs, so serving it through Kairyu's auth, tenancy, metering and
+admission is a shared contract, not one example's workflow. Examples own the
+model choice, aliases, limits and any UI.
+
 ## 3. Non-goals
 
 - A native in-process Kairyu VLM runner, tenant-controlled remote image

@@ -309,3 +309,64 @@ FlashInfer JIT caches are removed so the patched kernels are the ones
 compiled; a NaN-poisoned masked slot in the kernel gate catches a shadowed
 kernel. Only SHA-bound rows in the example's `MEASUREMENTS.md` establish
 runtime and performance claims.
+
+### OpenJev DiffusionGemma one-GPU amendment (2026-10-01)
+
+Status: accepted by the owner (plan
+`docs/superpowers/plans/2026-10-01-openjev-diffusiongemma-1gpu-example.md`);
+GPU-verified 2026-10-01 (every gate in the example's `MEASUREMENTS.md`).
+
+`examples/openjev-diffusiongemma-26b-1gpu` serves one replica on one selected
+GPU. The L1 is a third-party server, OpenJev (DiffusionGemma 26B-A4B NVFP4
+on vLLM `1b3b88ec`, behind OpenJev's OpenAI-style chat endpoint). L2/L3 are
+the single-replica structure: one ReplicaPool replica, the legacy OpenAI
+chat/tool path, image admission, and Open WebUI. The chat replica needs only
+configuration:
+
+- `health_url` set to OpenJev's `/health`, because Kairyu's default is
+  `/readyz`;
+- the fields OpenJev drops silently listed in `deny_sampling_fields`;
+- `max_concurrency` set to OpenJev's generations in flight plus queued
+  (40; 32 + 8 after the L1-1 measurement, OpenJev's default is 8 + 32).
+  OpenJev answers 529 above that, and Kairyu counts a 529 as a replica
+  failure.
+
+Every chat completion thinks first, with a thought of at most 512 tokens
+that callers cannot disable or resize. vLLM's `thinking_token_budget` cannot
+enforce this: DiffusionGemma replaces the sampler with `DiffusionSampler`,
+which never applies `ThinkingBudgetState`. The example therefore applies
+OpenJev's own System One `think` method to chat, as an L1 overlay that the
+example owns (a reasoning budget and a runtime adaptation, both example
+policy):
+
+- A thought pass continues an assistant prefill `<|channel>thought\n` with
+  `max_tokens: 512` and a stop on `<channel|>`.
+- An answer pass continues after the closed thought.
+- One generation slot covers both passes.
+- The overlay publishes only the capped first-pass thought as reasoning.
+- A failure after the thought has streamed aborts the stream rather than
+  ending it, because Kairyu ignores mid-stream error chunks.
+- A request that only the answer pass would refuse is refused with a 400
+  before the thought. Today that is a required or named `tool_choice`, which
+  needs structured outputs. Otherwise any client could make a stream abort,
+  and the abort would eject the only replica.
+
+The checkpoint's chat template strips thoughts from every assistant message,
+so `continue_final_message` cannot continue a prefill. The example's template
+renders only a final assistant message verbatim. With the checkpoint
+tokenizer, every other conversation renders byte for byte like the stock
+template. At startup the overlay refuses to run unless vLLM uses that
+template and it continues both prefills, both as a string and as the
+text-part list that vLLM's `openai` content format sends (the first GPU start
+showed the list form stripping the prefill). Only SHA-bound rows in the
+example's `MEASUREMENTS.md` establish runtime and performance claims.
+
+System One amendment (2026-10-01, accepted by the owner). OpenJev's System
+One API is served through Kairyu's `/v1/systemone` (m11 D8), not as a
+ReplicaPool member: Kairyu forwards at most 256 requests and queues 256 more,
+below OpenJev's 529 point of 512 waiting requests, so a burst gets Kairyu's
+429 and never ejects the chat replica. The example's UI follows Jev: a
+System One playground on :3011 (a static page behind nginx, on Kairyu's
+origin) shows each answer's distribution, confidence, tokens, latency and
+`Server-Timing`, next to the think-first chat answer for the same state;
+Open WebUI stays on :3010 for chat.

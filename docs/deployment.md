@@ -718,6 +718,27 @@ Operational notes:
   with an engine, pool, or orchestrator name. Unknown IDs return
   `model_not_found` without execution or usage accounting.
 
+- **System One model IDs are explicit too.** Each `systemone:` key and its
+  `aliases` route `POST /v1/systemone` (the Jev wire API) to one upstream
+  System One server, such as OpenJev. Kairyu bounds in-flight and queued
+  requests per model and answers 429 in Jev's error shape before the upstream
+  would answer 529; the upstream owns the question schema and its errors.
+  These requests bypass the server-wide `max_concurrency` gate and never
+  touch a pool, so they cannot eject a chat replica:
+
+  ```yaml
+  systemone:
+    openjev-0.1:
+      base_url: http://openjev:8080
+      upstream_model: openjev-0.1
+      aliases: [openjev-latest, jev-latest]
+      max_concurrency: 256    # at most the upstream's own queue (OpenJev: 512)
+      max_queue: 256
+      queue_wait_s: 30
+  ```
+
+  `/v1/models` then also returns Jev's `models: [{name}]` list. See m11 D8.
+
 ### Production embeddings and Open WebUI RAG
 
 Install the CPU production backend with `uv sync --extra embeddings`. It uses

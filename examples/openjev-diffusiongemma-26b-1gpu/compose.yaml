@@ -1,0 +1,144 @@
+name: kairyu-openjev-diffusiongemma-26b-1gpu
+services:
+  # One OpenJev replica on one selected GPU: vLLM serves DiffusionGemma
+  # 26B-A4B NVFP4 inside the container and OpenJev's API answers on :8080.
+  # This example's overlay (openjev-think.Dockerfile) makes every chat
+  # completion think first with a fixed 512-token budget. control.py passes
+  # the OPENJEV_* settings from example.json. No host port: clients reach
+  # OpenJev's chat and System One APIs only through Kairyu.
+  openjev:
+    image: ${OPENJEV_IMAGE:-local/openjev:diffusiongemma-think512}
+    ipc: host
+    environment:
+      OPENJEV_MODEL: /models/diffusiongemma-26b-a4b-it-nvfp4
+      OPENJEV_CANVAS: ${OPENJEV_CANVAS}
+      OPENJEV_MAX_NUM_SEQS: ${OPENJEV_MAX_NUM_SEQS}
+      OPENJEV_MAX_MODEL_LEN: ${OPENJEV_MAX_MODEL_LEN}
+      OPENJEV_GPU_UTIL: ${OPENJEV_GPU_UTIL}
+      OPENJEV_GEN_MAX_TOKENS: ${OPENJEV_GEN_MAX_TOKENS}
+      OPENJEV_GEN_MAX_INFLIGHT: ${OPENJEV_GEN_MAX_INFLIGHT}
+      OPENJEV_GEN_MAX_QUEUE: ${OPENJEV_GEN_MAX_QUEUE}
+      OPENJEV_MAX_INFLIGHT: ${OPENJEV_MAX_INFLIGHT}
+      OPENJEV_MAX_QUEUE: ${OPENJEV_MAX_QUEUE}
+      HF_HOME: /models/.cache
+      HF_HUB_OFFLINE: '1'
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      VLLM_NO_USAGE_STATS: '1'
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      XDG_CACHE_HOME: /root/.cache
+      TORCHINDUCTOR_CACHE_DIR: /root/.cache/torchinductor
+      TRITON_CACHE_DIR: /root/.cache/triton
+    healthcheck:
+      test:
+      - CMD
+      - curl
+      - -sf
+      - http://127.0.0.1:8080/health
+      interval: 5s
+      timeout: 3s
+      retries: 1440
+      start_period: 30s
+    restart: unless-stopped
+    cpuset: ${OPENJEV_CPUSET}
+    volumes:
+    - type: bind
+      source: ${OPENJEV_MODEL_STORAGE_PATH}
+      target: /models
+      read_only: true
+    - type: bind
+      source: ${OPENJEV_CACHE_PATH}
+      target: /root/.cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+          - driver: nvidia
+            device_ids:
+            - ${GPU_ID:-0}
+            capabilities:
+            - gpu
+  kairyu:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      args:
+        KAIRYU_VISION: '1'
+    image: ${KAIRYU_IMAGE:-local/kairyu:openjev-1gpu-example}
+    command:
+    - /etc/kairyu/kairyu.yaml
+    environment:
+      KAIRYU_CONTAINER_IMAGE_DIGEST: ${KAIRYU_IMAGE_ID:-local-build}
+    volumes:
+    - type: bind
+      source: ${PLACEMENT_LOG_PATH}
+      target: /var/lib/kairyu/placement
+    - ./kairyu.yaml:/etc/kairyu/kairyu.yaml:ro
+    depends_on:
+      openjev:
+        condition: service_healthy
+    ports:
+    - 127.0.0.1:${API_PORT:-8010}:8000
+    healthcheck:
+      test:
+      - CMD
+      - python3
+      - -c
+      - import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/readyz",
+        timeout=2)
+      interval: 5s
+      timeout: 3s
+      retries: 120
+    restart: unless-stopped
+  chat-ui:
+    image: ${OPEN_WEBUI_IMAGE:-ghcr.io/open-webui/open-webui:v0.11.0-slim@sha256:3698bd4e9628b7ae3768808721098616e669b4a05a6bceb2f5da2d84a3282a01}
+    environment:
+      OPENAI_API_BASE_URL: http://kairyu:8000/v1
+      OPENAI_API_KEY: sk-local-kairyu
+      DEFAULT_MODELS: diffusiongemma-26b
+      # OpenJev's answer cap; the 512-token thought comes on top of it.
+      # Sampling fields are omitted: OpenJev ignores them for this model.
+      DEFAULT_MODEL_PARAMS: '{"max_tokens":8192}'
+      ENABLE_PERSISTENT_CONFIG: 'false'
+      RESET_CONFIG_ON_START: 'true'
+      ENABLE_SIGNUP: 'false'
+      ENABLE_LOGIN_FORM: 'false'
+      WEBUI_AUTH: 'false'
+      WEBUI_URL: ${WEBUI_URL:-http://localhost:3010}
+      WEBUI_ADMIN_NAME: ${WEBUI_ADMIN_NAME:-Kairyu Admin}
+      ENABLE_OLLAMA_API: 'false'
+      ENABLE_EVALUATION_ARENA_MODELS: 'false'
+      RAG_EMBEDDING_ENGINE: ''
+    volumes:
+    - type: bind
+      source: ${WEBUI_STORAGE_PATH}
+      target: /app/backend/data
+    depends_on:
+      kairyu:
+        condition: service_healthy
+    ports:
+    - ${CHAT_UI_BIND_ADDRESS:-0.0.0.0}:${CHAT_UI_PORT:-3010}:8080
+    restart: unless-stopped
+  # Jev-style System One playground: a static page, with Kairyu's API proxied
+  # on the same origin (playground/nginx.conf).
+  playground:
+    image: ${PLAYGROUND_IMAGE}
+    volumes:
+    - ./playground/index.html:/usr/share/nginx/html/index.html:ro
+    - ./playground/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      kairyu:
+        condition: service_healthy
+    ports:
+    - ${CHAT_UI_BIND_ADDRESS:-0.0.0.0}:${PLAYGROUND_PORT:-3011}:8080
+    healthcheck:
+      test:
+      - CMD
+      - wget
+      - -q
+      - -O
+      - /dev/null
+      - http://127.0.0.1:8080/
+      interval: 5s
+      timeout: 3s
+      retries: 60
+    restart: unless-stopped

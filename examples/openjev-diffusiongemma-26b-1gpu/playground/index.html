@@ -1,0 +1,425 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>System One Playground</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6b66; --line: #e3e2dc;
+    --accent: #2f6fde; --accent-soft: #dbe6fb; --good: #1f8a5b; --warn: #b26a00;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #151514; --panel: #1f1f1d; --ink: #ecebe6; --muted: #9a9993; --line: #34332f;
+      --accent: #7aa7ff; --accent-soft: #24365a; --good: #4cc08a; --warn: #f0a640;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; align-items: baseline; gap: 12px; padding: 14px 20px;
+           border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 17px; margin: 0; }
+  header .sub { color: var(--muted); }
+  main { display: grid; grid-template-columns: minmax(320px, 440px) 1fr; gap: 16px; padding: 16px 20px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 8px; }
+  label { display: block; color: var(--muted); font-size: 12px; margin: 10px 0 4px; }
+  textarea, input, select { width: 100%; font: inherit; color: inherit; background: var(--bg);
+                            border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+  textarea { resize: vertical; }
+  button { font: inherit; border-radius: 6px; border: 1px solid var(--line); background: var(--panel);
+           color: inherit; padding: 6px 10px; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button:disabled { opacity: .5; cursor: default; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .row > * { flex: 1; }
+  .q { border: 1px solid var(--line); border-radius: 8px; padding: 8px; margin-top: 8px; }
+  .q .row > .small { flex: 0 0 auto; }
+  .muted { color: var(--muted); }
+  .results { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 1200px) { .results { grid-template-columns: 1fr; } }
+  .stats { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+  .stats b { color: var(--ink); font-family: var(--mono); font-weight: 600; }
+  .answer { border-top: 1px solid var(--line); padding: 8px 0; }
+  .answer h3 { margin: 0 0 6px; font-size: 14px; display: flex; justify-content: space-between; gap: 8px; }
+  .answer h3 .val { font-family: var(--mono); color: var(--accent); }
+  .bar { display: grid; grid-template-columns: minmax(70px, 30%) 1fr 56px; gap: 8px; align-items: center;
+         font-size: 12px; margin: 3px 0; }
+  .bar .track { background: var(--accent-soft); border-radius: 4px; height: 14px; overflow: hidden; }
+  .bar .fill { background: var(--accent); height: 100%; }
+  .bar.top .name { font-weight: 600; }
+  .bar .p { font-family: var(--mono); text-align: right; }
+  .conf { font-size: 12px; color: var(--muted); }
+  pre { white-space: pre-wrap; word-break: break-word; font-family: var(--mono); font-size: 12px; margin: 0; }
+  .thought { color: var(--muted); border-left: 3px solid var(--line); padding-left: 8px; margin-bottom: 8px;
+             max-height: 260px; overflow: auto; }
+  .error { color: #c0392b; }
+  details summary { cursor: pointer; color: var(--muted); margin-top: 10px; }
+  .thumbs { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+  .thumbs img { width: 56px; height: 56px; object-fit: cover; border-radius: 4px; border: 1px solid var(--line); }
+</style>
+</head>
+<body>
+<header>
+  <h1>System One Playground</h1>
+  <span class="sub">Typed decisions read from the model's probabilities, next to a think-first chat answer.
+  Served by Kairyu: <code>POST /v1/systemone</code> and <code>/v1/chat/completions</code>.</span>
+</header>
+<main>
+  <section>
+    <h2>Request</h2>
+    <div class="row">
+      <div><label for="model">System One model</label><select id="model"></select></div>
+      <div><label for="preset">Example</label><select id="preset"></select></div>
+    </div>
+    <label for="state">State</label>
+    <textarea id="state" rows="5"></textarea>
+    <label for="images">Images (optional, up to 8)</label>
+    <input id="images" type="file" accept="image/jpeg,image/png,image/webp,image/gif" multiple>
+    <div class="thumbs" id="thumbs"></div>
+    <div class="row" style="margin-top:12px">
+      <h2 style="margin:0">Questions</h2>
+      <button class="small" id="add-noul">+ yes/no</button>
+      <button class="small" id="add-choice">+ choice</button>
+      <button class="small" id="add-score">+ score</button>
+    </div>
+    <div id="questions"></div>
+    <details>
+      <summary>OpenJev extensions</summary>
+      <div class="row">
+        <div><label for="samples">samples (1–32)</label><input id="samples" type="number" min="1" max="32" placeholder="auto"></div>
+        <div><label for="steps">steps (1–8)</label><input id="steps" type="number" min="1" max="8" placeholder="1"></div>
+        <div><label for="think">think tokens (0–4096)</label><input id="think" type="number" min="0" max="4096" placeholder="0"></div>
+      </div>
+    </details>
+    <label><input type="checkbox" id="compare" checked style="width:auto"> Also ask the chat model (thinks first, at most 512 thought tokens)</label>
+    <div class="row" style="margin-top:12px">
+      <button class="primary" id="run">Run</button>
+    </div>
+  </section>
+  <div class="results">
+    <section id="s1">
+      <h2>System One</h2>
+      <div class="stats" id="s1-stats"></div>
+      <div id="s1-body" class="muted">Run a request to see each answer's distribution.</div>
+    </section>
+    <section id="chat">
+      <h2>Chat model</h2>
+      <div class="stats" id="chat-stats"></div>
+      <div id="chat-body" class="muted">The same state and questions, asked as a chat prompt.</div>
+    </section>
+  </div>
+</main>
+<script>
+"use strict";
+const PRESETS = {
+  "Support ticket": {
+    state: "Everything is down and we have a demo with our biggest client at noon.",
+    questions: {
+      urgent: {type: "noul", instructions: "Does the customer need a reply within the hour?"},
+      team: {type: "choice", instructions: "Which team should handle it?",
+             criteria: {outage: "service down", billing: "charges, refunds", feature: "requests, how-to"}},
+      tone: {type: "score", instructions: "How upset is the customer?", criteria: ["calm", "annoyed", "furious"]},
+    },
+  },
+  "Invoice complaint": {
+    state: "The invoice looks wrong again. Second time this quarter.",
+    questions: {
+      urgent: {type: "noul", instructions: "Does the customer need a reply within the hour?"},
+      team: {type: "choice", instructions: "Which team should handle it?",
+             criteria: {outage: "service down", billing: "charges, refunds", feature: "requests, how-to"}},
+      tone: {type: "score", instructions: "How upset is the customer?", criteria: ["calm", "annoyed", "furious"]},
+    },
+  },
+  "Code review": {
+    state: "def mean(xs):\n    return sum(xs) / len(xs)",
+    questions: {
+      crashes: {type: "noul", instructions: "Can this function raise an exception for some valid list input?"},
+      issue: {type: "choice", instructions: "What is the main problem?",
+              criteria: {empty_input: "fails on an empty list", precision: "floating-point precision",
+                         none: "no problem"}},
+      quality: {type: "score", instructions: "Rate the code quality.", criteria: ["poor", "fair", "good", "excellent"]},
+    },
+  },
+};
+const $ = (id) => document.getElementById(id);
+let images = [];
+let chatModel = "diffusiongemma-26b";
+
+function el(tag, attrs = {}, ...children) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") node.className = v; else if (k === "text") node.textContent = v; else node.setAttribute(k, v);
+  }
+  for (const child of children) node.append(child);
+  return node;
+}
+
+function questionEditor(key, q) {
+  const box = el("div", {class: "q"});
+  box.dataset.type = q.type;
+  const head = el("div", {class: "row"},
+    el("input", {class: "key", value: key, placeholder: "id"}),
+    el("span", {class: "small muted", text: q.type === "noul" ? "yes/no" : q.type}),
+    el("button", {class: "small", text: "✕", title: "Remove"}));
+  head.querySelector("button").onclick = () => box.remove();
+  box.append(head, el("label", {text: "Instructions"}));
+  const instructions = el("input", {class: "instructions"});
+  instructions.value = q.instructions || "";
+  box.append(instructions);
+  if (q.type === "choice") {
+    box.append(el("label", {text: "Options, one per line as name: description"}));
+    const area = el("textarea", {class: "criteria", rows: "3"});
+    area.value = Object.entries(q.criteria || {}).map(([n, d]) => `${n}: ${d ?? ""}`).join("\n");
+    box.append(area);
+  } else if (q.type === "score") {
+    box.append(el("label", {text: "Levels, lowest first, one per line (1–10)"}));
+    const area = el("textarea", {class: "criteria", rows: "3"});
+    area.value = (q.criteria || []).join("\n");
+    box.append(area);
+  }
+  return box;
+}
+
+function loadPreset(name) {
+  const preset = PRESETS[name];
+  $("state").value = preset.state;
+  $("questions").replaceChildren(...Object.entries(preset.questions).map(([k, q]) => questionEditor(k, q)));
+}
+
+function unusedId() {
+  const used = new Set([...$("questions").querySelectorAll(".key")].map((input) => input.value.trim()));
+  let n = 1;
+  while (used.has(`q${n}`)) n += 1;
+  return `q${n}`;
+}
+
+function readQuestions() {
+  const questions = {};
+  for (const box of $("questions").children) {
+    const key = box.querySelector(".key").value.trim();
+    if (!key) continue;
+    // a repeated id would silently replace the earlier question
+    if (Object.hasOwn(questions, key)) throw new Error(`Two questions share the id "${key}".`);
+    const q = {type: box.dataset.type, instructions: box.querySelector(".instructions").value};
+    const lines = (box.querySelector(".criteria")?.value || "").split("\n").map((l) => l.trim()).filter(Boolean);
+    if (q.type === "choice") {
+      q.criteria = Object.fromEntries(lines.map((line) => {
+        const at = line.indexOf(":");
+        return at < 0 ? [line, null] : [line.slice(0, at).trim(), line.slice(at + 1).trim() || null];
+      }));
+    } else if (q.type === "score") {
+      q.criteria = lines;
+    }
+    questions[key] = q;
+  }
+  return questions;
+}
+
+function systemOneBody() {
+  const body = {model: $("model").value, state: $("state").value, questions: readQuestions()};
+  if (images.length) body.images = images;
+  for (const field of ["samples", "steps", "think"]) {
+    const value = $(field).value;
+    if (value !== "") body[field] = Number(value);
+  }
+  return body;
+}
+
+function stat(label, value) {
+  return el("span", {}, `${label} `, el("b", {text: value}));
+}
+
+function bar(name, p, top) {
+  const fill = el("div", {class: "fill"});
+  fill.style.width = `${Math.max(0, Math.min(1, p)) * 100}%`;
+  return el("div", {class: "bar" + (top ? " top" : "")},
+    el("span", {class: "name", text: name}), el("div", {class: "track"}, fill),
+    el("span", {class: "p", text: p.toFixed(3)}));
+}
+
+function renderAnswer(key, q, a) {
+  const box = el("div", {class: "answer"});
+  if (q.type === "noul") {
+    box.append(el("h3", {}, el("span", {text: `${key} · ${q.instructions || ""}`}),
+                     el("span", {class: "val", text: a.noul >= 0.5 ? "yes" : "no"})));
+    box.append(bar("yes", a.noul, a.noul >= 0.5), bar("no", 1 - a.noul, a.noul < 0.5));
+  } else {
+    const probabilities = a.probabilities || {};
+    // a score's probabilities and legend are keyed by level index ("0", "1", ...)
+    const legend = a.legend || {};
+    const value = q.type === "choice" ? a.choice
+      : `${a.score.toFixed(2)} (≈ ${legend[Math.round(a.score)] ?? Math.round(a.score)})`;
+    box.append(el("h3", {}, el("span", {text: `${key} · ${q.instructions || ""}`}),
+                     el("span", {class: "val", text: value})));
+    const best = Math.max(...Object.values(probabilities));
+    for (const [name, p] of Object.entries(probabilities)) box.append(bar(legend[name] ?? name, p, p === best));
+    if (typeof a.confidence === "number") box.append(el("div", {class: "conf", text: `confidence ${a.confidence.toFixed(3)}`}));
+  }
+  return box;
+}
+
+async function runSystemOne(body) {
+  $("s1-stats").replaceChildren();
+  $("s1-body").replaceChildren(el("span", {class: "muted", text: "Reading…"}));
+  const started = performance.now();
+  const response = await fetch("/v1/systemone", {method: "POST", headers: {"content-type": "application/json"},
+                                                 body: JSON.stringify(body)});
+  const elapsed = performance.now() - started;
+  const text = await response.text();
+  let data;
+  try { data = JSON.parse(text); } catch { data = text; }
+  const stats = [stat("HTTP", String(response.status)), stat("latency", `${elapsed.toFixed(0)} ms`)];
+  const timing = response.headers.get("server-timing");
+  if (timing) {
+    for (const part of timing.split(",")) {
+      const [name, dur] = part.trim().split(";dur=");
+      if (dur) stats.push(stat(name, `${Number(dur).toFixed(1)} ms`));
+    }
+  }
+  if (response.ok) {
+    stats.push(stat("input tokens", String(data.usage?.input_tokens ?? "?")),
+               stat("output tokens", String(data.usage?.output_tokens ?? "?")),
+               stat("model", data.model));
+    $("s1-body").replaceChildren(...Object.entries(body.questions).map(
+      ([key, q]) => renderAnswer(key, q, data.answers[key])));
+  } else {
+    $("s1-body").replaceChildren(el("pre", {class: "error", text: typeof data === "string" ? data : JSON.stringify(data, null, 2)}));
+  }
+  $("s1-stats").replaceChildren(...stats);
+}
+
+function chatPrompt(body) {
+  const lines = [`State:\n${body.state}`, "", "Answer each question. Reply with one line per question as id: answer."];
+  // the same information System One receives: every option with its description
+  const described = (name, text) => (text ? `${name} (${typeof text === "string" ? text : JSON.stringify(text)})` : name);
+  for (const [key, q] of Object.entries(body.questions)) {
+    if (q.type === "noul") {
+      const yes = described("yes", q.criteria?.true);
+      const no = described("no", q.criteria?.false);
+      lines.push(`- ${key}: ${q.instructions || ""} Answer ${yes} or ${no}.`);
+    } else if (q.type === "choice") {
+      const options = Object.entries(q.criteria).map(([name, text]) => described(name, text));
+      lines.push(`- ${key}: ${q.instructions || ""} Answer one of: ${options.join("; ")}.`);
+    } else {
+      const levels = q.criteria.map((level, index) => `${index} = ${typeof level === "string" ? level : JSON.stringify(level)}`);
+      lines.push(`- ${key}: ${q.instructions || ""} Answer one level, lowest first: ${levels.join("; ")}.`);
+    }
+  }
+  return lines.join("\n");
+}
+
+async function runChat(body) {
+  $("chat-stats").replaceChildren();
+  const thought = el("pre", {class: "thought"});
+  const answer = el("pre");
+  $("chat-body").replaceChildren(thought, answer);
+  const content = [{type: "text", text: chatPrompt(body)}, ...images.map((url) => ({type: "image_url", image_url: {url}}))];
+  const started = performance.now();
+  let firstToken = null;
+  let usage = null;
+  let streamError = null;
+  let sawDone = false;
+  const response = await fetch("/v1/chat/completions", {
+    method: "POST", headers: {"content-type": "application/json"},
+    body: JSON.stringify({model: chatModel, stream: true, stream_options: {include_usage: true}, max_tokens: 1024,
+                          messages: [{role: "user", content: images.length ? content : chatPrompt(body)}]}),
+  });
+  if (!response.ok) {
+    answer.className = "error";
+    answer.textContent = await response.text();
+    $("chat-stats").replaceChildren(stat("HTTP", String(response.status)));
+    return;
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const {done, value} = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, {stream: true});
+    let cut;
+    while ((cut = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, cut).trim();
+      buffer = buffer.slice(cut + 1);
+      if (line === "data: [DONE]") sawDone = true;
+      if (!line.startsWith("data: ") || line === "data: [DONE]") continue;
+      const chunk = JSON.parse(line.slice(6));
+      // a failure after the stream started arrives as an error frame
+      if (chunk.error) streamError = chunk.error.message || JSON.stringify(chunk.error);
+      usage = chunk.usage || usage;
+      for (const choice of chunk.choices || []) {
+        const delta = choice.delta || {};
+        const reasoning = delta.reasoning_content || delta.reasoning || "";
+        if ((reasoning || delta.content) && firstToken === null) firstToken = performance.now() - started;
+        thought.textContent += reasoning;
+        answer.textContent += delta.content || "";
+      }
+    }
+  }
+  const elapsed = performance.now() - started;
+  if (streamError || !sawDone) {
+    answer.className = "error";
+    answer.textContent += `\n[stream failed: ${streamError || "ended without [DONE]"}]`;
+    $("chat-stats").replaceChildren(stat("HTTP", "200, stream failed"), stat("latency", `${elapsed.toFixed(0)} ms`));
+    return;
+  }
+  $("chat-stats").replaceChildren(stat("HTTP", "200"), stat("first token", `${(firstToken ?? elapsed).toFixed(0)} ms`),
+    stat("latency", `${elapsed.toFixed(0)} ms`), stat("prompt tokens", String(usage?.prompt_tokens ?? "?")),
+    stat("completion tokens", String(usage?.completion_tokens ?? "?")), stat("model", chatModel));
+}
+
+async function run() {
+  $("run").disabled = true;
+  try {
+    let body;
+    try {
+      body = systemOneBody();
+    } catch (e) {
+      $("s1-body").replaceChildren(el("pre", {class: "error", text: e.message}));
+      return;
+    }
+    const jobs = [runSystemOne(body).catch((e) => $("s1-body").replaceChildren(el("pre", {class: "error", text: String(e)})))];
+    if ($("compare").checked) {
+      jobs.push(runChat(body).catch((e) => $("chat-body").replaceChildren(el("pre", {class: "error", text: String(e)}))));
+    }
+    await Promise.all(jobs);
+  } finally {
+    $("run").disabled = false;
+  }
+}
+
+async function init() {
+  for (const name of Object.keys(PRESETS)) $("preset").append(el("option", {value: name, text: name}));
+  $("preset").onchange = () => loadPreset($("preset").value);
+  loadPreset(Object.keys(PRESETS)[0]);
+  for (const type of ["noul", "choice", "score"]) {
+    $(`add-${type}`).onclick = () => $("questions").append(questionEditor(unusedId(),
+      {type, criteria: type === "choice" ? {a: "", b: ""} : type === "score" ? ["low", "high"] : undefined}));
+  }
+  $("images").onchange = async () => {
+    const files = [...$("images").files].slice(0, 8);
+    images = await Promise.all(files.map((file) => new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    })));
+    $("thumbs").replaceChildren(...images.map((src) => el("img", {src, alt: ""})));
+  };
+  $("run").onclick = run;
+  const listing = await (await fetch("/v1/models")).json();
+  const chatIds = new Set((listing.data || []).map((card) => card.id));
+  for (const card of (listing.models || []).filter((card) => !chatIds.has(card.name))) {
+    $("model").append(el("option", {value: card.name, text: card.name, title: card.description || ""}));
+  }
+  if (listing.data?.length) chatModel = listing.data[0].id;
+}
+init();
+</script>
+</body>
+</html>

@@ -73,7 +73,7 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 - Quantized serving: FP8/INT8/AWQ/GPTQ/NVFP4 without full dequantization; opt-in FP8 EAGLE/MTP draft loading
 - Incremental architecture-state paths for Qwen3.6 and DeepSeek V4 plus an explicit recompute diagnostic mode; DeepSeek EP2/4/8 Attention-DP and direct packed-FP4 execution are implemented, with SM120 single-kernel and two-rank NCCL smokes green
 - Device-side sampling, penalties, spec verification, page-table caching; TP step headers sleep on Gloo while fixed-layout delta payloads use the bounded NCCL model group and rare controls remain Gloo objects; structured masks stay on CUDA with only selected IDs returned to the host matcher; deterministic n-gram/EAGLE-3/MTP drafts preserve T>0 and penalized sampling
-- Hardened gateway: auth, tenancy metering/invoicing, priority + SLO admission, batch API, embeddings/RAG, Responses API
+- Hardened gateway: auth, tenancy metering/invoicing, priority + SLO admission, batch API, embeddings/RAG, Responses API; System One (Jev wire API) at `/v1/systemone` outside ReplicaPool (m11 D8), GPU-verified with OpenJev in `openjev-diffusiongemma-26b-1gpu` (512-token think-first chat, Jev-style playground)
 - Orchestration (Conductor/MoA) with streaming, usage accounting, trace v2; assistant history round-trips typed `reasoning_content` while assistant-only LiteLLM provider objects and nullable legacy function calls are ignored before rendering and other extras remain fail-closed; MoA keeps the original response contract distinct from untrusted candidate drafts, with configured completion delimiters and the multi-stage boundary withholding private synthesis reasoning; prefix-aware replica placement obeys the configured queue-depth overload valve; Codex CLI and IDE tool-calling work end-to-end, including AUTO models over /v1/responses (#530)
 - Fleet: 3-gateway HA with PostgreSQL BatchStore, KV-aware prefix routing, DRAM KV tiering; Helm supports immutable images, split-role labels, safe rollout/drain, hardened Pods, and ServiceMonitor plus the kind CI drill
 - AsyncRequest v1 (opt-in `async_requests`): PostgreSQL-backed non-streaming Chat with tenant-scoped status/result/cancel, lease-fenced workers, shared queue telemetry and bounded request/audit retention; the retention-inclusive three-gateway Kind gate runs in F1c CI. Runner State v1 contracts (Kubernetes observation/reconciliation, fenced drain, failure-domain backoff, PostgreSQL leader lease, WP3.1 scaling policies, WP3.2 decision log) exist as a library
@@ -106,6 +106,26 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
 
+### 2026-10-01 — [amendment] System One second review round (PR #614)
+- What: `/v1/systemone` normalizes `samples`/`think`/`steps` ("32", 32.0) before reserving and forwarding (422 otherwise) and reserves `sequential` reads' repeated schema. The OpenJev overlay ends a thought cut at 512 with a budget sentence (budget forcing): empty answers after a cut thought 13/40 → 0/40; `l1` 8/8. Overlay re-pinned `5e8e2e08`; every gate passes.
+- Why: owner re-review: type changes and `sequential` still slipped past the reservation, and an answer pass could reopen a thought and return empty. vLLM refuses token bans for diffusion models, so the thought is closed in text.
+- Refs: m11 D8 metering; example `MEASUREMENTS.md` "Second review-fix rerun"
+
+### 2026-10-01 — [amendment] System One review fixes (PR #614)
+- What: `/v1/systemone` reserves the billed upper bound (questions as separate reads, think × samples), enforces each model's body limit, 502s unless both usage counts are valid, and tenant 429s use Jev's shape. The OpenJev overlay refuses empty `stop`/out-of-range `top_logprobs` before the thought; preflight exempts only the GPU the L1 holds; playground fixes. Gates pass on overlay `46530fa7`; `l1` thought-cut-then-answer fails intermittently (2/4, answer pass reopens a thought) — open finding.
+- Why: owner review: the old bound let one request bill 13× a tenant's bucket, and answer-only refusals after the thought ejected the only replica.
+- Refs: m11 D8 metering; example `MEASUREMENTS.md` "Review-fix rerun"
+
+### 2026-10-01 — [design] System One API through Kairyu; OpenJev example GPU-verified
+- What: Kairyu serves `POST /v1/systemone` (Jev wire API) via `HTTPSystemOneBackend`, not a pool member; `/v1/models` adds Jev's `models` list. The OpenJev example serves System One through Kairyu with a Jev-style playground, fixes the prefill template for vLLM's `openai` content format, pins the overlay, adopts 32 generations in flight + 8 queued (+32 % c32 tok/s), and passes every GPU gate including OpenJev's own live suite against Kairyu.
+- Why: owner request (Web UI following Jev, served by Kairyu). System One is a public wire format with several servers, so auth/tenancy/metering/admission belong in Kairyu; a pool member would let a System One 529 eject the chat replica.
+- Refs: m11 D8 (`docs/design/m11-product.md`); FN-D9 OpenJev amendment; example `MEASUREMENTS.md`; PR #614
+
+### 2026-10-01 — [design] OpenJev DiffusionGemma on one GPU, think = 512
+- What: new example `openjev-diffusiongemma-26b-1gpu`: one OpenJev replica (DiffusionGemma 26B-A4B NVFP4 on vLLM) behind the single-replica L2/L3. Every chat completion thinks first with a fixed 512-token thought, through an example-owned two-pass overlay on the published OpenJev image. `kairyu/` is unchanged. CPU tests and CPU evidence pass; GPU gates are pending.
+- Why: owner request. DiffusionGemma's `DiffusionSampler` does not apply vLLM's `thinking_token_budget`, and OpenJev's chat route has no budget, so OpenJev's own System One `think` method is applied to chat.
+- Refs: FN-D9 OpenJev one-GPU amendment in `docs/design/frontier-native-runtime.md`; plan `docs/superpowers/plans/2026-10-01-openjev-diffusiongemma-1gpu-example.md`; example `MEASUREMENTS.md`
+
 ### 2026-10-01 — [progress] V4.1 ensemble example GPU gates pass on the amended DTO-D17
 - What: readiness, vision, tool-calling, generic and coding matrices, and the browser smoke pass. Ensemble TTFT gate PASS at c1/c8/c16/c32 (8.7/7.7/39.6/95.8 % of 2× direct). Judge timeouts 3/269, all served by `deepseek_think`. 4/128 coding requests exceed 900 s after two audit refinements.
 - Refs: example `MEASUREMENTS.md` (runs `fb-*`); DTO-D17 in `docs/design/example-dual-track-orchestration.md`; PR #613
@@ -114,28 +134,3 @@ in `.claude/rules/progress-log.md`).
 - What: a judge timeout, backend error, or unparseable verdict now routes to `deepseek_think`, not the ensemble (`profile_judge.fallback`). `kairyu/` is unchanged. Every GPU gate is re-run.
 - Why: owner decision. A slow or failed judge says nothing about difficulty; escalating to the heavier route on a 5 s timeout added load when the system was busiest.
 - Refs: DTO-D17 second amendment in `docs/design/example-dual-track-orchestration.md`; PR #613
-
-### 2026-10-01 — [amendment] V4.1 ensemble example: looser ENSEMBLE criteria (DTO-D17)
-- What: the judge now sends hard problems and ties to ENSEMBLE (math/logic, algorithms, multi-file coding, proofs, design/planning, multi-step analysis, ambiguous requests). DEEPSEEK_THINK keeps everyday requests and routine agent turns. The example's GPU gates are re-run.
-- Why: owner request. The first DTO-D17 criteria sent 100% of the gate traffic and 44/44 live benchmark requests to deepseek_think.
-- Refs: DTO-D17 amendment in `docs/design/example-dual-track-orchestration.md`; PR #613
-
-### 2026-10-01 — [design] V4.1 ensemble example: two routes, two policies (DTO-D17)
-- What: `qwen3.8-deepseek-v4.1-8gpu` only. The judge offers DEEPSEEK_THINK and ENSEMBLE, and the other three routes are removed. `policies` writes two policies for `answer_1`/`answer_2`, one per Qwen replica. `synthesis` merges three candidates. Budget `{16, 2}`; the TTFT gate applies to the ensemble only. The V4 example and `kairyu/` are unchanged.
-- Why: owner decision. On five routes and four policies the Qwen pair was the bottleneck (c32 Qwen-route TTFT p50 43.9 s). The earlier GPU results are kept as superseded in the example's MEASUREMENTS.md.
-- Refs: DTO-D17 in `docs/design/example-dual-track-orchestration.md`; PR #613
-
-### 2026-09-30 — [design] Qwen3.8 + DeepSeek-V4.1 six-GPU ensemble example (DTO-D16)
-- What: new example `qwen3.8-deepseek-v4.1-8gpu`. It keeps the V4 ensemble method (judge + 5 routes, dual-track DAG, audit, budgets) on V4.1 DP6/EP6 (GPU 0–5) + Qwen TP1 × 2 (GPU 6, 7). `image_description` is removed; budget `{18, 2}`. DeepSeek roles use the official encoder via chat requests with one pool: `reasoning_effort` for thinking, `enable_thinking: false` for chat mode, no server-wide thinking default. Overlay edit 7 makes the V4.1 encoder continue a final `<think>` prefill (DTO-D9/D15 floor). `kairyu/` is unchanged.
-- Why: owner request — V4.1 takes images natively, so the Qwen description proxy is unnecessary. The encoder ignored `continue_final_message` and ORs `thinking`/`enable_thinking` (probed on the live six-GPU L1).
-- Refs: DTO-D16 in `docs/design/example-dual-track-orchestration.md`; plan `docs/superpowers/plans/2026-09-30-qwen38-deepseek-v41-8gpu-example.md`; example `MEASUREMENTS.md`
-
-### 2026-09-30 — [design] DeepSeek V4.1 Flash on six GPUs
-- What: new example `deepseek-v4.1-flash-6gpu` (GPUs 0–5, same L2/L3 as the 8-GPU example, all scripts example-owned). Bounded one-parameter comparisons select DP6/EP6 over the official TP2 degree (c32 +44–47 %) and DSpark with full verification plus the recipe's 4K / 0.92 memory levers (c1 +77 %, c32 +20 %).
-- Why: 6 × 96 GB is below the checkpoint's 614 GB official minimum; the recipe's DEP kernels, `indexer_sparse_logits` and adaptive verification do not run on SM120 with this runtime; masked sparse-KV rows need a zero row on EP6.
-- Refs: FN-D9 six-GPU amendment in `docs/design/frontier-native-runtime.md`; plan `docs/superpowers/plans/2026-09-30-deepseek-v41-flash-6gpu-example.md`; example `MEASUREMENTS.md`
-
-### 2026-09-30 — [amendment] m10 A39: AsyncRequest v1 pre-merge review fixes
-- What: an unstorable result publishes a fenced `result_persistence_failed` error after one retry; the third lease expiry fails a request with `lease_expired` instead of re-running it (defers and releases do not count); heartbeats retry transient renewal errors until the lease would expire; shutdown returns unfinished claims to the queue at once (zero-delay defer, no tenant cooldown); `/metrics` collectors render on the event loop with only the blocking store warmup off-loop; the capacity 429 omits `Retry-After` when request retention is off, and startup warns.
-- Why: PR #604 review — each replaced path re-ran inference (without bound for an unstorable result), read unlocked `ReplicaPool` state from a second thread, or promised a retry that could not succeed.
-- Refs: `docs/design/m10-fleet-cpu.md` A39 (supersedes A38's shutdown sentence); PR #604; `kairyu/async_requests/{worker,store,postgres_store}.py`, `kairyu/entrypoints/server/{metrics,health}.py`

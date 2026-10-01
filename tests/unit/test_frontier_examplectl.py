@@ -38,6 +38,7 @@ def test_examples_surface_contains_the_seven_hardware_examples() -> None:
         "qwen3.8-27b-1gpu",
         "qwen3.8-27b-dp8-8gpu",
         "qwen3.8-deepseek-v4-8gpu",
+        "qwen3.8-deepseek-v4.1-8gpu",
         "qwen3.8-flash-next-dp2-8gpu",
     ]
     qwen = json.loads((QWEN_EXAMPLE / "example.json").read_text())

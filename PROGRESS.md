@@ -82,6 +82,7 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 - Replica-pool scale-out examples (FN-D9, 2026-09-01): Qwen3.8 TP1 x 8 and DeepSeek TP4+EP4 x 2 behind one public model each; `verify.sh serving` proves the even per-replica split from the pool placement log and `verify.sh tool-calling` proves OpenAI tool calls on every replica (see their MEASUREMENTS.md); two vision replica examples (FN-D9 amendment 2026-09-04: DeepSeek-V4-Flash-Vision-Exp TP4+EP4 x 2, Qwen3.8-Flash-Next-FP8 TP4 x 2 on a shared upstream-main SM120 overlay image, Chat UI reasoning-effort dropdown, `verify.sh vision`) are GPU-verified (2026-09-04: pins locked, serving/tool-calling/vision gates PASS, MEASUREMENTS.md written); the Qwen example serves without the recipe's MTP k=3 because prefix caching + MTP corrupts batched output on this vLLM revision (vllm#53912)
 - DeepSeek V4.1 Flash single-replica example (FN-D9 amendment, 2026-09-11) is GPU-verified on TP8/EP8 SM120 with the V4 ReplicaPool/API/UI structure and official thinking-high default; bounded L1 comparisons select DSpark 5, 16K batching and NCCL. The 320-request matrix, reasoning/tool/vision/cancellation, normal restart and retrieval through 1,039,909 prompt tokens pass; exact evidence and limitations are in its `MEASUREMENTS.md`.
 - DeepSeek V4.1 Flash six-GPU example (FN-D9 six-GPU amendment, 2026-09-30): one DP6/EP6 replica on GPUs 0–5 with the 8-GPU example's L2/L3 structure and its own scripts; official-first L1 (pinned vLLM nightly + SM120 overlay, Engram offload, 4K batch / 0.92 from the recipe's memory-bound arm, DSpark 5 with full verification). Serving 102 / 591 / 718 tok/s at c1/c32/c64; gate evidence in its `MEASUREMENTS.md`.
+- Qwen3.8 + DeepSeek-V4.1 ensemble example (DTO-D16/D17, 2026-10-01): V4.1 DP6/EP6 (GPU 0–5, the six-GPU example's L1) + Qwen TP1 × 2 (GPU 6, 7). A Qwen judge picks one of two routes: thinking DeepSeek, or the dual-track ensemble with two policies and a three-candidate synthesis. Every role takes images natively; DeepSeek uses the official V4.1 encoder with per-request effort, and the example's overlay continues the floor's assistant prefill. ENSEMBLE criteria loosened and judge fallback moved to `deepseek_think` (DTO-D17 amendments). GPU-verified 2026-10-01: all gates pass, including the ensemble TTFT gate at c1–c32 (c32 at 95.8 % of the limit); 4 of 128 coding requests exceed the 900 s turn envelope after two audit refinements.
 - Process-split backend (`kairyu-proc`) with delta wire, TP group attestation, graceful lifecycle
 - CPU suite green (thousands of tests, no selected skips); CPU microbenchmark smoke + nightly regression series in CI
 
@@ -105,6 +106,30 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
 
+### 2026-10-01 — [progress] V4.1 ensemble example GPU gates pass on the amended DTO-D17
+- What: readiness, vision, tool-calling, generic and coding matrices, and the browser smoke pass. Ensemble TTFT gate PASS at c1/c8/c16/c32 (8.7/7.7/39.6/95.8 % of 2× direct). Judge timeouts 3/269, all served by `deepseek_think`. 4/128 coding requests exceed 900 s after two audit refinements.
+- Refs: example `MEASUREMENTS.md` (runs `fb-*`); DTO-D17 in `docs/design/example-dual-track-orchestration.md`; PR #613
+
+### 2026-10-01 — [amendment] V4.1 ensemble example: judge fallback is deepseek_think (DTO-D17)
+- What: a judge timeout, backend error, or unparseable verdict now routes to `deepseek_think`, not the ensemble (`profile_judge.fallback`). `kairyu/` is unchanged. Every GPU gate is re-run.
+- Why: owner decision. A slow or failed judge says nothing about difficulty; escalating to the heavier route on a 5 s timeout added load when the system was busiest.
+- Refs: DTO-D17 second amendment in `docs/design/example-dual-track-orchestration.md`; PR #613
+
+### 2026-10-01 — [amendment] V4.1 ensemble example: looser ENSEMBLE criteria (DTO-D17)
+- What: the judge now sends hard problems and ties to ENSEMBLE (math/logic, algorithms, multi-file coding, proofs, design/planning, multi-step analysis, ambiguous requests). DEEPSEEK_THINK keeps everyday requests and routine agent turns. The example's GPU gates are re-run.
+- Why: owner request. The first DTO-D17 criteria sent 100% of the gate traffic and 44/44 live benchmark requests to deepseek_think.
+- Refs: DTO-D17 amendment in `docs/design/example-dual-track-orchestration.md`; PR #613
+
+### 2026-10-01 — [design] V4.1 ensemble example: two routes, two policies (DTO-D17)
+- What: `qwen3.8-deepseek-v4.1-8gpu` only. The judge offers DEEPSEEK_THINK and ENSEMBLE, and the other three routes are removed. `policies` writes two policies for `answer_1`/`answer_2`, one per Qwen replica. `synthesis` merges three candidates. Budget `{16, 2}`; the TTFT gate applies to the ensemble only. The V4 example and `kairyu/` are unchanged.
+- Why: owner decision. On five routes and four policies the Qwen pair was the bottleneck (c32 Qwen-route TTFT p50 43.9 s). The earlier GPU results are kept as superseded in the example's MEASUREMENTS.md.
+- Refs: DTO-D17 in `docs/design/example-dual-track-orchestration.md`; PR #613
+
+### 2026-09-30 — [design] Qwen3.8 + DeepSeek-V4.1 six-GPU ensemble example (DTO-D16)
+- What: new example `qwen3.8-deepseek-v4.1-8gpu`. It keeps the V4 ensemble method (judge + 5 routes, dual-track DAG, audit, budgets) on V4.1 DP6/EP6 (GPU 0–5) + Qwen TP1 × 2 (GPU 6, 7). `image_description` is removed; budget `{18, 2}`. DeepSeek roles use the official encoder via chat requests with one pool: `reasoning_effort` for thinking, `enable_thinking: false` for chat mode, no server-wide thinking default. Overlay edit 7 makes the V4.1 encoder continue a final `<think>` prefill (DTO-D9/D15 floor). `kairyu/` is unchanged.
+- Why: owner request — V4.1 takes images natively, so the Qwen description proxy is unnecessary. The encoder ignored `continue_final_message` and ORs `thinking`/`enable_thinking` (probed on the live six-GPU L1).
+- Refs: DTO-D16 in `docs/design/example-dual-track-orchestration.md`; plan `docs/superpowers/plans/2026-09-30-qwen38-deepseek-v41-8gpu-example.md`; example `MEASUREMENTS.md`
+
 ### 2026-09-30 — [design] DeepSeek V4.1 Flash on six GPUs
 - What: new example `deepseek-v4.1-flash-6gpu` (GPUs 0–5, same L2/L3 as the 8-GPU example, all scripts example-owned). Bounded one-parameter comparisons select DP6/EP6 over the official TP2 degree (c32 +44–47 %) and DSpark with full verification plus the recipe's 4K / 0.92 memory levers (c1 +77 %, c32 +20 %).
 - Why: 6 × 96 GB is below the checkpoint's 614 GB official minimum; the recipe's DEP kernels, `indexer_sparse_logits` and adaptive verification do not run on SM120 with this runtime; masked sparse-KV rows need a zero row on EP6.
@@ -114,37 +139,3 @@ in `.claude/rules/progress-log.md`).
 - What: an unstorable result publishes a fenced `result_persistence_failed` error after one retry; the third lease expiry fails a request with `lease_expired` instead of re-running it (defers and releases do not count); heartbeats retry transient renewal errors until the lease would expire; shutdown returns unfinished claims to the queue at once (zero-delay defer, no tenant cooldown); `/metrics` collectors render on the event loop with only the blocking store warmup off-loop; the capacity 429 omits `Retry-After` when request retention is off, and startup warns.
 - Why: PR #604 review — each replaced path re-ran inference (without bound for an unstorable result), read unlocked `ReplicaPool` state from a second thread, or promised a retry that could not succeed.
 - Refs: `docs/design/m10-fleet-cpu.md` A39 (supersedes A38's shutdown sentence); PR #604; `kairyu/async_requests/{worker,store,postgres_store}.py`, `kairyu/entrypoints/server/{metrics,health}.py`
-
-### 2026-09-15 — [progress] Durable autoscaler observation and decision log
-- What: added bounded source-timestamped scaling windows, exact policy/input
-  decision records, stale-input scale-down rejection, and a shared PostgreSQL
-  append-only log with idempotency, fixed capacity, and strict schema checks.
-- Refs: docs/design/runner-state-v1.md; kairyu/runners/scaling_log.py;
-  kairyu/runners/postgres_scaling_log.py
-
-### 2026-09-15 — [design] Model-class scaling policy v1
-- What: added bounded min/max, buffer, timing, scale-to-zero approval,
-  multiplexing, and per-decision step contracts plus a versioned policy catalog.
-- Why: autoscaler decisions need immutable safety bounds before durable input logging.
-- Refs: docs/design/runner-state-v1.md; kairyu/runners/scaling.py
-
-### 2026-09-15 — [progress] Runner control-plane safety through WP2.6
-- What: added Kubernetes reconciliation, drain authorization, revision/node/GPU
-  backoff, and PostgreSQL lease-fenced single-writer gates for controller and
-  autoscaler work.
-- Refs: docs/design/runner-state-v1.md; kairyu/runners; tests/unit/test_runner_*.py
-
-### 2026-09-11 — [design] Runner State v1 and startup evidence
-- What: added immutable, versioned Runner status and startup phase schemas,
-  strict logical transition validation, pure status updates, and gap-free
-  image/model/compile/warmup reporting with bounded failure records.
-- Why: Pod phase alone cannot distinguish image pull, model load, warmup,
-  serving readiness, active work, or safe drain; controller and autoscaler
-  implementation now share one executable contract.
-- Refs: docs/design/runner-state-v1.md; kairyu/runners;
-  tests/unit/test_runner_lifecycle.py
-
-### 2026-09-11 — [progress] V4.1 L1 selection and final GPU gates complete
-- What: select TP8/EP8, DSpark 5, 16K batching and NCCL; the 320-request matrix, default/explicit reasoning, tools, images, cancellation, normal restart and four long-context retrieval smokes pass. Best measured aggregate throughput is 326.82 tok/s at c32; near-1M retrieval completes in 203.02 s.
-- Why: DSpark improves c1 throughput 1.91×; EP-off exhausts KV memory at the same limits, PCIe IPC stalls during autotuning, and 8K batching shows no throughput gain. Keep unmeasured alternatives and broad quality claims outside this evidence.
-- Refs: PR #597; FN-D9 V4.1 amendment; example `MEASUREMENTS.md` records exact configuration, run IDs, hashes and limitations.

@@ -11,7 +11,9 @@ Chat UI and Terminal-Bench passes remain on the next-window list. The
 previous green run (2026-08-18, `20260818T025710Z`) measured the pre-DTO-D8
 nine-role DAG.
 Applies to: `examples/qwen3.8-deepseek-v4-8gpu/` and the L2 mechanisms in
-`kairyu/orchestration/` + `kairyu/dsl/` that it consumes.
+`kairyu/orchestration/` + `kairyu/dsl/` that it consumes; DTO-D16 applies the
+same policy to `examples/qwen3.8-deepseek-v4.1-8gpu/`, reduced there to two
+routes and two policies by DTO-D17.
 Supersedes the ECO-D2/D3/D5/D6 role graphs, profiles, and profile judge in
 `example-coding-orchestration.md` (owner decision, 2026-08-18: the coding DAG,
 the general ensemble profile, the LLM profile judge, and the sandbox execution
@@ -606,6 +608,129 @@ Status: accepted; implemented; serving gates GPU re-verify and digest re-pin pen
   `prompt_suffix`.
 - GPU consequences: served config changed → both serving gates and the
   digest re-pin must be re-run before the next status claim.
+
+### DTO-D16 — DeepSeek V4.1 six-GPU + Qwen two-replica variant (owner decision, 2026-09-30)
+
+Status: accepted; implemented. Startup probes, vision, tool-calling, and the
+generic matrix passed on the five-route, four-policy configuration; DTO-D17
+then reduced the routes and policies, so those gates are re-run on the new
+configuration (plan
+`docs/superpowers/plans/2026-09-30-qwen38-deepseek-v41-8gpu-example.md`).
+
+- New example `qwen3.8-deepseek-v4.1-8gpu`: DeepSeek-V4.1-Flash as one
+  DP6/EP6 replica on GPUs 0–5 (the measured L1 of `deepseek-v4.1-flash-6gpu`,
+  FN-D9 six-GPU amendment) and Qwen3.8-27B TP1 × 2 on GPUs 6 and 7. The
+  V4 example is unchanged. The ensemble method is inherited unchanged:
+  the judge and its five routes (D13), the three-wave dual-track DAG (D1, D2),
+  the head stream and TTFT gate (D3), peer synthesis with the inline Qwen
+  audit (D10, D14), the sampling policy and budgets (D8, D12), and the
+  public-output floor (D9, D15). Role prompt bodies, seeds, and the four
+  policy-bound answerers are kept; wave 2 now shares two Qwen replicas.
+- D11 is withdrawn for this variant. V4.1 accepts images, so every worker is
+  image-capable. `derive_multimodal_prompt` attaches the request's images to
+  each role call, so `image_description`, its dependencies, and every
+  `IMAGE DESCRIPTION` block are removed; the budget becomes `{18, 2}`. The
+  judge now offers every route on image requests, because each route's worker
+  accepts images. The ensemble's image limit is the Qwen pool's one-image
+  policy.
+- DeepSeek roles move from inline completion scaffolds (D6, D7) to the
+  official V4.1 encoder on the chat path. Images can only reach a role
+  through a chat message, and V4.1 renders chats with its Python encoder,
+  not a Jinja template. Role prompts keep their text without the
+  `<｜User｜>`/`<｜Assistant｜>` scaffolding.
+  - One DeepSeek pool serves every DeepSeek role. `inherit` roles send the
+    L3 effort as `reasoning_effort` (thinking, 50/75/100 budgets). The
+    effort-less `deepseek_answer` gets Kairyu's existing `enable_thinking:
+    false`, which requires the L1 to carry no `thinking: true` default
+    (the encoder ORs the two keys).
+  - The V4 preamble templates are not carried over.
+- The D9 floor on the DeepSeek final units uses D15's `chat` continuation.
+  The pinned V4.1 encoder ignores `continue_final_message`: it appends
+  end-of-sentence and re-renders an empty think span. This example's own
+  overlay therefore patches the encoder to render a final
+  `<think>…</think>` assistant prefill as an open continuation. This is a
+  runtime adaptation owned by the example; `kairyu/` is unchanged.
+- Rationale: owner request — V4.1 performance on the six-GPU L1 with the
+  inherited ensemble method, and native image input in place of the
+  Qwen-described proxy.
+
+### DTO-D17 — Two routes and two policies for the V4.1 example (owner decision, 2026-10-01)
+
+Status: accepted; implemented, with the two amendments below. On the
+amended configuration every GPU gate passes on 2026-10-01: readiness, vision,
+tool-calling, the generic matrix, the coding matrix (ensemble TTFT gate PASS
+at c1/c8/c16/c32; c32 at 95.8 % of the limit), and the browser smoke. 4 of 128
+coding requests exceed the 900 s turn envelope after two audit refinements.
+See the example's MEASUREMENTS.md.
+
+Applies only to `examples/qwen3.8-deepseek-v4.1-8gpu/`. The V4 example keeps
+five routes and four policies.
+
+- **Routes.** Two routes remain: `DEEPSEEK_THINK` → `deepseek_think` and
+  `ENSEMBLE` → `primary`, with fallback `primary`.
+  - `qwen_direct`, `qwen_think_medium`, and `deepseek_direct` are removed.
+  - The `DEEPSEEK_THINK` criteria now cover every request that one careful
+    expert answer handles, from greetings and short questions to hard
+    problems. Without this, requests the removed Qwen routes used to serve
+    would match no choice.
+  - The `ENSEMBLE` criteria are unchanged.
+- **Policies.** `policies` writes `POLICY 1:` and `POLICY 2:`. `answer_3`
+  and `answer_4` are removed, so each Qwen replica hosts one answerer.
+- **Synthesis.** It merges three UNTRUSTED peer candidates: 1 = `answer_1`,
+  2 = `answer_2`, and 3 = critique.
+- **Budget.** `{16, 2}`: 7 generation units, 1 empty-output re-dispatch,
+  3 audit verdicts, 3 inconclusive re-verifies, and 2 refinements.
+- **DeepSeek pool.** No DeepSeek role is effort-less, so the pool no longer
+  allows `enable_thinking`. The Qwen pool keeps it for the judge and head.
+- **TTFT gate.** The coding gate is applied to the ensemble only
+  (`ttft_gated_profiles: [primary]`). The thinking direct route is reported,
+  not gated.
+- **Unchanged.** The head, draft, critique, and audit roles; the effort
+  budgets; `internal_max_tokens`; and the 256-token floor.
+- **Rationale.** Owner request. The route mix and the width-4 fan-out were
+  measured with the Qwen pair as the bottleneck: at c32 the Qwen-only routes
+  reached a 43.9 s TTFT p50 and the judge a 2.4 s p50.
+
+**DTO-D17 amendment (owner, 2026-10-01): looser ENSEMBLE criteria.**
+
+- **Why:** under the first DTO-D17 criteria the judge routed 100% of the
+  gates' synthetic requests and of a live benchmark (44/44) to
+  `deepseek_think`. The ENSEMBLE text excluded anything DEEPSEEK_THINK
+  "would already answer", so almost nothing qualified.
+- **New `DEEPSEEK_THINK` criteria:** everyday to moderate requests.
+  - greetings and short questions, facts
+  - rewording, translation, formatting
+  - simple explanations, small well-specified code edits
+  - routine agent tool-call turns whose next action is clear
+- **New `ENSEMBLE` criteria:** requests whose correctness depends on deep
+  reasoning or on comparing approaches.
+  - math or logic, algorithm design, multi-file coding or debugging
+  - proofs, design or planning, multi-step analysis
+  - ambiguous or multi-constraint requests, and any request for a thorough
+    answer
+  - The deterrent sentences are removed, and the criteria end with "If
+    unsure between the two routes, choose ENSEMBLE."
+- **Why the tie-break is in the criteria text:** the judge's
+  `prompt_prefix`/`prompt_suffix` would turn the judge prompt into a
+  pre-rendered raw prompt, dropping the Qwen chat template and
+  `enable_thinking: false`.
+- **Status:** GPU gates re-run after this amendment.
+
+**DTO-D17 second amendment (owner, 2026-10-01): fallback `deepseek_think`.**
+
+- **What:** `profile_judge.fallback` changes from `primary` to
+  `deepseek_think`. A judge timeout (5 s), a backend error, an unparseable
+  verdict, or a request the judge does not see now runs one thinking
+  DeepSeek call instead of the ensemble.
+- **Why:** a judge that is slow or broken says nothing about the request's
+  difficulty. Sending such requests to the heavier route made a 5 s judge
+  delay escalate work exactly when the system is most loaded.
+- **Mechanism:** the existing `ProfileJudgeSpec.fallback` setting; `kairyu/`
+  is unchanged. `control.py` checks the served fallback against
+  `example.json` at readiness.
+- **Status:** every GPU gate passes on this configuration (2026-10-01). Judge
+  timeouts: 3 of 269 judged requests, all served by `deepseek_think`. The
+  earlier amendment's runs are kept in MEASUREMENTS.md as superseded.
 
 ## Acceptance
 

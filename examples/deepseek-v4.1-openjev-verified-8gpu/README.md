@@ -63,6 +63,9 @@ curl -s http://127.0.0.1:8013/v1/chat/completions -H 'Content-Type: application/
   - `requirements_unconfirmed`: the requirement checklist still left an
     instruction unit uncovered after re-extraction and curation, so passing
     it would prove nothing; the answer is returned without a guarantee.
+  - `requirements_unconfirmed`: the requirement checklist still left an
+    instruction unit uncovered after re-extraction and curation, so passing
+    it would prove nothing; the answer is returned without a guarantee.
 
 The answer page (`http://<host>:3013`) shows the badge, the reason and the
 requirement table; internal stages are folded below the answer.

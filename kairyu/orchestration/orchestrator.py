@@ -41,7 +41,7 @@ from kairyu.orchestration.conductor import (
     ConductorStreamError,
     CostModel,
     RoleSpec,
-    inline_bound_role_names,
+    final_unit_role,
     zero_cost,
 )
 from kairyu.orchestration.execution import ExecutionBackend, ExecutorDescriptor
@@ -1123,22 +1123,9 @@ class Orchestrator:
         )
 
     def _conductor_final_role(self, roles: tuple[RoleSpec, ...]) -> RoleSpec:
-        # The Conductor's units: inline-bound roles (run inside a verifier's
-        # loop) are never the final unit.
-        inline = inline_bound_role_names(roles)
-        units = [
-            role for role in roles if role.role_type != "verifier" and role.name not in inline
-        ]
-        dependents = {dependency for role in units for dependency in role.depends_on}
-        terminal = [
-            role
-            for role in units
-            if role.name not in dependents and role.role_type not in {"head", "executor"}
-        ]
-        synthesizers = [role for role in terminal if role.role_type == "synthesizer"]
-        if not terminal:
-            raise ValueError("orchestration requires at least one terminal role")
-        return (synthesizers + terminal)[0]
+        # Exactly the Conductor's resolution (inline-bound roles excluded and
+        # dependencies on them remapped to their targets).
+        return final_unit_role(roles)
 
     def _conductor_head_role(self, roles: tuple[RoleSpec, ...]) -> RoleSpec | None:
         return next((role for role in roles if role.role_type == "head"), None)

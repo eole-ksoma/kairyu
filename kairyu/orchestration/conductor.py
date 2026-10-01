@@ -302,16 +302,16 @@ class RoleSpec:
                 )
 
 
-def inline_bound_role_names(roles: tuple[RoleSpec, ...]) -> frozenset[str]:
-    """Roles a verifier runs inline on every attempt of its target.
+def inline_bound_roles(roles: tuple[RoleSpec, ...]) -> dict[str, str]:
+    """Roles a verifier runs inline on every attempt, mapped to its target.
 
     Executors a verifier depends on, and generation roles a checklist
     verifier depends on that themselves depend on its target. They are not
-    DAG units, so they can never be the final unit.
+    DAG units: a dependency on one is a dependency on the target.
     """
 
     by_name = {role.name: role for role in roles}
-    bound: set[str] = set()
+    bound: dict[str, str] = {}
     for verifier in roles:
         if verifier.role_type != "verifier" or verifier.verifies is None:
             continue
@@ -324,8 +324,47 @@ def inline_bound_role_names(roles: tuple[RoleSpec, ...]) -> frozenset[str]:
                 and role.role_type not in {"verifier", "head"}
                 and verifier.verifies in role.depends_on
             ):
-                bound.add(dep)
-    return frozenset(bound)
+                bound[dep] = verifier.verifies
+    return bound
+
+
+def inline_bound_role_names(roles: tuple[RoleSpec, ...]) -> frozenset[str]:
+    return frozenset(inline_bound_roles(roles))
+
+
+def final_unit_role(roles: tuple[RoleSpec, ...]) -> RoleSpec:
+    """The unit that publishes the answer: the Conductor's own resolution.
+
+    Units exclude verifiers and inline-bound roles; a dependency on a
+    verifier or an inline-bound role counts as one on its target. The final
+    unit is the first terminal synthesizer, else the first terminal unit
+    (heads and executors never publish).
+    """
+
+    by_name = {role.name: role for role in roles}
+    inline = inline_bound_roles(roles)
+    units = [
+        role for role in roles if role.role_type != "verifier" and role.name not in inline
+    ]
+
+    def target(dep: str) -> str:
+        role = by_name.get(dep)
+        if role is not None and role.role_type == "verifier" and role.verifies:
+            return role.verifies
+        return inline.get(dep, dep)
+
+    dependents = {
+        target(dep) for unit in units for dep in unit.depends_on if target(dep) != unit.name
+    }
+    terminal = [
+        unit
+        for unit in units
+        if unit.name not in dependents and unit.role_type not in {"head", "executor"}
+    ]
+    if not terminal:
+        raise ValueError("orchestration requires at least one generation role")
+    synthesizers = [unit for unit in terminal if unit.role_type == "synthesizer"]
+    return (synthesizers + terminal)[0]
 
 
 @dataclass(frozen=True)
@@ -1122,6 +1161,19 @@ class Conductor:
         self._validate_checklists()
         if self._units:
             final = self._selected_final_unit()
+            # One final-unit resolution for the Conductor and its callers.
+            assert final_unit_role(self._roles).name == final.name
+            final_verifier = self._verifier_for.get(final.name)
+            if final_verifier is not None and (
+                final_verifier.checklist is not None
+                and final_verifier.checklist.curate is not None
+            ):
+                # The guarantee report describes the judged attempt; a
+                # curation would publish different text than was judged.
+                raise ValueError(
+                    f"checklist verifier {final_verifier.name!r} of the final unit "
+                    f"{final.name!r} cannot curate its output"
+                )
             # A final-unit sampling block is deployment policy layered over
             # the caller's public params (DTO-D13): style fields override,
             # max_tokens only caps the caller's allowance; the caller's intent

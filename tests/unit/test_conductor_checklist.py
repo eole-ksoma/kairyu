@@ -3,6 +3,8 @@ guarantee report published with the final answer."""
 
 import json
 
+import pytest
+
 from kairyu.engine.backend import GenerationRequest, GenerationResult
 from kairyu.engine.systemone import SystemOneReply, SystemOneUnavailableError
 from kairyu.orchestration.budget import Budget
@@ -463,3 +465,75 @@ async def test_a_downstream_seed_publishes_the_attempt_the_verifier_kept():
 
     assert result.final_text == "good answer"
     assert result.completions[0].text == "good answer"
+
+
+def _inline_claims_roles(*, writer_seeded: bool) -> tuple[RoleSpec, ...]:
+    return (
+        RoleSpec(name="draft", worker="gen", prompt="[draft] {query}"),
+        RoleSpec(name="claims", worker="gen", prompt="[claims] {draft}", depends_on=("draft",)),
+        RoleSpec(
+            name="check",
+            worker="judge",
+            prompt="",
+            role_type="verifier",
+            verifies="draft",
+            depends_on=("draft", "claims"),
+            checklist=ChecklistConfig(
+                questions=(ChecklistQuestion(id="R1", proposition="ok"),),
+                state=(StateSection("claims", "claims"),),
+            ),
+        ),
+        RoleSpec(
+            name="writer",
+            worker="gen",
+            prompt="" if writer_seeded else "[writer] {claims}",
+            depends_on=("draft", "claims"),
+            seed_from="draft" if writer_seeded else None,
+            refine_prompt="[fix] {previous}" if writer_seeded else "",
+        ),
+    )
+
+
+async def test_the_orchestrator_resolves_the_final_unit_like_the_conductor():
+    # Review P2 (round 3): a dependency on an inline role is one on its target,
+    # so the writer, not the draft, publishes; a seeded writer refuses n > 1.
+    from kairyu.orchestration.orchestrator import Orchestrator
+    from kairyu.orchestration.request import OrchestrationRequest
+    from kairyu.orchestration.router import RouteThresholds, RuleRouter
+    from kairyu.sampling_params import SamplingParams
+
+    for seeded in (False, True):
+        roles = _inline_claims_roles(writer_seeded=seeded)
+        orchestrator = Orchestrator(
+            {"gen": RoutedBackend({})},
+            router=RuleRouter(RouteThresholds(multi_step_markers=0)),
+            roles=roles,
+            decision_workers={"judge": FakeSystemOne({})},
+        )
+        assert orchestrator._conductor_final_role(roles).name == "writer"
+    with pytest.raises(ValueError, match="n > 1"):
+        await orchestrator.run(
+            OrchestrationRequest(prompt="q", sampling_params=SamplingParams(max_tokens=8, n=2))
+        )
+
+
+def test_a_final_checklist_cannot_curate_what_it_publishes():
+    # Review P1 (round 3): the guarantee must describe the published text.
+    roles = (
+        RoleSpec(name="answer", worker="gen", prompt="[answer] {query}"),
+        RoleSpec(
+            name="check",
+            worker="judge",
+            prompt="",
+            role_type="verifier",
+            verifies="answer",
+            depends_on=("answer",),
+            checklist=ChecklistConfig(
+                questions=(ChecklistQuestion(id="R1", proposition="ok"),),
+                state=(StateSection("answer", "answer"),),
+                curate=CurationConfig(items_path="items", drop_group="checklist"),
+            ),
+        ),
+    )
+    with pytest.raises(ValueError, match="cannot curate"):
+        Conductor(roles, {"gen": RoutedBackend({})}, decision_workers={"judge": FakeSystemOne({})})

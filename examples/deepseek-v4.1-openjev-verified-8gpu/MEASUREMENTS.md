@@ -96,3 +96,50 @@ Result (alpha = 0.10, 95 % confidence): **tau_hi = 0.9966**.
 
 Held-out answers: 54 / 125 pass every requirement; 10 of them carry at least
 one labelled violation.
+
+## GPU gates on the final code (2026-10-01, `5b455dd8` plus the G3/report fixes)
+
+Raw rows: `results/{structured,requirements,serving}-2026100*T11*Z.json`,
+`results/serving-20261001T124829Z.json`. Every request routes through the
+verified DAG (`multi_agent`); tokens are internal orchestration totals
+(DeepSeek + System One).
+
+| Gate | Result |
+|---|---|
+| `l1` (readiness) | PASS: JSON-grammar probe on every DP rank, thinking and chat; System One on each OpenJev replica |
+| `repair` (16 constraint requests, c8) | PASS: 16/16 answered, 13 guaranteed, 5 repaired, 0 guaranteed answers violate their stated constraint (independent check); p50 65 s, p95 186 s |
+| `structured` (caller json_schema) | PASS: schema-valid and guaranteed |
+| `fallback` | PASS: one OpenJev down still guaranteed; both down 200 + `judge_unavailable`; recovered |
+| `requirements` (40 InFoBench, c8) | PASS: gold-question recall 0.901 on all 40; 11 guaranteed, 36 repaired; p50 209 s, p95 421 s; 772 output tok/s aggregate |
+| `serving` (InFoBench, c1/c4/c8/c16) | PASS: every request answered with a flag (table below) |
+| `browser-smoke.sh` | PASS: badge "Guaranteed", answer "red, blue, yellow" |
+
+Serving (each row: requests / ok / guaranteed / repaired / mean attempts /
+latency p50 / p95 / per-request internal input / output tokens (median) /
+per-request output tok/s median (range) / aggregate output tok/s / req/min):
+
+| c | n | ok | guaranteed | repaired | attempts | latency p50 / p95 s | tokens in / out | tok/s per request | aggregate tok/s | req/min |
+|---|---:|---:|---:|---:|---:|---|---|---|---:|---:|
+| c1 | 8 | 8 | 2 (25 %) | 8 | 2.75 | 141.1 / 221.1 | 11,134 / 27,416 | 180.9 (160.7-206.2) | 185.9 | 0.39 |
+| c4 | 16 | 16 | 5 (31 %) | 15 | 2.69 | 153.5 / 293.5 | 11,158 / 21,982 | 141.9 (121.7-153.6) | 525.7 | 1.38 |
+| c8 | 16 | 16 | 6 (38 %) | 11 | 2.31 | 213.4 / 346.5 | 10,650 / 24,328 | 110.9 (86.7-226.1) | 808.8 | 1.95 |
+| c16 | 32 | 32 | 8 (25 %) | 27 | 2.62 | 260.2 / 443.4 | 13,152 / 23,653 | 87.9 (72.1-130.6) | 1133.0 | 2.91 |
+
+DeepSeek L1 during the gates (30-60 s samples of vLLM `/metrics`, six DP
+ranks): 175 tok/s generation at c1, 590-760 tok/s at c4-c8; DSpark
+acceptance 51-63 %; prefix-cache hits 15.5 % of prompt tokens.
+
+Findings (open):
+
+- Guarantee rate on long InFoBench requests is 25-38 %; most unguaranteed
+  answers fail requirements scored 0.7-0.99 against tau_hi 0.9966, or G1
+  (per-claim groundedness, minimum over claims, not separately calibrated).
+  Short constraint requests reach 81 %.
+- Latency is dominated by internal tokens (thinking-high extraction and
+  draft, repairs averaging 2.3-2.8 attempts): p50 141 s at c1, 260 s at
+  c16. No latency target has been agreed yet.
+- Defects found and fixed during the gates: G3 read JSON keys and code
+  string literals as quotations; verbatim matching failed on typography;
+  a report omitted requirements an early check failure left unread; the
+  extractor read Kairyu's answer-contract wrapper; V4.1 thinks unless
+  `enable_thinking: false` is sent.

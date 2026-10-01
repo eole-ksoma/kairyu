@@ -3,10 +3,15 @@
 A System One server answers ``POST /v1/systemone``: a ``state`` and typed
 ``questions`` in, per-question probabilities and ``usage`` out. TypeSafe's Jev,
 OpenJev and Codiv serve the same wire API. Kairyu forwards a request to one
-configured upstream and owns admission in front of it, so an overloaded
-upstream sees a bounded load and the caller gets a 429 before the upstream
-would answer 529. The upstream owns the schema and its errors; they pass
-through unchanged.
+of the configured upstream replicas and owns admission in front of them, so an
+overloaded upstream sees a bounded load and the caller gets a 429 before the
+upstream would answer 529. The upstream owns the schema and its errors; they
+pass through unchanged.
+
+With several replicas a request goes to the one with the fewest requests in
+flight. An unreachable replica or an overload/unavailable status moves the
+request to another replica once; reads are side-effect free, so one retry is
+safe (m11 D8 replica amendment).
 
 This backend is never a ReplicaPool member: System One reads are not
 generation requests, and an upstream 529 must not eject a chat replica that
@@ -24,6 +29,9 @@ import httpx
 # Upstream headers a System One client reads. Server-Timing carries the
 # model/server split; retry-after belongs to 429/503/529.
 _PASSED_HEADERS = ("content-type", "retry-after", "server-timing")
+# Upstream statuses that say "this replica cannot serve now", not "this
+# request is wrong": the read moves to another replica once.
+_RETRY_ON_OTHER_REPLICA = frozenset({429, 502, 503, 504, 529})
 
 
 class SystemOneCapacityError(RuntimeError):
@@ -47,8 +55,9 @@ class HTTPSystemOneBackend:
     def __init__(
         self,
         *,
-        base_url: str,
+        base_url: str | None = None,
         upstream_model: str,
+        base_urls: tuple[str, ...] = (),
         api_key_env: str | None = None,
         timeout_s: float = 300.0,
         max_concurrency: int = 64,
@@ -65,7 +74,13 @@ class HTTPSystemOneBackend:
             api_key = os.environ.get(api_key_env)
             if not api_key:
                 raise ValueError(f"System One API key variable {api_key_env!r} is not set")
-        self._url = base_url.rstrip("/") + "/v1/systemone"
+        urls = (base_url,) if base_url is not None else tuple(base_urls)
+        if (base_url is None) == (not base_urls) or not urls:
+            raise ValueError("System One requires exactly one of base_url or base_urls")
+        if len(set(urls)) != len(urls):
+            raise ValueError("System One base_urls must be distinct")
+        self._urls = tuple(url.rstrip("/") + "/v1/systemone" for url in urls)
+        self._in_flight = dict.fromkeys(self._urls, 0)
         self._upstream_model = upstream_model
         self._headers = {"authorization": f"Bearer {api_key}"} if api_key else {}
         self._slots = asyncio.Semaphore(max_concurrency)
@@ -96,18 +111,49 @@ class HTTPSystemOneBackend:
         finally:
             self._waiting -= 1
 
-    async def decide(self, body: dict) -> SystemOneReply:
-        """Forward one request body (any model alias) to the upstream model."""
+    @property
+    def replica_count(self) -> int:
+        return len(self._urls)
 
-        await self._acquire()
+    def _replica_order(self) -> list[str]:
+        # Fewest in flight first; ties keep configuration order.
+        return sorted(self._urls, key=lambda url: self._in_flight[url])
+
+    async def _post(self, url: str, body: dict) -> httpx.Response:
+        self._in_flight[url] += 1
         try:
-            response = await self._client.post(
-                self._url,
+            return await self._client.post(
+                url,
                 json={**body, "model": self._upstream_model},
                 headers=self._headers,
             )
-        except httpx.HTTPError as error:
-            raise SystemOneUnavailableError(type(error).__name__) from error
+        finally:
+            self._in_flight[url] -= 1
+
+    async def decide(self, body: dict) -> SystemOneReply:
+        """Forward one request body (any model alias) to an upstream replica.
+
+        Raises ``SystemOneUnavailableError`` only when every tried replica was
+        unreachable; an upstream status reply (including 529) is returned so
+        the public route can pass it through unchanged.
+        """
+
+        await self._acquire()
+        try:
+            response: httpx.Response | None = None
+            last_error: httpx.HTTPError | None = None
+            for url in self._replica_order()[:2]:
+                try:
+                    response = await self._post(url, body)
+                except httpx.HTTPError as error:
+                    last_error = error
+                    response = None
+                    continue
+                if response.status_code not in _RETRY_ON_OTHER_REPLICA:
+                    break
+            if response is None:
+                assert last_error is not None
+                raise SystemOneUnavailableError(type(last_error).__name__) from last_error
         finally:
             self._slots.release()
         headers = {

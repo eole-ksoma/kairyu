@@ -658,6 +658,17 @@ servers and SDKs, so serving it through Kairyu's auth, tenancy, metering and
 admission is a shared contract, not one example's workflow. Examples own the
 model choice, aliases, limits and any UI.
 
+**Replica amendment (2026-10-01).** `systemone.<name>.base_urls` (exclusive
+with `base_url`) serves one model from several upstream replicas. A read goes
+to the replica with the fewest reads in flight; a transport error or a 429,
+502, 503, 504 or 529 moves it to another replica once (reads are side-effect
+free). When every tried replica is unreachable the backend raises
+`SystemOneUnavailableError` (the public route answers 503; a checklist
+verifier reports `judge_unavailable`, m1 D8). Admission stays one bounded
+queue per model. Why: a System One model deployed for availability or load
+has more than one server, and a checklist verifier's guarantee must not
+depend on one GPU. Tests: `tests/server/test_systemone_api.py`.
+
 ## 3. Non-goals
 
 - A native in-process Kairyu VLM runner, tenant-controlled remote image

@@ -7,10 +7,25 @@ from pathlib import Path
 
 import yaml
 
-from kairyu.dsl.spec import OrchestratorSpec, RoleNodeSpec, WorkerSpec
+from kairyu.dsl.spec import (
+    ChecklistSpec,
+    ItemSourceSpec,
+    OrchestratorSpec,
+    RoleNodeSpec,
+    WorkerSpec,
+)
 from kairyu.engine.backend import EngineBackend
 from kairyu.engine.registry import create_backend
 from kairyu.orchestration.budget import Budget
+from kairyu.orchestration.checklist import (
+    ChecklistCheck,
+    ChecklistConfig,
+    ChecklistQuestion,
+    CurationConfig,
+    DecisionBackend,
+    ItemSource,
+    StateSection,
+)
 from kairyu.orchestration.conductor import (
     ExecutorRoleConfig,
     RoleSamplingOverrides,
@@ -64,6 +79,107 @@ def _role_sampling(role: RoleNodeSpec) -> RoleSamplingOverrides | None:
         ),
         seed_offset=role.sampling.seed_offset,
         stop=role.sampling.stop,
+        response_format=role.sampling.response_format,
+    )
+
+
+def _item_source(source: ItemSourceSpec | None) -> ItemSource | None:
+    if source is None:
+        return None
+    return ItemSource(
+        role=source.role,
+        path=source.path,
+        where=source.where,
+        pairs_sharing=source.pairs_sharing,
+    )
+
+
+def _checklist(spec: ChecklistSpec | None) -> ChecklistConfig | None:
+    if spec is None:
+        return None
+    return ChecklistConfig(
+        checks=tuple(
+            ChecklistCheck(
+                id=check.id,
+                proposition=check.proposition,
+                primitive=check.primitive,
+                params=check.params,
+                foreach=_item_source(check.foreach),
+                primitive_key=check.primitive_key,
+                params_key=check.params_key,
+                sources_key=check.sources_key,
+                stage=check.stage,
+                group=check.group,
+                semantic_fallback=check.semantic_fallback,
+            )
+            for check in spec.checks
+        ),
+        questions=tuple(
+            ChecklistQuestion(
+                id=question.id,
+                proposition=question.proposition,
+                foreach=_item_source(question.foreach),
+                sources_key=question.sources_key,
+                expect=question.expect,
+                threshold=question.threshold,
+                group=question.group,
+                subject=question.subject,
+                ask=question.ask,
+                criteria_true=question.criteria_true,
+                criteria_false=question.criteria_false,
+                context=question.context,
+            )
+            for question in spec.questions
+        ),
+        state=tuple(
+            StateSection(key=section.key, source=section.source, max_chars=section.max_chars)
+            for section in spec.state
+        ),
+        subject=spec.subject,
+        threshold=spec.threshold,
+        samples=spec.samples,
+        think=spec.think,
+        steps=spec.steps,
+        max_questions_per_call=spec.max_questions_per_call,
+        max_questions=spec.max_questions,
+        max_state_chars=spec.max_state_chars,
+        feedback_header=spec.feedback_header,
+        feedback_item=spec.feedback_item,
+        max_refinements=spec.max_refinements,
+        on_exhausted=spec.on_exhausted,
+        on_unavailable=spec.on_unavailable,
+        unverified_from=spec.unverified_from,
+        curate=(
+            None
+            if spec.curate is None
+            else CurationConfig(**spec.curate.model_dump())
+        ),
+    )
+
+
+def role_spec(role: RoleNodeSpec) -> RoleSpec:
+    """The Conductor role a DSL role node describes."""
+
+    return RoleSpec(
+        name=role.name,
+        worker=role.worker,
+        prompt=role.prompt,
+        role_type=role.role_type,
+        depends_on=role.depends_on,
+        verifies=role.verifies,
+        sampling=_role_sampling(role),
+        executor=_role_executor(role),
+        prompt_suffix=role.prompt_suffix,
+        prompt_headless=role.prompt_headless,
+        reasoning_closed=role.reasoning_closed,
+        reasoning_effort=role.reasoning_effort,
+        reasoning_close_tag=role.reasoning_close_tag,
+        reasoning_continuation=role.reasoning_continuation,
+        reasoning_open_tag=role.reasoning_open_tag,
+        requires=role.requires,
+        checklist=_checklist(role.checklist),
+        seed_from=role.seed_from,
+        refine_prompt=role.refine_prompt,
     )
 
 
@@ -90,6 +206,8 @@ def _build_worker(worker: WorkerSpec) -> EngineBackend:
         raise ValueError("engine_ref workers require deployment engine resolution")
     if worker.executor_ref is not None:
         raise ValueError("executor_ref workers require deployment executor resolution")
+    if worker.systemone_ref is not None:
+        raise ValueError("systemone_ref workers require deployment System One resolution")
     options = dict(worker.options)
     if worker.model is not None:
         options.setdefault("model", worker.model)
@@ -108,11 +226,14 @@ def build_orchestrator(
     *,
     engine_refs: Mapping[str, EngineBackend] | None = None,
     executor_refs: Mapping[str, ExecutionBackend] | None = None,
+    systemone_refs: Mapping[str, DecisionBackend] | None = None,
 ) -> Orchestrator:
     available_refs = dict(engine_refs or {})
     available_executor_refs = dict(executor_refs or {})
+    available_systemone_refs = dict(systemone_refs or {})
     engines: dict[str, EngineBackend] = {}
     execution_workers: dict[str, ExecutionBackend] = {}
+    decision_workers: dict[str, DecisionBackend] = {}
     executor_descriptors: dict[str, ExecutorDescriptor] = {}
     owned_engines: list[EngineBackend] = []
     for worker in spec.workers:
@@ -123,6 +244,14 @@ def build_orchestrator(
                 raise ValueError(
                     f"worker {worker.name!r} references unknown deployment engine "
                     f"{worker.engine_ref!r}"
+                ) from error
+        elif worker.systemone_ref is not None:
+            try:
+                decision_workers[worker.name] = available_systemone_refs[worker.systemone_ref]
+            except KeyError as error:
+                raise ValueError(
+                    f"worker {worker.name!r} references unknown deployment System One "
+                    f"model {worker.systemone_ref!r}"
                 ) from error
         elif worker.executor_ref is not None:
             try:
@@ -163,32 +292,12 @@ def build_orchestrator(
             ),
         )
         for worker in spec.workers
-        if worker.executor_ref is None
+        if worker.executor_ref is None and worker.systemone_ref is None
     }
-    def _role_spec(role: RoleNodeSpec) -> RoleSpec:
-        return RoleSpec(
-            name=role.name,
-            worker=role.worker,
-            prompt=role.prompt,
-            role_type=role.role_type,
-            depends_on=role.depends_on,
-            verifies=role.verifies,
-            sampling=_role_sampling(role),
-            executor=_role_executor(role),
-            prompt_suffix=role.prompt_suffix,
-            prompt_headless=role.prompt_headless,
-            reasoning_closed=role.reasoning_closed,
-            reasoning_effort=role.reasoning_effort,
-            reasoning_close_tag=role.reasoning_close_tag,
-            reasoning_continuation=role.reasoning_continuation,
-            reasoning_open_tag=role.reasoning_open_tag,
-            requires=role.requires,
-        )
-
-    roles = tuple(_role_spec(role) for role in spec.roles) or None
+    roles = tuple(role_spec(role) for role in spec.roles) or None
     profiles = (
         {
-            profile.name: tuple(_role_spec(role) for role in profile.roles)
+            profile.name: tuple(role_spec(role) for role in profile.roles)
             for profile in spec.profiles
         }
         or None
@@ -251,4 +360,5 @@ def build_orchestrator(
         profile_judge=profile_judge,
         default_reasoning_effort=spec.default_reasoning_effort,
         public_output_floor=spec.public_output_floor,
+        decision_workers=decision_workers,
     )

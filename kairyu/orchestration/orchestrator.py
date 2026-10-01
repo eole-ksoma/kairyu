@@ -34,6 +34,7 @@ from kairyu.engine.prompt import (
 )
 from kairyu.models.generation import GenerationDefaults
 from kairyu.orchestration.budget import Budget, BudgetState
+from kairyu.orchestration.checklist import DecisionBackend, VerificationReport
 from kairyu.orchestration.conductor import (
     Conductor,
     ConductorStreamError,
@@ -139,6 +140,8 @@ class OrchestratorResult:
     # caller's request.
     public_prompt_tokens: int | None = None
     public_completion_tokens: int | None = None
+    # Checklist verification of the published answer (None without one).
+    verification: VerificationReport | None = None
 
 
 @dataclass(frozen=True)
@@ -382,6 +385,7 @@ class Orchestrator:
         profile_judge: ProfileJudge | None = None,
         default_reasoning_effort: str | None = None,
         public_output_floor: int | None = None,
+        decision_workers: Mapping[str, DecisionBackend] | None = None,
     ) -> None:
         if not engines:
             raise ValueError("Orchestrator requires at least one engine")
@@ -485,6 +489,8 @@ class Orchestrator:
         # not the HTTP app that owns metrics, constructs orchestrators.
         self._stage_observer: Callable[[TraceEvent], None] | None = None
         self._execution_workers = dict(execution_workers or {})
+        # System One (Jev wire API) backends read by checklist verifiers.
+        self._decision_workers = dict(decision_workers or {})
         supplied_executor_descriptors = dict(executor_descriptors or {})
         self._executor_descriptors = {
             name: supplied_executor_descriptors.get(
@@ -506,6 +512,7 @@ class Orchestrator:
                     sampling_params=self._sampling_params,
                     execution_workers=self._execution_workers,
                     public_output_floor=self._profile_output_floor(profile_roles),
+                    decision_workers=self._decision_workers,
                 )
             if self._public_output_floor is not None and not any(
                 self._profile_output_floor(profile_roles) is not None
@@ -1778,7 +1785,11 @@ class Orchestrator:
 
     @staticmethod
     def _generation_roles(roles: tuple[RoleSpec, ...]) -> tuple[RoleSpec, ...]:
-        return tuple(role for role in roles if role.role_type != "executor")
+        return tuple(
+            role
+            for role in roles
+            if role.role_type != "executor" and role.checklist is None
+        )
 
     def _conductor_workers(
         self,
@@ -1839,6 +1850,7 @@ class Orchestrator:
             execution_workers=self._execution_workers,
             reasoning_effort=self._effective_reasoning_effort(call),
             public_output_floor=self._profile_output_floor(roles),
+            decision_workers=self._decision_workers,
         )
 
     def _effective_reasoning_effort(self, call: OrchestrationRequest) -> str | None:
@@ -1861,7 +1873,9 @@ class Orchestrator:
                 model=descriptor.model,
             )
         for role in roles:
-            if role.role_type == "executor" and role.worker not in identities:
+            if (
+                role.role_type == "executor" or role.checklist is not None
+            ) and role.worker not in identities:
                 identities[role.worker] = WorkerTraceIdentity(engine=role.worker)
         return identities
 
@@ -2022,6 +2036,7 @@ class Orchestrator:
             reasoning_content: str | None = None,
             public_prompt_tokens: int | None = None,
             public_completion_tokens: int | None = None,
+            verification: VerificationReport | None = None,
         ) -> OrchestratorResult:
             return OrchestratorResult(
                 text=text,
@@ -2034,6 +2049,7 @@ class Orchestrator:
                 reasoning_content=reasoning_content,
                 public_prompt_tokens=public_prompt_tokens,
                 public_completion_tokens=public_completion_tokens,
+                verification=verification,
                 structured_trace=StructuredTrace(
                     request_id=request_id,
                     started_at=trace_started_at,
@@ -2318,6 +2334,7 @@ class Orchestrator:
                 cached_tokens=result.cached_tokens,
                 reasoning_content=result.reasoning_content,
                 public_completion_tokens=result.public_completion_tokens,
+                verification=result.verification,
             )
         try:
             engine_name = (
@@ -2528,6 +2545,7 @@ class Orchestrator:
             reasoning_content: str | None = None,
             public_prompt_tokens: int | None = None,
             public_completion_tokens: int | None = None,
+            verification: VerificationReport | None = None,
         ) -> OrchestratorResult:
             return OrchestratorResult(
                 text=text,
@@ -2540,6 +2558,7 @@ class Orchestrator:
                 reasoning_content=reasoning_content,
                 public_prompt_tokens=public_prompt_tokens,
                 public_completion_tokens=public_completion_tokens,
+                verification=verification,
                 structured_trace=StructuredTrace(
                     request_id=request_id,
                     started_at=trace_started_at,
@@ -3214,6 +3233,7 @@ class Orchestrator:
                 cached_tokens=conductor_result.cached_tokens,
                 reasoning_content=conductor_result.reasoning_content,
                 public_completion_tokens=conductor_result.public_completion_tokens,
+                verification=conductor_result.verification,
             ),
         )
 

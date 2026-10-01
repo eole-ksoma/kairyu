@@ -404,8 +404,16 @@ _KAIRYU_CHAT_EXTENSION_FIELDS = frozenset(
         "kairyu_trace",
         "kairyu_trace_v2",
         "kairyu_route",
+        "kairyu_verification",
     }
 )
+
+
+def _verification_payload(result) -> dict[str, object] | None:
+    """The public checklist verification of an orchestrated result, if any."""
+
+    verification = getattr(result, "verification", None)
+    return None if verification is None else verification.as_dict()
 _USAGE_ORCHESTRATION_FIELDS = frozenset(
     {"orchestration_input_tokens", "orchestration_output_tokens"}
 )
@@ -767,9 +775,11 @@ def _orchestrator_metadata_chunk(
     include_usage: bool,
     want_trace: bool,
 ) -> str | None:
-    """One terminal AUTO chunk carrying requested usage and/or trace data."""
+    """One terminal AUTO chunk carrying requested usage, trace, and/or the
+    checklist verification (always sent when the result has one)."""
 
-    if not include_usage and not want_trace:
+    verification = _verification_payload(result)
+    if not include_usage and not want_trace and verification is None:
         return None
     trace = (
         result.structured_trace.as_dict(request_id=response_id)
@@ -785,14 +795,17 @@ def _orchestrator_metadata_chunk(
         kairyu_trace=list(result.trace) if want_trace else None,
         kairyu_trace_v2=trace,
         kairyu_route=_route_payload(result.route) if want_trace else None,
+        kairyu_verification=verification,
     )
     exclude: set[str] = set()
     if not include_usage:
         exclude.add("usage")
     if not want_trace:
-        exclude.update(_KAIRYU_CHAT_EXTENSION_FIELDS)
+        exclude.update(_KAIRYU_CHAT_EXTENSION_FIELDS - {"kairyu_verification"})
     elif trace is None:
         exclude.add("kairyu_trace_v2")
+    if verification is None:
+        exclude.add("kairyu_verification")
     if usage is not None:
         exclude = _with_usage_exclude(exclude, usage)
     serialized = escape_json_line_separators(payload.model_dump_json(exclude=exclude))
@@ -892,7 +905,7 @@ def _direct_metadata_chunk(
         kairyu_trace_v2=trace,
     )
     serialized = escape_json_line_separators(
-        payload.model_dump_json(exclude={"usage", "kairyu_route"})
+        payload.model_dump_json(exclude={"usage", "kairyu_route", "kairyu_verification"})
     )
     return f"data: {serialized}\n\n"
 
@@ -1438,7 +1451,9 @@ async def _stream_choices(
         if write_started_ns is not None:
             sse_write_ns += time.perf_counter_ns() - write_started_ns
             sse_write_count += 1
-    if orchestration_result is not None and want_trace:
+    if orchestration_result is not None and (
+        want_trace or _verification_payload(orchestration_result) is not None
+    ):
         metadata = _orchestrator_metadata_chunk(
             response_id,
             created,
@@ -1446,11 +1461,12 @@ async def _stream_choices(
             usage=None,
             result=orchestration_result,
             include_usage=False,
-            want_trace=True,
+            want_trace=want_trace,
         )
         if metadata is not None:
             yield metadata
-        yield f": trace {' | '.join(orchestration_result.trace)}\n\n"
+        if want_trace:
+            yield f": trace {' | '.join(orchestration_result.trace)}\n\n"
     elif direct_trace:
         direct_metrics = tuple(stage_metrics)
         if sse_write_count:
@@ -2666,16 +2682,18 @@ def create_app(
                         want_trace=want_trace,
                     )
                 )
+            payload = _chat_response_payload(response)
+            verification = _verification_payload(result)
+            if verification is not None:
+                payload["kairyu_verification"] = verification
             if want_trace:
-                payload = _chat_response_payload(response)
                 payload["kairyu_trace"] = list(result.trace)
                 if result.structured_trace is not None:
                     payload["kairyu_trace_v2"] = result.structured_trace.as_dict(
                         request_id=response.id
                     )
                 payload["kairyu_route"] = _route_payload(result.route).model_dump(mode="json")
-                return JSONResponse(content=payload)
-            return JSONResponse(content=_chat_response_payload(response))
+            return JSONResponse(content=payload)
 
         session_id = _session_id(request, http_request)
         validation_started_ns = time.perf_counter_ns()

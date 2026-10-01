@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -12,6 +13,37 @@ from kairyu.sampling_params import (
     SamplingParams,
     resolve_parallel_tool_calls,
 )
+
+# Delimiters of the conversation JSON inside the L2 ``{query}`` that the chat
+# service renders (validate_orchestration_chat_input). Shared so a consumer
+# can recover the message list without depending on the wrapper prose.
+CONVERSATION_JSON_OPEN = "--- CONVERSATION CONTEXT JSON ---\n"
+CONVERSATION_JSON_CLOSE = "\n--- END CONVERSATION CONTEXT JSON ---"
+
+
+def conversation_messages(query: str) -> list[object] | None:
+    """The role-tagged messages of an L2 query, or None for a plain prompt."""
+
+    start = query.find(CONVERSATION_JSON_OPEN)
+    if start < 0:
+        return None
+    start += len(CONVERSATION_JSON_OPEN)
+    end = query.find(CONVERSATION_JSON_CLOSE, start)
+    if end < 0:
+        return None
+    try:
+        messages = json.loads(query[start:end])
+    except ValueError:
+        return None
+    return messages if isinstance(messages, list) else None
+
+
+def conversation_text(query: str) -> str:
+    """The ``{conversation}`` role placeholder: the request's role-tagged
+    messages without the answer-contract wrapper, or the query itself."""
+
+    messages = conversation_messages(query)
+    return query if messages is None else json.dumps(messages, ensure_ascii=False, indent=1)
 
 
 @dataclass(frozen=True)

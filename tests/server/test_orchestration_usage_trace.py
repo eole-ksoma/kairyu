@@ -973,3 +973,84 @@ def test_trace_v2_event_accepts_list_detail_values() -> None:
         },
     )
     assert '"offered":["QWEN","ENSEMBLE"]' in chunk.model_dump_json()
+
+
+class _AlwaysYes:
+    async def decide(self, body):
+        from kairyu.engine.systemone import SystemOneReply
+
+        answers = {key: {"noul": 0.97} for key in body["questions"]}
+        return SystemOneReply(
+            status=200, body=json.dumps({"answers": answers}).encode(), headers={}
+        )
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["unary", "stream"])
+def test_checklist_verification_reaches_the_client_without_trace_opt_in(tmp_path, stream):
+    from fastapi.testclient import TestClient
+
+    from kairyu.orchestration.checklist import (
+        ChecklistConfig,
+        ChecklistQuestion,
+        StateSection,
+    )
+    from kairyu.orchestration.conductor import RoleSpec
+
+    backend = AccountingBackend()
+    roles = (
+        RoleSpec(name="draft", worker="tier2", prompt="[draft] {query}"),
+        RoleSpec(
+            name="answer",
+            worker="tier2",
+            prompt="",
+            depends_on=("draft",),
+            seed_from="draft",
+            refine_prompt="[repair] {previous} {feedback}",
+        ),
+        RoleSpec(
+            name="check",
+            worker="jev",
+            prompt="",
+            role_type="verifier",
+            verifies="answer",
+            depends_on=("answer",),
+            checklist=ChecklistConfig(
+                questions=(ChecklistQuestion(id="R1", proposition="answers"),),
+                state=(StateSection("answer", "answer"),),
+                threshold=0.9,
+            ),
+        ),
+    )
+    app = create_legacy_app(
+        {"plain": backend},
+        orchestrators={
+            "auto": Orchestrator(
+                {"tier1": backend, "tier2": backend},
+                roles=roles,
+                decision_workers={"jev": _AlwaysYes()},
+            )
+        },
+        settings=ServerSettings(usage_ledger_path=str(tmp_path / "usage.jsonl")),
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "auto",
+                "messages": [{"role": "user", "content": COMPLEX}],
+                "stream": stream,
+            },
+        )
+
+    assert response.status_code == 200
+    if stream:
+        verification = next(
+            payload["kairyu_verification"]
+            for payload in _sse_payloads(response.text)
+            if "kairyu_verification" in payload
+        )
+    else:
+        verification = response.json()["kairyu_verification"]
+    assert verification["guaranteed"] is True
+    assert verification["requirements"][0]["id"] == "R1"
+    assert verification["requirements"][0]["p"] == pytest.approx(0.97)

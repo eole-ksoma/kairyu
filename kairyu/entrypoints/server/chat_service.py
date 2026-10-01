@@ -55,6 +55,7 @@ from kairyu.entrypoints.server.protocol import (
     TopLogprobEntry,
     Usage,
 )
+from kairyu.orchestration.request import CONVERSATION_JSON_CLOSE, CONVERSATION_JSON_OPEN
 from kairyu.outputs import CompletionOutput, TokenLogprob
 from kairyu.sampling_params import (
     GENERATION_CONFIG_SAMPLING_FIELDS,
@@ -933,14 +934,15 @@ def validate_orchestration_chat_input(
         "assistant response body; do not add a role/content envelope unless an "
         "instruction inside the conversation explicitly requires that exact format. "
         "Use JSON, code, or tool-call syntax only when the conversation or active tool "
-        "contract requires it.\n\n--- CONVERSATION CONTEXT JSON ---\n"
+        "contract requires it.\n\n"
+        + CONVERSATION_JSON_OPEN
         + json.dumps(
             messages,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
         )
-        + "\n--- END CONVERSATION CONTEXT JSON ---"
+        + CONVERSATION_JSON_CLOSE
     )
     current_user = next(
         (

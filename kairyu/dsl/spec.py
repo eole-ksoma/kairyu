@@ -18,6 +18,9 @@ class WorkerSpec(BaseModel):
     # A deployment-owned sandbox execution service (ECO-D1). Mutually exclusive
     # with engine_ref and with every generation factory field.
     executor_ref: str | None = Field(default=None, min_length=1)
+    # A deployment System One (Jev wire API) model read by checklist
+    # verifiers. Mutually exclusive with the other refs and factory fields.
+    systemone_ref: str | None = Field(default=None, min_length=1)
     backend: str = "mock"
     model: str | None = None
     base_url: str | None = None
@@ -26,10 +29,19 @@ class WorkerSpec(BaseModel):
 
     @model_validator(mode="after")
     def _validate_openai_capabilities(self) -> WorkerSpec:
-        if self.engine_ref is not None and self.executor_ref is not None:
-            raise ValueError("a worker cannot declare both engine_ref and executor_ref")
-        if self.engine_ref is not None or self.executor_ref is not None:
-            kind = "engine_ref" if self.engine_ref is not None else "executor_ref"
+        refs = {
+            name: value
+            for name, value in (
+                ("engine_ref", self.engine_ref),
+                ("executor_ref", self.executor_ref),
+                ("systemone_ref", self.systemone_ref),
+            )
+            if value is not None
+        }
+        if len(refs) > 1:
+            raise ValueError(f"a worker cannot declare more than one of {sorted(refs)}")
+        if refs:
+            kind = next(iter(refs))
             factory_fields = {
                 "backend",
                 "model",
@@ -85,6 +97,117 @@ class RoleSamplingSpec(BaseModel):
     max_tokens_by_effort: EffortMaxTokensSpec | None = None
     seed_offset: int | None = Field(default=None, ge=0)
     stop: tuple[str, ...] = ()
+    # Grammar for an internal role: an OpenAI response_format object (for
+    # example a json_schema) or "inherit" to apply the caller's
+    # response_format to this role as well. Not allowed on the final unit,
+    # which always carries the caller's own intent.
+    response_format: dict | Literal["inherit"] | None = None
+
+
+class ItemSourceSpec(BaseModel):
+    """Items from a role's JSON output: a dotted ``path`` to a list of objects,
+    filtered by ``where``; ``pairs_sharing`` iterates item pairs instead."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    role: str = Field(min_length=1)
+    path: str = ""
+    where: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
+    pairs_sharing: str | None = Field(default=None, min_length=1)
+
+
+class ChecklistCheckSpec(BaseModel):
+    """A deterministic check (kairyu.orchestration.checks primitive)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: str = Field(min_length=1)
+    proposition: str = Field(min_length=1)
+    primitive: str = ""
+    params: dict = Field(default_factory=dict)
+    foreach: ItemSourceSpec | None = None
+    primitive_key: str = ""
+    params_key: str = ""
+    sources_key: str = ""
+    stage: Literal["pre", "post"] = "pre"
+    group: str = "checklist"
+    semantic_fallback: bool = False
+
+
+class ChecklistQuestionSpec(BaseModel):
+    """A System One ``noul`` question. Without ``ask`` Kairyu builds it from
+    the requirement (does the subject satisfy the proposition?); ``expect``
+    names the passing answer."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: str = Field(min_length=1)
+    proposition: str = Field(min_length=1)
+    foreach: ItemSourceSpec | None = None
+    sources_key: str = ""
+    expect: Literal["yes", "no"] = "yes"
+    threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    group: str = "checklist"
+    subject: str = ""
+    ask: str = ""
+    criteria_true: str = ""
+    criteria_false: str = ""
+    context: dict[str, str] = Field(default_factory=dict)
+
+
+class StateSectionSpec(BaseModel):
+    """One field of the System One state: ``query`` or a role's output."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    key: str = Field(min_length=1)
+    source: str = Field(min_length=1)
+    max_chars: int | None = Field(default=None, ge=1)
+
+
+class CurationSpec(BaseModel):
+    """Drop / merge / pad the target's JSON list after the verdict."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    items_path: str = Field(min_length=1)
+    id_key: str = "id"
+    sources_key: str = "sources"
+    proposition_key: str = "proposition"
+    drop_group: str = ""
+    drop_below: float = Field(default=0.5, ge=0.0, le=1.0)
+    merge_group: str = ""
+    merge_below: float = Field(default=0.5, ge=0.0, le=1.0)
+    units_path: str = ""
+    unit_id_key: str = "id"
+    pad: dict = Field(default_factory=dict)
+
+
+class ChecklistSpec(BaseModel):
+    """A verifier judged without generation: deterministic checks, then
+    System One probabilities against ``threshold`` (see
+    kairyu.orchestration.checklist)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    checks: tuple[ChecklistCheckSpec, ...] = ()
+    questions: tuple[ChecklistQuestionSpec, ...] = ()
+    state: tuple[StateSectionSpec, ...] = ()
+    subject: str = "the state"
+    threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    samples: int | None = Field(default=None, ge=1, le=32)
+    think: int | None = Field(default=None, ge=0, le=4096)
+    steps: int | None = Field(default=None, ge=1, le=8)
+    max_questions_per_call: int = Field(default=64, ge=1, le=4096)
+    max_questions: int = Field(default=256, ge=1, le=4096)
+    max_state_chars: int | None = Field(default=None, ge=1)
+    feedback_header: str = "The following requirements are not met:"
+    feedback_item: str = "- [{id}] {proposition} (sources: {sources}; p={p}){detail}"
+    max_refinements: int | None = Field(default=None, ge=0)
+    on_exhausted: Literal["last", "latest_checks_passed"] = "last"
+    on_unavailable: Literal["error", "publish_unverified"] = "error"
+    unverified_from: str = ""
+    curate: CurationSpec | None = None
 
 
 class ExecutionLimitsSpec(BaseModel):
@@ -187,6 +310,15 @@ class RoleNodeSpec(BaseModel):
     # slot renders as "" (DTO-D11). Head, final, verifier, and executor roles
     # cannot be conditional.
     requires: Literal["image"] | None = None
+    # A verifier judged by deterministic checks and System One reads instead
+    # of a generation call; its worker must be a systemone_ref worker.
+    checklist: ChecklistSpec | None = None
+    # Attempt 0 publishes this upstream role's output unchanged; the role's
+    # own worker only generates refinements (from refine_prompt).
+    seed_from: str | None = Field(default=None, min_length=1)
+    # Refinement prompt over the role outputs plus {previous} and {feedback};
+    # empty keeps the default appended-feedback refinement.
+    refine_prompt: str = ""
 
     @model_validator(mode="after")
     def _executor_shape(self) -> RoleNodeSpec:
@@ -218,9 +350,13 @@ class RoleNodeSpec(BaseModel):
                     f"executor role {self.name!r} references roles outside its "
                     f"depends_on: {sorted(missing)}"
                 )
-        elif not self.prompt:
+        elif not self.prompt and self.checklist is None and self.seed_from is None:
             raise ValueError(f"role {self.name!r} requires a prompt")
-        for field_name in ("prompt", "prompt_headless"):
+        if self.checklist is not None and self.role_type != "verifier":
+            raise ValueError(f"role {self.name!r}: only a verifier can declare a checklist")
+        if self.seed_from is not None and not self.refine_prompt:
+            raise ValueError(f"seeded role {self.name!r} requires a refine_prompt")
+        for field_name in ("prompt", "prompt_headless", "refine_prompt"):
             _check_prompt_placeholders(self.name, field_name, getattr(self, field_name))
         if self.requires is not None and self.role_type in {"verifier", "executor"}:
             raise ValueError(
@@ -407,6 +543,9 @@ class OrchestratorSpec(BaseModel):
         executor_workers = {
             worker.name for worker in self.workers if worker.executor_ref is not None
         }
+        decision_workers = {
+            worker.name for worker in self.workers if worker.systemone_ref is not None
+        }
         profile_names = [profile.name for profile in self.profiles]
         if len(set(profile_names)) != len(profile_names):
             raise ValueError("profile names must be unique")
@@ -442,7 +581,7 @@ class OrchestratorSpec(BaseModel):
                     f"profile_judge references unknown worker "
                     f"{self.profile_judge.worker!r}"
                 )
-            if self.profile_judge.worker in executor_workers:
+            if self.profile_judge.worker in executor_workers | decision_workers:
                 raise ValueError("profile_judge worker must be a generation worker")
         for profile, roles in (
             ("roles", self.roles),
@@ -458,6 +597,11 @@ class OrchestratorSpec(BaseModel):
                     raise ValueError(
                         f"{profile}: role {role.name!r}: executor roles must use an "
                         "executor_ref worker and generation roles must not"
+                    )
+                if (role.checklist is not None) != (role.worker in decision_workers):
+                    raise ValueError(
+                        f"{profile}: role {role.name!r}: checklist verifiers must use a "
+                        "systemone_ref worker and other roles must not"
                     )
             heads = [role for role in roles if role.role_type == "head"]
             if len(heads) > 1:

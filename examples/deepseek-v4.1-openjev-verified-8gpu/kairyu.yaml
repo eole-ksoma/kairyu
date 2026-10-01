@@ -1,0 +1,76 @@
+server:
+  host: 0.0.0.0
+  port: 8000
+  api_keys_env: null
+  max_concurrency: 128
+  admission_wait_timeout_s: 600
+  max_chat_body_bytes: 100663296
+pools:
+  deepseek-v4.1-flash:
+    replicas:
+    - backend: openai
+      health_url: http://deepseek:8000/health
+      options:
+        base_url: http://deepseek:8000/v1
+        model: deepseek-v4.1-flash
+        api_key_env: null
+        timeout_s: 1800
+        upstream: vllm
+        capabilities:
+          allow_prompt_kinds:
+          - multimodal
+          # V4.1 thinks unless a request turns it off: roles without an
+          # effort (the state builder) are sent enable_thinking: false.
+          allow_chat_template_kwargs:
+          - enable_thinking
+        image_input_policy:
+          max_images: 8
+          max_image_bytes: 8388608
+          max_total_image_bytes: 67108864
+          max_image_pixels: 16777216
+          max_total_image_pixels: 134217728
+          max_image_dimension: 8192
+          max_image_aspect_ratio: 200
+          max_processed_prompt_tokens: 1048576
+        model_revision: dba1be0a40aa45a94ad051997016db3960a90277
+        max_model_len: 1048576
+        quantization_format: mixed-fp4-fp8
+        cache_descriptor:
+          family: deepseek-v41-swa-csa-engram
+          block_size: 64
+        tensor_parallel_size: 1
+        expert_parallel_size: 6
+        attention_data_parallel_size: 6
+        dspark_enabled: true
+        container_image_digest: sha256:119afb09d8b71203707c50e8f9da1300c9992aea6c7aaa959cdb18df7e2483c5
+    unhealthy_after: 1
+    queue_depth_threshold: 0
+    prefix_index: true
+    probe_interval_s: 2.0
+    placement_log_path: /var/lib/kairyu/placement/deepseek-v4.1-flash.jsonl
+# The judge: two OpenJev replicas (GPU 6, GPU 7) behind one System One model.
+# A read goes to the replica with fewer reads in flight and moves to the other
+# replica once if one is unreachable or overloaded; when neither answers, the
+# checklist reports "judge_unavailable" and the draft is published unverified.
+# Each OpenJev runs 64 reads and answers 529 once 512 wait; Kairyu forwards at
+# most 256 reads at a time and queues 256 more.
+systemone:
+  openjev-0.1:
+    base_urls:
+    - http://openjev-0:8080
+    - http://openjev-1:8080
+    upstream_model: openjev-0.1
+    description: DiffusionGemma 26B-A4B (NVFP4) read as a diffusion canvas (OpenJev), 2 replicas
+    max_concurrency: 256
+    max_queue: 256
+    queue_wait_s: 30
+    timeout_s: 300
+    max_body_bytes: 50331648
+orchestrators:
+  kairyu-verified:
+    spec: /etc/kairyu/verified.yaml
+public_models:
+- kairyu-verified
+# The DeepSeek pool is an internal L1 resource, not a public model.
+legacy_chat_models:
+- deepseek-v4.1-flash

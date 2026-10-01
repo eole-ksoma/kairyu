@@ -31,6 +31,8 @@ ANSWER_ONLY = frozenset({"stop", "logprobs", "top_logprobs", "tool_choice"})
 # answer pass would exceed the budget.
 NOT_ANSWER = frozenset({"role", "reasoning", "reasoning_content"})
 ERROR_TEXT_LIMIT = 500
+# OpenJev's image starts vLLM with --max-logprobs 32 (docker/entrypoint.sh).
+MAX_LOGPROBS = 32
 
 
 class UpstreamError(Exception):
@@ -60,10 +62,16 @@ def _continued(upstream: dict, prefill: str) -> dict:
 def check_answer_controls(upstream: dict) -> None:
     """Refuse what only the answer pass would reject, before any thought is spent.
 
-    A required or named ``tool_choice`` needs structured outputs, which vLLM
-    does not support for diffusion models. If that were refused only in the
-    answer pass, a streamed request could only be aborted, and Kairyu counts
-    an aborted stream as a failure of the only replica.
+    The ANSWER_ONLY fields reach vLLM only in the answer pass. If vLLM refused
+    one there, a streamed request could only be aborted after its thought, and
+    Kairyu counts an aborted stream as a failure of the only replica. So each
+    is checked here with vLLM's own rules:
+
+    - a required or named ``tool_choice`` needs structured outputs, which vLLM
+      does not support for diffusion models;
+    - ``stop`` is a string or a list of strings, none of them empty;
+    - ``top_logprobs`` needs ``logprobs: true`` and stays within OpenJev's
+      ``--max-logprobs``.
     """
 
     if upstream.get("tool_choice") not in (None, "auto", "none"):
@@ -71,6 +79,20 @@ def check_answer_controls(upstream: dict) -> None:
             400,
             "tool_choice must be 'auto' or 'none': a required or named tool call needs "
             "structured outputs, which vLLM does not support for DiffusionGemma",
+        )
+    stop = upstream.get("stop")
+    stops = [stop] if isinstance(stop, str) else stop if isinstance(stop, list) else None
+    if stop is not None and (stops is None or not all(isinstance(s, str) and s for s in stops)):
+        raise UpstreamError(400, "stop must be a non-empty string or a list of them")
+    top = upstream.get("top_logprobs")
+    if top is not None and (
+        isinstance(top, bool)
+        or not isinstance(top, int)
+        or not 0 <= top <= MAX_LOGPROBS
+        or upstream.get("logprobs") is not True
+    ):
+        raise UpstreamError(
+            400, f"top_logprobs needs logprobs: true and must be within 0..{MAX_LOGPROBS}"
         )
 
 

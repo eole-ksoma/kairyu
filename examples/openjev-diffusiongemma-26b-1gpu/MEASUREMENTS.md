@@ -1,8 +1,11 @@
 # Measurements: OpenJev DiffusionGemma on one GPU (think = 512)
 
-Status: **GPU-verified (2026-10-01).** Every gate passes on one RTX PRO 6000
+Status: **GPU-verified (2026-10-01).** Every gate passed on one RTX PRO 6000
 Blackwell Server Edition (GPU 0) with served config
-`eafbfa94d9376e069a2f39b32b303d13d00c83b7af049d5237ff0c22164893ba`. The CPU
+`eafbfa94d9376e069a2f39b32b303d13d00c83b7af049d5237ff0c22164893ba`. After the
+review fixes (served config `705655a434d181bcac765ccb1b2bd34e26a1d06533cd3066b824ed22ab1574ce`,
+overlay `sha256:46530fa7…`) every gate passes again except one intermittent
+`l1` case, which is an open finding (see "Review-fix rerun" below). The CPU
 evidence below was recorded first, on the development machine.
 
 ## Pins
@@ -12,7 +15,7 @@ evidence below was recorded first, on the development machine.
 | OpenJev source | `dcd20947b5ddad5be4a8f5aed6aa6dd245653823` (package 0.5.0) |
 | Base image | `razorback16/openjev:0.5.1@sha256:65f88680e0093c9229d8cc55c0d2f279db27aba78a7ce74ea762b8f2da82d47d`, image ID `sha256:b219be87fdde14896b0029edabe5586b2e99c89380784a9ec73f1405a0453757` |
 | vLLM in the base | `1b3b88ec2b7457aa030db4d0e7d8aaf04f6d0fb8`, with OpenJev's logprob-id cap 512 and vision prefix-LM patch (from the image's build history) |
-| Overlay image ID | `sha256:1c14bdf63a9be36a9ac8ae8f4500e372dae5921f9eb4f210f730074f01156c6b` |
+| Overlay image ID | `sha256:46530fa771b908dbfa9e2ea2a663899beea32bd99c1da376abcab6bd849a3138` (review fixes; the first GPU pass used `sha256:1c14bdf6…`) |
 | Kairyu gateway image (final runs) | `sha256:69a1ece39192531c04aa6ffd6aa5abb45e8a9b75a18cc8bcb97ac4e482e5e288`, built from this branch (`/v1/systemone`, m11 D8) |
 | Playground | `nginx:1.29-alpine@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de` |
 | Checkpoint | `nvidia/diffusiongemma-26B-A4B-it-NVFP4@ec4ff3df205028f4e81c954c2227f9312b3ec2ea` |
@@ -162,6 +165,23 @@ req/s), so Kairyu adds no measurable cost. Rows above c16 are 6–9 s long and
 vary by run order. OpenJev's README reports 43.3 / 51.7 / 57.4 req/s at
 c16/32/64 at 38 % GPU memory; here vLLM has 0.9 of the GPU and serves chat
 too.
+
+### Review-fix rerun (2026-10-01, `rev-*`)
+
+The overlay now refuses an empty `stop` or out-of-range `top_logprobs`
+before the thought, and Kairyu's System One route reserves the billed upper
+bound, checks each model's body limit, validates both usage counts and
+answers tenant 429s in Jev's shape (PR #614 review).
+
+| Gate | Result |
+|---|---|
+| `think` | PASS, including `empty_stop_refused_before_thought`: through Kairyu the stream carries only an error frame (no thought), and the replica stays healthy. Directly, OpenJev answers 400 for `stop: [""]`, streamed or not, with zero vLLM requests |
+| `serving` | PASS: c1 489.6 / c8 1,414.6 / c16 1,520.0 / c32 1,645.6 tok/s, 32/32 each, all `stop` |
+| `tool-calling`, `vision`, `cancellation`, `restart` | PASS (restart healthy and answering after 105 s) |
+| `systemone-live` | PASS (12 passed, 4 skipped) |
+| `systemone-serving` | PASS: through Kairyu 13.1 / 39.6 / 42.6 / 39.1 req/s at c1/16/32/64, direct 11.4 / 35.0 / 31.9 / 32.5 |
+| `systemone-isolation` | PASS: 512 × 200, 128 × 429, no 529, in 17.5 s; chat answered; replica healthy |
+| `l1` | **Intermittent FAIL (2 of 4 runs)** in `thought_cut_at_budget`: after the thought is cut at 512, the answer pass sometimes opens a new thought and spends its whole 256-token budget there (`finish_reason: length`, 768 completion tokens). The overlay drops a reopened thought by design, so the answer is empty. The other cases pass in every run. Not caused by the review fixes (the request sets no stop or logprobs); the first GPU pass happened to pass it. Open |
 
 ### Degenerate endings (D2)
 

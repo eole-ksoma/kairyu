@@ -26,6 +26,10 @@ from kairyu.entrypoints.server.messages_protocol import (
     anthropic_error_payload,
     wants_anthropic_envelope,
 )
+from kairyu.entrypoints.server.systemone_service import (
+    jev_error_payload,
+    wants_jev_envelope,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -632,6 +636,9 @@ class TenantLimitMiddleware:
                     error_type="rate_limit_error",
                     request_id=state.get("request_id"),
                 )
+            elif wants_jev_envelope(path):
+                # /v1/systemone speaks Jev's {"detail": ...} envelope (m11 D8)
+                payload = jev_error_payload("rate_limit_error", message)
             else:
                 payload = {
                     "error": {

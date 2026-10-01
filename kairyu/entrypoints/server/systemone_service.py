@@ -27,6 +27,9 @@ SYSTEMONE_PATH = "/v1/systemone"
 # Tokens reserved per image before the upstream reports exact usage; a
 # DiffusionGemma image costs about 280 input tokens.
 _IMAGE_TOKEN_BOUND = 1024
+# System prompt and answer scaffold around each read, beyond the state and
+# the group's own questions (OpenJev bills about 100 for three questions).
+_READ_OVERHEAD_TOKENS = 512
 
 
 @dataclass(frozen=True)
@@ -65,16 +68,35 @@ def _invalid(loc: list, kind: str, message: str) -> JSONResponse:
     return JSONResponse({"detail": [{"type": kind, "loc": loc, "msg": message}]}, status_code=422)
 
 
+def _option(body: dict, name: str, default: int) -> int:
+    value = body.get(name)
+    return value if isinstance(value, int) and not isinstance(value, bool) else default
+
+
 def _work_bound(body: dict) -> int:
-    text = json.dumps(
-        {"state": body.get("state"), "questions": body.get("questions")}, ensure_ascii=False
-    )
+    """An upper bound on the tokens one request can bill, before dispatch.
+
+    UTF-8 bytes bound tokens. A server may read every question in its own
+    group: each group's prompt carries the state, and with ``think`` each
+    group writes a thought, reads its prompt once to do so, and then reads
+    prompt + thought once per sample. Re-reads a server adds by its own
+    policy are not billed (OpenJev), so they are not reserved.
+    """
+
     images = body.get("images")
-    image_count = len(images) if isinstance(images, list) else 0
-    reads = body.get("samples") if isinstance(body.get("samples"), int) else 1
-    think = body.get("think") if isinstance(body.get("think"), int) else 0
-    prompt = len(text.encode()) + _IMAGE_TOKEN_BOUND * image_count
-    return max(1, prompt * max(1, reads) * (2 if think else 1) + max(0, think))
+    state = len(json.dumps(body.get("state"), ensure_ascii=False).encode())
+    state += _IMAGE_TOKEN_BOUND * (len(images) if isinstance(images, list) else 0)
+    questions = body.get("questions")
+    sizes = (
+        [len(json.dumps(q, ensure_ascii=False).encode()) for q in questions.values()]
+        if isinstance(questions, dict) and questions
+        else [0]
+    )
+    prompts = sum(_READ_OVERHEAD_TOKENS + state + size for size in sizes)
+    reads = max(1, _option(body, "samples", 1))
+    think = max(0, _option(body, "think", 0))
+    input_tokens = (reads + (1 if think else 0)) * prompts + reads * len(sizes) * think
+    return input_tokens + len(sizes) * think
 
 
 def systemone_model_cards(models: Mapping[str, SystemOneModel]) -> list[dict]:
@@ -95,8 +117,9 @@ def add_systemone_route(app: FastAPI, models: Mapping[str, SystemOneModel]) -> N
 
     @app.post(SYSTEMONE_PATH)
     async def systemone(http_request: Request):
+        raw = await http_request.body()
         try:
-            body = json.loads(await http_request.body())
+            body = json.loads(raw)
         except ValueError:
             return _invalid(["body"], "json_invalid", "JSON decode error")
         if not isinstance(body, dict):
@@ -108,6 +131,11 @@ def add_systemone_route(app: FastAPI, models: Mapping[str, SystemOneModel]) -> N
         if model is None:
             return _error(400, "api_usage_error", f"Unknown model: {name}")
         http_request.state.model = model.name
+        # the middleware bounds the largest model's limit; each model keeps its own
+        if len(raw) > model.max_body_bytes:
+            return _error(
+                413, "api_usage_error", f"request body is larger than {model.max_body_bytes} bytes"
+            )
         questions = body.get("questions")
         if isinstance(questions, dict) and len(questions) > model.max_questions:
             return JSONResponse(
@@ -138,7 +166,7 @@ def add_systemone_route(app: FastAPI, models: Mapping[str, SystemOneModel]) -> N
         except SystemOneUnavailableError as error:
             return _error(503, "api_error", f"inference backend unavailable: {error}", "2")
         if reply.status == 200:
-            if reply.input_tokens is None:
+            if reply.input_tokens is None or reply.output_tokens is None:
                 # an answer that cannot be metered is not passed on unbilled
                 return _error(502, "api_error", "upstream answer has no valid usage")
             # Only answered reads are billed; any other outcome leaves the
@@ -150,7 +178,7 @@ def add_systemone_route(app: FastAPI, models: Mapping[str, SystemOneModel]) -> N
                 tenant=owner,
                 model=model.name,
                 prompt_tokens=reply.input_tokens,
-                completion_tokens=reply.output_tokens or 0,
+                completion_tokens=reply.output_tokens,
                 reservation=admission,
             )
         return Response(reply.body, status_code=reply.status, headers=reply.headers)

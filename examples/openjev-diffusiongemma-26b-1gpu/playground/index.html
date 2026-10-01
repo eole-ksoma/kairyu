@@ -191,11 +191,20 @@ function loadPreset(name) {
   $("questions").replaceChildren(...Object.entries(preset.questions).map(([k, q]) => questionEditor(k, q)));
 }
 
+function unusedId() {
+  const used = new Set([...$("questions").querySelectorAll(".key")].map((input) => input.value.trim()));
+  let n = 1;
+  while (used.has(`q${n}`)) n += 1;
+  return `q${n}`;
+}
+
 function readQuestions() {
   const questions = {};
   for (const box of $("questions").children) {
     const key = box.querySelector(".key").value.trim();
     if (!key) continue;
+    // a repeated id would silently replace the earlier question
+    if (Object.hasOwn(questions, key)) throw new Error(`Two questions share the id "${key}".`);
     const q = {type: box.dataset.type, instructions: box.querySelector(".instructions").value};
     const lines = (box.querySelector(".criteria")?.value || "").split("\n").map((l) => l.trim()).filter(Boolean);
     if (q.type === "choice") {
@@ -286,10 +295,20 @@ async function runSystemOne(body) {
 
 function chatPrompt(body) {
   const lines = [`State:\n${body.state}`, "", "Answer each question. Reply with one line per question as id: answer."];
+  // the same information System One receives: every option with its description
+  const described = (name, text) => (text ? `${name} (${typeof text === "string" ? text : JSON.stringify(text)})` : name);
   for (const [key, q] of Object.entries(body.questions)) {
-    if (q.type === "noul") lines.push(`- ${key} (yes or no): ${q.instructions || ""}`);
-    else if (q.type === "choice") lines.push(`- ${key} (one of ${Object.keys(q.criteria).join(", ")}): ${q.instructions || ""}`);
-    else lines.push(`- ${key} (one of ${q.criteria.join(", ")}): ${q.instructions || ""}`);
+    if (q.type === "noul") {
+      const yes = described("yes", q.criteria?.true);
+      const no = described("no", q.criteria?.false);
+      lines.push(`- ${key}: ${q.instructions || ""} Answer ${yes} or ${no}.`);
+    } else if (q.type === "choice") {
+      const options = Object.entries(q.criteria).map(([name, text]) => described(name, text));
+      lines.push(`- ${key}: ${q.instructions || ""} Answer one of: ${options.join("; ")}.`);
+    } else {
+      const levels = q.criteria.map((level, index) => `${index} = ${typeof level === "string" ? level : JSON.stringify(level)}`);
+      lines.push(`- ${key}: ${q.instructions || ""} Answer one level, lowest first: ${levels.join("; ")}.`);
+    }
   }
   return lines.join("\n");
 }
@@ -303,6 +322,8 @@ async function runChat(body) {
   const started = performance.now();
   let firstToken = null;
   let usage = null;
+  let streamError = null;
+  let sawDone = false;
   const response = await fetch("/v1/chat/completions", {
     method: "POST", headers: {"content-type": "application/json"},
     body: JSON.stringify({model: chatModel, stream: true, stream_options: {include_usage: true}, max_tokens: 1024,
@@ -325,8 +346,11 @@ async function runChat(body) {
     while ((cut = buffer.indexOf("\n")) >= 0) {
       const line = buffer.slice(0, cut).trim();
       buffer = buffer.slice(cut + 1);
+      if (line === "data: [DONE]") sawDone = true;
       if (!line.startsWith("data: ") || line === "data: [DONE]") continue;
       const chunk = JSON.parse(line.slice(6));
+      // a failure after the stream started arrives as an error frame
+      if (chunk.error) streamError = chunk.error.message || JSON.stringify(chunk.error);
       usage = chunk.usage || usage;
       for (const choice of chunk.choices || []) {
         const delta = choice.delta || {};
@@ -338,6 +362,12 @@ async function runChat(body) {
     }
   }
   const elapsed = performance.now() - started;
+  if (streamError || !sawDone) {
+    answer.className = "error";
+    answer.textContent += `\n[stream failed: ${streamError || "ended without [DONE]"}]`;
+    $("chat-stats").replaceChildren(stat("HTTP", "200, stream failed"), stat("latency", `${elapsed.toFixed(0)} ms`));
+    return;
+  }
   $("chat-stats").replaceChildren(stat("HTTP", "200"), stat("first token", `${(firstToken ?? elapsed).toFixed(0)} ms`),
     stat("latency", `${elapsed.toFixed(0)} ms`), stat("prompt tokens", String(usage?.prompt_tokens ?? "?")),
     stat("completion tokens", String(usage?.completion_tokens ?? "?")), stat("model", chatModel));
@@ -346,7 +376,13 @@ async function runChat(body) {
 async function run() {
   $("run").disabled = true;
   try {
-    const body = systemOneBody();
+    let body;
+    try {
+      body = systemOneBody();
+    } catch (e) {
+      $("s1-body").replaceChildren(el("pre", {class: "error", text: e.message}));
+      return;
+    }
     const jobs = [runSystemOne(body).catch((e) => $("s1-body").replaceChildren(el("pre", {class: "error", text: String(e)})))];
     if ($("compare").checked) {
       jobs.push(runChat(body).catch((e) => $("chat-body").replaceChildren(el("pre", {class: "error", text: String(e)}))));
@@ -362,7 +398,7 @@ async function init() {
   $("preset").onchange = () => loadPreset($("preset").value);
   loadPreset(Object.keys(PRESETS)[0]);
   for (const type of ["noul", "choice", "score"]) {
-    $(`add-${type}`).onclick = () => $("questions").append(questionEditor(`q${$("questions").children.length + 1}`,
+    $(`add-${type}`).onclick = () => $("questions").append(questionEditor(unusedId(),
       {type, criteria: type === "choice" ? {a: "", b: ""} : type === "score" ? ["low", "high"] : undefined}));
   }
   $("images").onchange = async () => {

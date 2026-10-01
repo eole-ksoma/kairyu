@@ -630,16 +630,20 @@ does not reimplement reads.
   replica that shares the server. The route is exempt from the server-wide
   chat `max_concurrency` gate for the same reason.
 - **Upstream owns the schema.** Kairyu checks only what routing and resource
-  bounds need (a JSON object, a string `model`, `max_questions`, the body
-  size). Upstream answers and errors pass through with `retry-after` and
+  bounds need (a JSON object, a string `model`, `max_questions`, and the
+  selected model's own `max_body_bytes`; the middleware bounds the largest). Upstream answers and errors pass through with `retry-after` and
   `Server-Timing`. Kairyu's own errors use Jev's shapes: a FastAPI-style
   `{"detail": [...]}` list for a malformed body, otherwise
   `{"detail": {"error_type", "message"}}`, including 401/413/429 from the
-  middleware.
-- **Metering.** A tenant reservation is bounded from the body and refunded
-  unless the upstream answers 200; then `usage.input_tokens` and
-  `usage.output_tokens` are recorded. A 200 without valid usage becomes a
-  502, so no answer leaves unbilled.
+  middleware and the tenant limiter.
+- **Metering.** Before dispatch a tenant reserves an upper bound on what the
+  request can bill: every question may be its own read carrying the state,
+  and with `think` each read writes a thought and then reads prompt +
+  thought once per sample (unbilled server re-reads are not reserved). The
+  reservation is refunded unless the upstream answers 200; then
+  `usage.input_tokens` and `usage.output_tokens` are recorded. A 200 whose
+  two counts are not both valid becomes a 502, so no answer leaves unbilled
+  (review amendment, PR #614).
 - **Discovery.** With System One models served, `/v1/models` also returns
   Jev's `models: [{name, description}]` list (System One names and aliases,
   then the other served models). System One models stay out of OpenAI's

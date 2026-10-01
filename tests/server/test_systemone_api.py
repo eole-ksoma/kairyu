@@ -21,6 +21,7 @@ from kairyu.engine.systemone import HTTPSystemOneBackend
 from kairyu.entrypoints.server.app import create_app
 from kairyu.entrypoints.server.settings import ServerSettings
 from kairyu.entrypoints.server.systemone_service import SystemOneModel
+from kairyu.entrypoints.server.tenancy import TenantConfig, TenantLimits
 
 QUESTIONS = {"urgent": {"type": "noul", "instructions": "Does the customer need a reply?"}}
 ANSWER = {
@@ -172,10 +173,20 @@ async def test_systemone_errors_use_jev_shapes(monkeypatch, request_body, header
     assert calls == []
 
 
-async def test_upstream_overload_passes_through_without_billing(tmp_path):
+@pytest.mark.parametrize(
+    ("upstream_status", "upstream_body", "status", "error_type"),
+    [
+        (529, {"detail": {"error_type": "overloaded_error", "message": "busy"}},
+         529, "overloaded_error"),
+        (200, {**ANSWER, "usage": {"input_tokens": 41, "output_tokens": "0"}}, 502, "api_error"),
+        (200, {**ANSWER, "usage": {"input_tokens": 41}}, 502, "api_error"),
+    ],
+)  # fmt: skip
+async def test_unmeterable_upstream_replies_are_not_billed(
+    tmp_path, upstream_status, upstream_body, status, error_type
+):
     def upstream(request: httpx.Request) -> httpx.Response:
-        error = {"detail": {"error_type": "overloaded_error", "message": "busy"}}
-        return httpx.Response(529, json=error, headers={"retry-after": "1"})
+        return httpx.Response(upstream_status, json=upstream_body, headers={"retry-after": "1"})
 
     backend = HTTPSystemOneBackend(
         base_url="http://openjev",
@@ -194,7 +205,73 @@ async def test_upstream_overload_passes_through_without_billing(tmp_path):
         )
         usage = (await client.get("/admin/usage")).json()["usage"]
 
-    assert response.status_code == 529
-    assert response.headers["retry-after"] == "1"
-    assert json.loads(response.content)["detail"]["error_type"] == "overloaded_error"
+    assert response.status_code == status
+    assert json.loads(response.content)["detail"]["error_type"] == error_type
     assert usage == {}
+
+
+@pytest.mark.parametrize(
+    ("limits", "body", "requests"),
+    [
+        # 32 samples of a 4,096-token thought bill far more than 10,000 tokens
+        (TenantLimits(tokens_per_minute=10_000, token_burst=10_000),
+         {"state": "s", "questions": {"q": {"type": "noul"}}, "samples": 32, "think": 4096}, 1),
+        (TenantLimits(requests_per_minute=1, request_burst=1),
+         {"state": "s", "questions": QUESTIONS}, 2),
+    ],
+)  # fmt: skip
+async def test_tenant_limits_refuse_before_dispatch_in_jev_shape(limits, body, requests):
+    calls: list[httpx.Request] = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json=ANSWER)
+
+    backend = HTTPSystemOneBackend(
+        base_url="http://openjev",
+        upstream_model="openjev-0.1",
+        transport=httpx.MockTransport(upstream),
+    )
+    app = create_app(
+        {"chat": MockBackend()},
+        legacy_chat_models={"chat"},
+        systemone_models={"openjev-0.1": SystemOneModel(name="openjev-0.1", backend=backend)},
+        tenant_config=TenantConfig(limits={"default": limits}),
+    )
+    async with _client(app) as client:
+        responses = [
+            await client.post("/v1/systemone", json={"model": "openjev-0.1", **body})
+            for _ in range(requests)
+        ]
+
+    refused = responses[-1]
+    assert refused.status_code == 429
+    assert refused.json()["detail"]["error_type"] == "rate_limit_error"
+    assert len(calls) == requests - 1
+
+
+async def test_each_model_keeps_its_own_body_limit():
+    calls: list[httpx.Request] = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json=ANSWER)
+
+    def model(name: str, limit: int) -> SystemOneModel:
+        backend = HTTPSystemOneBackend(
+            base_url="http://openjev", upstream_model=name, transport=httpx.MockTransport(upstream)
+        )
+        return SystemOneModel(name=name, backend=backend, max_body_bytes=limit)
+
+    app = create_app(
+        {"chat": MockBackend()},
+        legacy_chat_models={"chat"},
+        systemone_models={"small": model("small", 200), "large": model("large", 2_000)},
+    )
+    body = {"model": "small", "state": "x" * 500, "questions": QUESTIONS}
+    async with _client(app) as client:
+        response = await client.post("/v1/systemone", json=body)
+
+    assert response.status_code == 413
+    assert response.json()["detail"]["error_type"] == "api_usage_error"
+    assert calls == []

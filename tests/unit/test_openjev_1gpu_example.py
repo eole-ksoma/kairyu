@@ -324,12 +324,19 @@ async def test_a_refused_thought_is_an_error_before_the_stream_starts(example):
 
 
 @pytest.mark.parametrize(
-    "tool_choice", ["required", {"type": "function", "function": {"name": "bash"}}]
+    "controls",
+    [
+        {"tool_choice": "required"},
+        {"tool_choice": {"type": "function", "function": {"name": "bash"}}},
+        {"stop": [""]},
+        {"logprobs": True, "top_logprobs": 64},
+    ],
 )
-async def test_a_forced_tool_choice_is_refused_before_any_thought(example, tool_choice):
-    """Diffusion models cannot run the structured outputs a forced tool call needs.
-    Refused only in the answer pass, a streamed request could just be aborted,
-    which Kairyu counts as a failure of the only replica."""
+async def test_an_answer_only_refusal_comes_before_any_thought(example, controls):
+    """Answer-only controls reach vLLM only in the answer pass (a forced tool call
+    needs structured outputs diffusion models lack; vLLM refuses an empty stop or
+    more top_logprobs than --max-logprobs). Refused there, a streamed request could
+    just be aborted, which Kairyu counts as a failure of the only replica."""
 
     think_core = example("think_core")
     fake = FakeVllm()
@@ -337,13 +344,13 @@ async def test_a_forced_tool_choice_is_refused_before_any_thought(example, tool_
         with pytest.raises(think_core.UpstreamError) as streamed:
             await think_core.stream(
                 client,
-                _upstream(stream=True, tool_choice=tool_choice),
+                _upstream(stream=True, **controls),
                 [CLOSE_ID],
                 model="diffusiongemma-26b",
             )
         with pytest.raises(think_core.UpstreamError) as unstreamed:
             await think_core.complete(
-                client, _upstream(tool_choice=tool_choice), [CLOSE_ID], model="diffusiongemma-26b"
+                client, _upstream(**controls), [CLOSE_ID], model="diffusiongemma-26b"
             )
 
     assert (streamed.value.status, unstreamed.value.status) == (400, 400)

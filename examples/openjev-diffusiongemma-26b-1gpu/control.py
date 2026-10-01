@@ -212,13 +212,29 @@ def _node_cpulist(node: int) -> str:
     return cpus
 
 
-def _l1_running() -> bool:
+def _l1_holds(gpu_id: int) -> bool:
+    """True when this example's running L1 container is assigned exactly ``gpu_id``."""
+
     state = _run(
-        ["docker", "inspect", "--format", "{{.State.Running}}", L1_CONTAINER],
+        [
+            "docker",
+            "inspect",
+            "--format",
+            "{{.State.Running}} {{json .HostConfig.DeviceRequests}}",
+            L1_CONTAINER,
+        ],
         capture=True,
         check=False,
     )
-    return state.returncode == 0 and state.stdout.strip() == "true"
+    if state.returncode != 0:
+        return False
+    running, _, requests = state.stdout.strip().partition(" ")
+    devices = [
+        device
+        for request in json.loads(requests or "null") or ()
+        for device in request.get("DeviceIDs") or ()
+    ]
+    return running == "true" and devices == [str(gpu_id)]
 
 
 def _preflight(env: dict[str, str]) -> None:
@@ -248,8 +264,10 @@ def _preflight(env: dict[str, str]) -> None:
     if row["compute_capability"] < expected["minimum_compute_capability"]:
         raise SystemExit(f"GPU {gpu_id} has insufficient compute capability")
     # Never evict another workload: the GPU must be idle unless this
-    # example's own L1 already holds it.
-    if not _l1_running() and int(row["memory_used_mib"]) > int(expected["maximum_idle_used_mib"]):
+    # example's own L1 already holds that very GPU.
+    if not _l1_holds(gpu_id) and int(row["memory_used_mib"]) > int(
+        expected["maximum_idle_used_mib"]
+    ):
         raise SystemExit(
             f"GPU {gpu_id} already has {row['memory_used_mib']} MiB in use; "
             "stop the workload holding it or choose another GPU_ID"

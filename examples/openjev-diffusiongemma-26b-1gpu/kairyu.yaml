@@ -46,7 +46,7 @@ pools:
           max_image_dimension: 8192
           max_image_aspect_ratio: 200
           max_processed_prompt_tokens: 65536
-        container_image_digest: sha256:1c14bdf63a9be36a9ac8ae8f4500e372dae5921f9eb4f210f730074f01156c6b
+        container_image_digest: sha256:46530fa771b908dbfa9e2ea2a663899beea32bd99c1da376abcab6bd849a3138
         model_revision: ec4ff3df205028f4e81c954c2227f9312b3ec2ea
         max_model_len: 65536
         quantization_format: nvfp4

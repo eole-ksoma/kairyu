@@ -385,6 +385,29 @@ def think(run_dir: Path) -> int:
         }
     )
     cases["chat_template_kwargs_rejected"] = None if status == 400 else f"HTTP {status}"
+    # An answer-only control vLLM refuses is OpenJev's 400 before any thought,
+    # not an aborted stream that would eject the only replica. Kairyu has sent
+    # its stream headers by then, so the 400 arrives as an error frame.
+    status, body = post_chat(
+        {
+            "model": SERVED,
+            "stream": True,
+            "max_tokens": 64,
+            "stop": [""],
+            "messages": [{"role": "user", "content": ARITHMETIC}],
+        }
+    )
+    metrics = urllib.request.urlopen(f"{_api_url()}/metrics", timeout=5).read().decode()
+    healthy = control._healthy_replicas(metrics, SERVED)
+    events, _ = stream_events(body) if status == 200 else ([], False)
+    deltas = [c.get("delta") or {} for e in events for c in e.get("choices") or ()]
+    thought = any(delta.get("reasoning_content") for delta in deltas)
+    refused = status == 400 or any("error" in event for event in events)
+    cases["empty_stop_refused_before_thought"] = (
+        None
+        if refused and not thought and healthy == 1
+        else f"HTTP {status}, thought {thought}, healthy {healthy}: {str(body)[:200]}"
+    )
     return _report(run_dir, "think", cases)
 
 

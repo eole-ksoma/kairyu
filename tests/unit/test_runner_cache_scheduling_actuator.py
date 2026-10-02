@@ -399,7 +399,7 @@ def test_scale_up_atomically_cas_binds_template_and_replicas(tmp_path: Path) -> 
     )
 
     assert result.scale.applied is True
-    assert authority_checks == [NOW]
+    assert authority_checks == [NOW, NOW]
     replacements = [
         operation["path"] for operation in patches[0] if operation["op"] == "replace"
     ]

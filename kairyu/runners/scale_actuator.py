@@ -531,6 +531,49 @@ class KubernetesScaleActuator:
             )
         return refreshed
 
+    def _final_pre_patch_authority(
+        self,
+        decision: ScalingDecisionRecord,
+        *,
+        target: KubernetesScaleTarget,
+        fence: KubernetesScaleFence,
+        authority: RunnerWriterAuthority,
+        reauthorize: Callable[[], RunnerWriterAuthority],
+        model_id: str | None,
+        quota: ScalingQuotaAdmission | None,
+        prewarm: ScalingPrewarmPlan | None,
+        startup_binding: RunnerCacheStartupBinding | None,
+        drain: ScalingDrainPlan | None,
+    ) -> RunnerWriterAuthority:
+        """Reauthorize the leader after every callback and recheck evidence age.
+
+        Callbacks run between the earlier reauthorization and the PATCH, so a lease
+        or evidence that expired while they ran must fail closed here. Nothing may
+        perform I/O or call back between this check and the PATCH.
+        """
+
+        final = self._reauthorize(authority, reauthorize)
+        if final.validated_at < authority.validated_at:
+            raise KubernetesScaleConflictError(
+                "leader authority regressed before Kubernetes mutation"
+            )
+        if quota is not None:
+            self._reauthorize_quota(decision, lambda: quota, authority=final)
+        if prewarm is not None:
+            self._reauthorize_prewarm(decision, lambda: prewarm, authority=final)
+        if startup_binding is not None:
+            self._validate_startup_binding(
+                startup_binding,
+                decision=decision,
+                target=target,
+                fence=fence,
+                model_id=model_id,
+                validated_at=final.validated_at,
+            )
+        if drain is not None:
+            self._reauthorize_drain(decision, lambda: drain, authority=final)
+        return final
+
     @staticmethod
     def _reauthorize_quota(
         decision: ScalingDecisionRecord,
@@ -1775,6 +1818,10 @@ class KubernetesScaleActuator:
                 for name, value in annotations.items()
             )
             held_drain_pods: tuple[_DrainPodSnapshot, ...] = ()
+            refreshed_quota: ScalingQuotaAdmission | None = None
+            refreshed_prewarm: ScalingPrewarmPlan | None = None
+            refreshed_binding: RunnerCacheStartupBinding | None = None
+            final_drain: ScalingDrainPlan | None = None
             authority = self._reauthorize(authority, reauthorize)
             if decision.action is ScalingDecisionAction.SCALE_UP:
                 refreshed_quota = self._reauthorize_quota(
@@ -1845,6 +1892,18 @@ class KubernetesScaleActuator:
                     raise KubernetesScaleConflictError(
                         "drain authority rolled back during Pod hold verification"
                     )
+            authority = self._final_pre_patch_authority(
+                decision,
+                target=target,
+                fence=fence,
+                authority=authority,
+                reauthorize=reauthorize,
+                model_id=observed.annotations.get(MODEL_ID_ANNOTATION),
+                quota=refreshed_quota,
+                prewarm=refreshed_prewarm,
+                startup_binding=refreshed_binding,
+                drain=final_drain,
+            )
             response = self._client.patch(
                 url,
                 headers={**headers, "Content-Type": "application/json-patch+json"},

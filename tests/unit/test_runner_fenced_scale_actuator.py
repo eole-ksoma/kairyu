@@ -2524,3 +2524,77 @@ def test_leader_gate_claims_before_fenced_scale(tmp_path: Path) -> None:
     assert result.scale.applied is True
     assert methods == ["GET", "PATCH", "GET", "PATCH"]
     client.close()
+
+
+@pytest.mark.parametrize(
+    ("lease_seconds", "callback_delay_seconds", "expected_error", "match"),
+    [
+        (10, 11, RunnerNotLeaderError, "lease"),
+        (60, 31, KubernetesScaleConflictError, "not fresh"),
+    ],
+    ids=["lease-expired-during-callback", "evidence-aged-during-callback"],
+)
+def test_final_callback_delay_is_rechecked_before_scale_patch(
+    tmp_path: Path,
+    lease_seconds: int,
+    callback_delay_seconds: int,
+    expected_error: type[Exception],
+    match: str,
+) -> None:
+    decision: ScalingDecisionRecord | None = None
+    state = _workload_payload()
+    methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal state
+        methods.append(request.method)
+        if request.method == "GET":
+            return httpx.Response(200, json=state)
+        if SCALE_ELECTION_ID_ANNOTATION not in state["metadata"]["annotations"]:
+            state = _workload_payload(resource_version="11", annotations=_annotations(token=1))
+        else:
+            assert decision is not None
+            state = _workload_payload(
+                replicas=4,
+                resource_version="12",
+                generation=8,
+                annotations=_annotations(token=1, decision=decision),
+            )
+        return httpx.Response(200, json=state)
+
+    actuator, client, log = _actuator(tmp_path, handler)
+    clock = [NOW]
+    elector = RunnerLeaderElector(
+        InMemoryRunnerLeaderLeaseStore(clock=lambda: clock[0]),
+        election_id="runner-control-plane",
+        holder_id="controller-a",
+        lease_seconds=lease_seconds,
+    )
+    gate = LeaderFencedRunnerController(elector, RunnerStatusReconciler())
+    assert elector.campaign() is not None
+    claim = gate.mutate_autoscaler(
+        lambda authority: actuator.claim_authority(
+            _target(), authority, reauthorize=elector.authority
+        )
+    )
+    decision = log.append(_decision(target_revision=claim.target_revision))
+
+    def slow_prewarm():
+        clock[0] += timedelta(seconds=callback_delay_seconds)
+        return decision.prewarm_plan
+
+    with pytest.raises(expected_error, match=match):
+        gate.mutate_autoscaler(
+            lambda authority: actuator.apply_fenced(
+                decision,
+                _target(),
+                authority=authority,
+                fence=_fence(),
+                reauthorize=elector.authority,
+                reauthorize_quota=lambda: decision.quota_admission,
+                reauthorize_prewarm=slow_prewarm,
+            )
+        )
+
+    assert methods == ["GET", "PATCH", "GET"]
+    client.close()

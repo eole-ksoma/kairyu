@@ -285,7 +285,10 @@ JSON Patch resourceVersion/UID CAS. The actuator then accepts a decision only
 when that exact token is still present. Both claim and actuation require one
 more store-authoritative reauthorization immediately before PATCH, so expiry
 detected by that final pre-PATCH check fails closed even before a successor
-claim. Cluster RBAC
+claim. Review amendment (PR #615): actuation takes that check after its last
+quota, prewarm, startup-binding, or drain callback, and re-evaluates the
+freshness of the evidence those callbacks returned against the final authority;
+nothing runs between that check and the PATCH. Cluster RBAC
 and admission policy remain deployment concerns.
 
 ## Model-class scaling policy

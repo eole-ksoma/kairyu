@@ -11,6 +11,30 @@ header (above the existing entries), keeping their original order.
 
 <!-- ARCHIVE-INSERT-POINT: new trimmed entries go directly below this line -->
 
+### 2026-10-01 — [amendment] System One review fixes (PR #614)
+- What: `/v1/systemone` reserves the billed upper bound (questions as separate reads, think × samples), enforces each model's body limit, 502s unless both usage counts are valid, and tenant 429s use Jev's shape. The OpenJev overlay refuses empty `stop`/out-of-range `top_logprobs` before the thought; preflight exempts only the GPU the L1 holds; playground fixes. Gates pass on overlay `46530fa7`; `l1` thought-cut-then-answer fails intermittently (2/4, answer pass reopens a thought) — open finding.
+- Why: owner review: the old bound let one request bill 13× a tenant's bucket, and answer-only refusals after the thought ejected the only replica.
+- Refs: m11 D8 metering; example `MEASUREMENTS.md` "Review-fix rerun"
+
+### 2026-10-01 — [design] System One API through Kairyu; OpenJev example GPU-verified
+- What: Kairyu serves `POST /v1/systemone` (Jev wire API) via `HTTPSystemOneBackend`, not a pool member; `/v1/models` adds Jev's `models` list. The OpenJev example serves System One through Kairyu with a Jev-style playground, fixes the prefill template for vLLM's `openai` content format, pins the overlay, adopts 32 generations in flight + 8 queued (+32 % c32 tok/s), and passes every GPU gate including OpenJev's own live suite against Kairyu.
+- Why: owner request (Web UI following Jev, served by Kairyu). System One is a public wire format with several servers, so auth/tenancy/metering/admission belong in Kairyu; a pool member would let a System One 529 eject the chat replica.
+- Refs: m11 D8 (`docs/design/m11-product.md`); FN-D9 OpenJev amendment; example `MEASUREMENTS.md`; PR #614
+
+### 2026-10-01 — [design] OpenJev DiffusionGemma on one GPU, think = 512
+- What: new example `openjev-diffusiongemma-26b-1gpu`: one OpenJev replica (DiffusionGemma 26B-A4B NVFP4 on vLLM) behind the single-replica L2/L3. Every chat completion thinks first with a fixed 512-token thought, through an example-owned two-pass overlay on the published OpenJev image. `kairyu/` is unchanged. CPU tests and CPU evidence pass; GPU gates are pending.
+- Why: owner request. DiffusionGemma's `DiffusionSampler` does not apply vLLM's `thinking_token_budget`, and OpenJev's chat route has no budget, so OpenJev's own System One `think` method is applied to chat.
+- Refs: FN-D9 OpenJev one-GPU amendment in `docs/design/frontier-native-runtime.md`; plan `docs/superpowers/plans/2026-10-01-openjev-diffusiongemma-1gpu-example.md`; example `MEASUREMENTS.md`
+
+### 2026-10-01 — [progress] V4.1 ensemble example GPU gates pass on the amended DTO-D17
+- What: readiness, vision, tool-calling, generic and coding matrices, and the browser smoke pass. Ensemble TTFT gate PASS at c1/c8/c16/c32 (8.7/7.7/39.6/95.8 % of 2× direct). Judge timeouts 3/269, all served by `deepseek_think`. 4/128 coding requests exceed 900 s after two audit refinements.
+- Refs: example `MEASUREMENTS.md` (runs `fb-*`); DTO-D17 in `docs/design/example-dual-track-orchestration.md`; PR #613
+
+### 2026-10-01 — [amendment] V4.1 ensemble example: judge fallback is deepseek_think (DTO-D17)
+- What: a judge timeout, backend error, or unparseable verdict now routes to `deepseek_think`, not the ensemble (`profile_judge.fallback`). `kairyu/` is unchanged. Every GPU gate is re-run.
+- Why: owner decision. A slow or failed judge says nothing about difficulty; escalating to the heavier route on a 5 s timeout added load when the system was busiest.
+- Refs: DTO-D17 second amendment in `docs/design/example-dual-track-orchestration.md`; PR #613
+
 ### 2026-10-01 — [amendment] V4.1 ensemble example: looser ENSEMBLE criteria (DTO-D17)
 - What: the judge now sends hard problems and ties to ENSEMBLE (math/logic, algorithms, multi-file coding, proofs, design/planning, multi-step analysis, ambiguous requests). DEEPSEEK_THINK keeps everyday requests and routine agent turns. The example's GPU gates are re-run.
 - Why: owner request. The first DTO-D17 criteria sent 100% of the gate traffic and 44/44 live benchmark requests to deepseek_think.

@@ -66,8 +66,11 @@ def _deepseek(
     draft: str,
     checklist: dict | None = None,
     implicit: list[dict] | None = None,
+    implicit_texts: list[str] | None = None,
     draft_finish: str = "stop",
 ):
+    replies = list(implicit_texts or [])
+
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         seen.append(body)
@@ -75,7 +78,7 @@ def _deepseek(
         if text.startswith("[extract]"):
             answer = json.dumps(checklist or CHECKLIST)
         elif text.startswith("[implicit]"):
-            answer = json.dumps({"requirements": implicit or []})
+            answer = replies.pop(0) if replies else json.dumps({"requirements": implicit or []})
         elif text.startswith("[state_builder]"):
             answer = json.dumps(
                 {
@@ -170,6 +173,7 @@ def _orchestrator(
     implicit: float = 0.9999,
     checklist: dict | None = None,
     implicit_conditions: list[dict] | None = None,
+    implicit_texts: list[str] | None = None,
     jev_down: bool = False,
     sufficiency: float = 0.9999,
     needs: str | None = None,
@@ -190,6 +194,7 @@ def _orchestrator(
                     draft=draft,
                     checklist=checklist,
                     implicit=implicit_conditions,
+                    implicit_texts=implicit_texts,
                     draft_finish=draft_finish,
                 )
             ),
@@ -438,6 +443,21 @@ async def test_an_unconfirmed_requirement_set_never_yields_a_guarantee() -> None
     assert result.text == "Paris"
     assert result.verification.guaranteed is False
     assert result.verification.reason == "requirements_unconfirmed"
+
+
+async def test_a_cut_off_implicit_list_is_written_again() -> None:
+    # A thinking extractor that ran into max_tokens left the implicit list
+    # as broken JSON; the final checklist could not read it and the whole
+    # answer ended checklist_unavailable.
+    seen: list[dict] = []
+    orchestrator = _orchestrator(
+        seen, [], draft="Paris", implicit_texts=['{"requirements": [{"id": "I1", "propos']
+    )
+
+    result = await orchestrator.run(_call("Name the capital of France in one word."))
+
+    assert sum(_text(body).startswith("[implicit]") for body in seen) == 2
+    assert result.verification.guaranteed
 
 
 async def test_the_longest_path_fits_the_step_budget() -> None:

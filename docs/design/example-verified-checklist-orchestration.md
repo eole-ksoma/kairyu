@@ -261,6 +261,14 @@ rejected); free-text requests unchanged. A shorter scope ("within the
 caller's fixed JSON fields") did not work (0.03-0.07). Structured gate: two
 runs, 4/4 guaranteed.
 
+Defect found by the requirements gate (2026-10-02): on a puzzle request
+("a 9-digit lockscreen pattern ..."), the implicit extractor tried to solve
+the puzzle, thought until max_tokens (32,768) and returned cut-off JSON; the
+final checklist could not read it and the whole answer ended
+`checklist_unavailable` (1 of 4 reruns). Both extractors are now told never
+to work out the answer itself, and implicit_check writes a broken list once
+more (max_refinements 1; worst case 20 steps, budget 24).
+
 ## Limitations
 
 - A guaranteed answer is not streamed before its checklist finishes (time to

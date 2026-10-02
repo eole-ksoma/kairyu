@@ -124,7 +124,11 @@ roles:
       free). Read the request within it: a content demand ("describe",
       "explain", ...) is satisfied by what the format can hold, so write each
       condition so that an answer in exactly this format can meet it, and do
-      not add conditions about the format itself.
+      not add conditions about the format itself. When the format is fixed,
+      append to the text of each unit that asks for such content the scope
+      the judge must read it in, for example "describe it (the caller fixed
+      the answer to a JSON object with only the fields city, country and
+      population; this is done by filling them)", naming the actual format.
 
       Output only the JSON object.
       --- RESPONSE FORMAT ---

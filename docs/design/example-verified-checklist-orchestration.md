@@ -243,6 +243,24 @@ builder 44 s / 5,109 tokens, guaranteed 1/8 -> 3/8. The floor is extraction
 (implicit 110 s in parallel with extract 89 s) plus one attempt (answer and
 state builder, about 70 s); repairs add about 70 s each.
 
+### VCO-D13 — Instruction units read within the caller's format (2026-10-02)
+
+The structured gate's "Pick a European capital and describe it in exactly
+the requested JSON" (fields city, country, population_estimate) was not
+guaranteed: OpenJev read "describe it" as free prose, called the field
+conditions unrequested (necessity p 0.005-0.02) and three fields an
+incomplete description (sufficiency 0.01). Owner ruling: under a fixed
+format, "describe it" means filling those fields; the answer deserves the
+guarantee, and the fix belongs in how the requirement reaches Jev. The
+extractor now appends to each unit that asks for content the format bounds
+the scope to read it in ("describe it (the caller fixed the answer to a JSON
+object with only the fields city, country and population_estimate; this is
+done by filling them)"). Probes (5 reads each): all fields covered ->
+sufficiency 0.85-0.93; population condition missing -> 0.11-0.18 (still
+rejected); free-text requests unchanged. A shorter scope ("within the
+caller's fixed JSON fields") did not work (0.03-0.07). Structured gate: two
+runs, 4/4 guaranteed.
+
 ## Limitations
 
 - A guaranteed answer is not streamed before its checklist finishes (time to

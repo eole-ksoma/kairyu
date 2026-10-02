@@ -561,7 +561,9 @@ def test_claim_then_fenced_scale_persists_full_decision_identity_and_retries(
                 {"op": "test", "path": "/metadata/resourceVersion", "value": "10"},
                 {"op": "test", "path": "/metadata/uid", "value": "workload-uid"},
             ]
-            state = _workload_payload(resource_version="11", annotations=_annotations(token=1))
+            state = _workload_payload(
+                resource_version="11", generation=8, annotations=_annotations(token=1)
+            )
         else:
             assert decision is not None
             values = {operation["path"]: operation.get("value") for operation in patch}
@@ -579,7 +581,7 @@ def test_claim_then_fenced_scale_persists_full_decision_identity_and_retries(
             state = _workload_payload(
                 replicas=4,
                 resource_version="12",
-                generation=8,
+                generation=9,
                 annotations=_annotations(token=1, decision=decision),
             )
         return httpx.Response(200, json=state)
@@ -591,7 +593,7 @@ def test_claim_then_fenced_scale_persists_full_decision_identity_and_retries(
         decision,
         _target(),
         authority=_authority(),
-        fence=_fence(),
+        fence=_fence(workload_generation=8),
         reauthorize=lambda: _authority(),
         reauthorize_quota=lambda: decision.quota_admission,
         reauthorize_prewarm=lambda: decision.prewarm_plan,
@@ -600,7 +602,7 @@ def test_claim_then_fenced_scale_persists_full_decision_identity_and_retries(
         decision,
         _target(),
         authority=_authority(),
-        fence=_fence(),
+        fence=_fence(workload_generation=8),
         reauthorize=lambda: _authority(),
         reauthorize_quota=lambda: decision.quota_admission,
         reauthorize_prewarm=lambda: decision.prewarm_plan,
@@ -627,7 +629,9 @@ def test_successor_claim_blocks_stale_leader_before_decision(tmp_path: Path) -> 
         nonlocal state
         if request.method == "GET":
             return httpx.Response(200, json=state)
-        state = _workload_payload(resource_version="11", annotations=_annotations(token=2))
+        state = _workload_payload(
+            resource_version="11", generation=8, annotations=_annotations(token=2)
+        )
         return httpx.Response(200, json=state)
 
     actuator, client, log = _actuator(tmp_path, handler)
@@ -2475,13 +2479,15 @@ def test_leader_gate_claims_before_fenced_scale(tmp_path: Path) -> None:
         if request.method == "GET":
             return httpx.Response(200, json=state)
         if SCALE_ELECTION_ID_ANNOTATION not in state["metadata"]["annotations"]:
-            state = _workload_payload(resource_version="11", annotations=_annotations(token=1))
+            state = _workload_payload(
+                resource_version="11", generation=8, annotations=_annotations(token=1)
+            )
         else:
             assert decision is not None
             state = _workload_payload(
                 replicas=4,
                 resource_version="12",
-                generation=8,
+                generation=9,
                 annotations=_annotations(token=1, decision=decision),
             )
         return httpx.Response(200, json=state)
@@ -2514,7 +2520,7 @@ def test_leader_gate_claims_before_fenced_scale(tmp_path: Path) -> None:
             decision,
             _target(),
             authority=authority,
-            fence=_fence(),
+            fence=_fence(workload_generation=8),
             reauthorize=elector.authority,
             reauthorize_quota=lambda: decision.quota_admission,
             reauthorize_prewarm=lambda: decision.prewarm_plan,
@@ -2551,13 +2557,15 @@ def test_final_callback_delay_is_rechecked_before_scale_patch(
         if request.method == "GET":
             return httpx.Response(200, json=state)
         if SCALE_ELECTION_ID_ANNOTATION not in state["metadata"]["annotations"]:
-            state = _workload_payload(resource_version="11", annotations=_annotations(token=1))
+            state = _workload_payload(
+                resource_version="11", generation=8, annotations=_annotations(token=1)
+            )
         else:
             assert decision is not None
             state = _workload_payload(
                 replicas=4,
                 resource_version="12",
-                generation=8,
+                generation=9,
                 annotations=_annotations(token=1, decision=decision),
             )
         return httpx.Response(200, json=state)
@@ -2589,7 +2597,7 @@ def test_final_callback_delay_is_rechecked_before_scale_patch(
                 decision,
                 _target(),
                 authority=authority,
-                fence=_fence(),
+                fence=_fence(workload_generation=8),
                 reauthorize=elector.authority,
                 reauthorize_quota=lambda: decision.quota_admission,
                 reauthorize_prewarm=slow_prewarm,
@@ -2597,4 +2605,42 @@ def test_final_callback_delay_is_rechecked_before_scale_patch(
         )
 
     assert methods == ["GET", "PATCH", "GET"]
+    client.close()
+
+
+@pytest.mark.parametrize(
+    ("kind", "generation_after_claim", "template_after_claim"),
+    [
+        (KubernetesScalableKind.STATEFUL_SET, 8, None),
+        (KubernetesScalableKind.DEPLOYMENT, 9, None),
+        (KubernetesScalableKind.DEPLOYMENT, 8, {"metadata": {"labels": {"changed": "1"}}}),
+    ],
+    ids=["statefulset-generation-advanced", "deployment-skipped-generation", "template-changed"],
+)
+def test_claim_rejects_response_outside_kind_generation_contract(
+    tmp_path: Path,
+    kind: KubernetesScalableKind,
+    generation_after_claim: int,
+    template_after_claim: dict | None,
+) -> None:
+    kind_name = "Deployment" if kind is KubernetesScalableKind.DEPLOYMENT else "StatefulSet"
+    state = _workload_payload(kind=kind_name)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal state
+        if request.method == "GET":
+            return httpx.Response(200, json=state)
+        state = _workload_payload(
+            kind=kind_name,
+            resource_version="11",
+            generation=generation_after_claim,
+            annotations=_annotations(token=1),
+        )
+        if template_after_claim is not None:
+            state["spec"]["template"] = template_after_claim
+        return httpx.Response(200, json=state)
+
+    actuator, client, _log = _actuator(tmp_path, handler)
+    with pytest.raises(InvalidKubernetesScaleResponseError, match="authority claim"):
+        actuator.claim_authority(_target(kind), _authority(), reauthorize=lambda: _authority())
     client.close()

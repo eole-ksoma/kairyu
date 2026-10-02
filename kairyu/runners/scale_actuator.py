@@ -1450,10 +1450,17 @@ class KubernetesScaleActuator:
                 )
             response.raise_for_status()
             updated = self._parse_workload(self._response_payload(response), target=target)
+            # Deployment advances metadata.generation on any annotation change,
+            # StatefulSet only on a spec change; the template check keeps the
+            # claim provably spec-neutral for both kinds.
+            claim_generation = observed.generation + (
+                1 if target.kind is KubernetesScalableKind.DEPLOYMENT else 0
+            )
             if (
                 updated.uid != observed.uid
                 or updated.replicas != observed.replicas
-                or updated.generation != observed.generation
+                or updated.generation != claim_generation
+                or updated.pod_template != observed.pod_template
                 or updated.resource_version == observed.resource_version
                 or self._stored_authority(updated) != requested
                 or updated.annotations.get(RELEASE_ID_ANNOTATION) != release_id

@@ -281,7 +281,11 @@ atomically by its mutation target; output from a callback that outlives its
 lease is stale even if the local function returns normally. WP3.4 implements
 that boundary as `claim_authority() -> observe/decide -> append ->
 apply_fenced()`. A successor first advances the token on the workload with a
-JSON Patch resourceVersion/UID CAS. The actuator then accepts a decision only
+JSON Patch resourceVersion/UID CAS. That claim response must keep replicas and
+the Pod template; its generation follows the workload kind (Deployment advances
+it by one on any annotation change, StatefulSet keeps it), and the claim records
+the returned generation for the decision fence (review amendment, PR #615). The
+actuator then accepts a decision only
 when that exact token is still present. Both claim and actuation require one
 more store-authoritative reauthorization immediately before PATCH, so expiry
 detected by that final pre-PATCH check fails closed even before a successor

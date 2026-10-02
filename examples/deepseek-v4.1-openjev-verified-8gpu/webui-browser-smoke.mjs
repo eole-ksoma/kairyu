@@ -28,7 +28,22 @@ async function step(name, operation) {
 	return operation();
 }
 
+// Open WebUI's corner notices (bottom-right) can cover the model selector;
+// they are informational, so the gate records and closes them before clicking.
+async function dismissNotices() {
+	const notices = page.locator('div.absolute.bottom-8.right-8.z-50');
+	for (const notice of await notices.all()) {
+		console.log(JSON.stringify({ notice: (await notice.innerText()).trim().slice(0, 200) }));
+		const close = notice.locator('button');
+		if ((await close.count()) > 0) {
+			await close.last().click({ timeout: actionTimeoutMs }).catch(() => {});
+		}
+	}
+	await notices.evaluateAll((elements) => elements.forEach((element) => element.remove()));
+}
+
 async function selectModel(modelId) {
+	await dismissNotices();
 	await page.locator('#model-selector-model-button').click({ timeout: actionTimeoutMs });
 	await page.locator('#model-search-input').fill(modelId);
 	const option = page.locator(`[role="option"][data-value="${modelId}"]`);

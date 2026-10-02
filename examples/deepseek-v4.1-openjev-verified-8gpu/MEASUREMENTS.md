@@ -125,6 +125,52 @@ flight, 74 tok/s per request, 2,370-2,500 tok/s DeepSeek generation, DSpark
 acceptance 57-61 %; about 85 minutes in all. 12 state-builder outputs (0.7 %)
 were truncated JSON (runaway newlines) and are excluded.
 
+## GPU gates on `e81db571` (2026-10-02, 13:22-16:30 JST)
+
+Every gate passes. Raw rows: `results/*-20261002T0[4-7]*Z.json`.
+
+| Gate | Result |
+|---|---|
+| `l1` | PASS: grammar probes on every DP rank, System One on both replicas |
+| `routing` | PASS: 80 conversations judged in 1.41 s; held-out miss rate 0.0; everyday to think 1.0 |
+| `effort` | PASS: default/low/high/max reach every DeepSeek step on both routes |
+| `think-route` | PASS: 6/6 think, p50 1.09 s, TTFT p50 0.85 s |
+| `implicit` | PASS: recall 0.875 (gate 0.80), controls 0.0, 27/30 guaranteed, p50 89 s |
+| `requirements` (40 InFoBench, c8) | PASS: gold recall 0.972 (gate 0.90), 40/40 judged, 17 guaranteed, p50 342 s / p95 537 s |
+| `repair` (16, c8) | PASS: 14 guaranteed, 0 guaranteed answers violate their constraint, p50 103 s |
+| `structured` | PASS: both schema answers guaranteed (121 s, 77 s) |
+| `fallback` | PASS: one replica down guaranteed; both down `judge_unavailable` / think route; recovered |
+| `calibrate` | PASS: tau_hi reproduced from cache |
+| `serving` (InFoBench, kairyu-verified-always) | PASS (table below) |
+| `serving-routed` (routing set, kairyu-verified) | PASS (table below) |
+| `browser-smoke.sh` | PASS after the gate script closes Open WebUI's "new version (v0.11.4) available" notice, which covered the model selector |
+
+Serving (InFoBench; per row: requests / guaranteed / latency p50 / p95 /
+internal input / output tokens / aggregate output tok/s / req/min):
+
+| c | n | guaranteed | p50 / p95 s | tokens in / out | tok/s | req/min |
+|---|---:|---:|---|---|---:|---:|
+| c1 | 8 | 4 (50 %) | 154 / 261 | 106,478 / 276,551 | 211 | 0.37 |
+| c4 | 16 | 7 (44 %) | 221 / 384 | 247,646 / 524,539 | 540 | 0.99 |
+| c8 | 16 | 8 (50 %) | 218 / 549 | 246,750 / 590,312 | 869 | 1.41 |
+| c16 | 32 | 17 (53 %) | 191 / 507 | 382,164 / 844,110 | 1,347 | 3.06 |
+
+(5b455dd8: 25-38 % guaranteed, p50 141-260 s.)
+
+Serving-routed (Jev picks the route per conversation):
+
+| c | verified n / guaranteed | verified p50 / p95 s | think n | think p50 / p95 s | tok/s | req/min |
+|---|---|---|---:|---|---:|---:|
+| c1 | 7 / 7 | 95 / 139 | 1 | 0.5 | 208 | 0.61 |
+| c4 | 10 / 3 | 235 / 345 | 6 | 1.5 / 1.8 | 492 | 1.21 |
+| c8 | 10 / 6 | 184 / 405 | 6 | 3.3 / 5.9 | 663 | 2.02 |
+| c16 | 16 / 12 | 307 / 545 | 16 | 3.3 / 8.3 | 946 | 2.81 |
+
+Verified route overall 28/43 guaranteed (65 %). The owner latency target
+(p50 <= 3 minutes on long InFoBench requests) is not met: p50 154-342 s
+across gates; first-attempt guarantees take 50-120 s, failed repairs
+200-650 s.
+
 ## Two-stage extraction and latency (2026-10-02, VCO-D8 amendment 2, VCO-D12)
 
 Implicit conditions, extraction plus OpenJev only (no answer generation;

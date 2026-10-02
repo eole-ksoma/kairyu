@@ -354,7 +354,11 @@ class NodeModelCacheIndex:
             raise NodeModelCacheIndexError("cannot record verified cache residency") from exc
 
     def touch(self, manifest_digest: str) -> NodeModelCacheRecord:
-        """Advance last-access time without changing immutable identity or pins."""
+        """Advance last-access time without changing identity, pins, or generation.
+
+        Access recency advances only the index revision, so placement bindings that
+        pin a residency generation survive a successful Runner-start verification.
+        """
 
         digest = self._validate_digest(manifest_digest)
         now = self._now_ns()
@@ -377,8 +381,7 @@ class NodeModelCacheIndex:
                 if last_access != row["last_access_at_ns"]:
                     connection.execute(
                         """
-                        UPDATE cache_entries
-                        SET last_access_at_ns = ?, generation = generation + 1
+                        UPDATE cache_entries SET last_access_at_ns = ?
                         WHERE manifest_digest = ?
                         """,
                         (last_access, digest),

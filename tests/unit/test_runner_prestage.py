@@ -34,9 +34,11 @@ from kairyu.artifacts import (
 )
 from kairyu.runners import (
     InMemoryNodeModelPrestageStore,
+    LocalNodeModelCacheLiveEvidenceSource,
     ModelCachePlacement,
     ModelCachePlacementCandidate,
     ModelCachePlacementState,
+    NodeModelCacheLiveEvidenceRequest,
     NodeModelPrestageCapacityError,
     NodeModelPrestageCompactionMonitoringStore,
     NodeModelPrestageCompactionStore,
@@ -45,6 +47,7 @@ from kairyu.runners import (
     NodeModelPrestageExpiredError,
     NodeModelPrestageLookupStore,
     NodeModelPrestageStore,
+    RunnerCacheStartupPlacement,
     RunnerWriterAuthority,
     ScalingPrewarmSnapshot,
     apply_node_model_prestage_records,
@@ -1215,3 +1218,79 @@ def test_overlay_rejects_cross_binding_record() -> None:
             cache_revision=11,
             observed_at=_NOW + timedelta(seconds=3),
         )
+
+
+class _NoAuditSink:
+    def emit(self, event) -> None:
+        raise AssertionError(f"unexpected cache audit event: {event}")
+
+
+def test_runner_start_verification_keeps_prestage_binding_evidence_live(
+    tmp_path: Path,
+) -> None:
+    envelope, trust_store, request = _artifact()
+    ticks = iter(range(1, 1_000))
+    root = tmp_path / "cache"
+    index = NodeModelCacheIndex(
+        root / "cache-index.sqlite3",
+        node_id="gpu-node-00",
+        clock_ns=lambda: next(ticks) * 1_000_000,
+    )
+    store = InMemoryNodeModelPrestageStore(node_id="gpu-node-00")
+    agent = NodeModelCacheAgent(root, Source(), index=index, chunk_size_bytes=4)
+    executor = NodeModelPrestageExecutor(
+        node_id="gpu-node-00",
+        agent=agent,
+        index=index,
+        store=store,
+        clock=lambda: _NOW + timedelta(seconds=2),
+    )
+    command = _commands(envelope.manifest_digest)[0]
+    record = executor.execute(
+        command,
+        claim_id="a" * 64,
+        envelope=envelope,
+        trust_store=trust_store,
+        request=request,
+    )
+    evidence = LocalNodeModelCacheLiveEvidenceSource(
+        node_id="gpu-node-00",
+        store=store,
+        index=index,
+        hint_ttl_seconds=30,
+        clock=lambda: _NOW + timedelta(seconds=3),
+    )
+    live_request = NodeModelCacheLiveEvidenceRequest(
+        placement=RunnerCacheStartupPlacement(
+            placement_id=command.placement_id,
+            node_name=command.node_id,
+            resource_flavor=command.resource_flavor,
+            profile_id=command.profile_id,
+            compatibility_approval_id=command.compatibility_approval_id,
+            manifest_digest=command.manifest_digest,
+            pin_owner=command.pin_owner,
+            prestage_command_id=command.command_id,
+            prestage_command_generation=command.command_generation,
+            hint_index_revision=1,
+            resident_record_generation=record.pin_record_generation,
+            hint_observed_at=_NOW,
+            hint_valid_until=_NOW + timedelta(minutes=1),
+        ),
+        model_id=command.model_id,
+        model_revision=command.model_revision,
+    )
+    evidence.read(live_request)
+    accessed_before = index.get(command.manifest_digest).last_access_at_ns
+
+    decision = agent.verify_for_runner_start(
+        envelope,
+        trust_store,
+        request,
+        audit_sink=_NoAuditSink(),
+    )
+
+    assert decision.runner_start_allowed is True
+    assert index.get(command.manifest_digest).last_access_at_ns > accessed_before
+    assert evidence.read(live_request).pin_evidence.record_generation == (
+        record.pin_record_generation
+    )

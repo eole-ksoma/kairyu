@@ -93,6 +93,13 @@ Wall-clock regression cannot move `last_access_at_ns` backward. A row generation
 advances only when durable observable state changes, allowing later eviction or
 placement code to detect stale snapshots.
 
+Review amendment (PR #615): `touch()` advances last access and the global
+revision but not the row generation. The row generation is the residency,
+verification, and pin lineage that pre-stage completion and startup bindings
+pin (D3.1); a successful Runner-start verification must not invalidate the
+binding it serves. Eviction stays fenced by the global revision, which every
+last-access change still advances.
+
 ## Owner-scoped pins
 
 Pins are separate rows keyed by `(manifest_digest, owner)`. This prevents one

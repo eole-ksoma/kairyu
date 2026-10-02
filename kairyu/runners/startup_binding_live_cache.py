@@ -643,7 +643,7 @@ class AuthenticatedNodeModelCacheLiveEvidenceClient:
 
 
 class RunnerCachePlacementBindingInventory(BaseModel):
-    """Fresh controller-owned placement facts observed after node evidence."""
+    """Controller-owned placement facts, read after node evidence, at their source time."""
 
     model_config = ConfigDict(frozen=True, extra="forbid", revalidate_instances="always")
 

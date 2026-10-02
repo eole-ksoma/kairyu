@@ -246,9 +246,10 @@ removed the successor's pin and exposed a ready artifact to eviction. The owner
 therefore names the ensure generation, and a release (which copies its ensure's
 owner) can remove only that generation's pin. Before pinning, an ensure removes
 its placement's lower-generation owners on the same artifact; the store admits
-it only after those generations were released, so this preserves the earlier
-crash-before-unpin convergence and turns a delayed unpin into a no-op that
-cannot advance the successor's cache record generation.
+it only after those generations were released, so this keeps the earlier
+same-artifact crash-before-unpin convergence (as before, a successor on another
+artifact can leave that older pin behind) and turns a delayed unpin into a
+no-op that cannot advance the successor's cache record generation.
 
 ## Controller feedback
 
@@ -640,7 +641,9 @@ hint. Review amendment (PR #615): the join time is the latest of the inventory
 source time and every hint observation; every hint must still be live then, and
 the inventory source time may be at most the policy observation age older.
 Only then does the aggregator rebuild the prewarm snapshot and plan at the join
-time. The inventory carries its publisher's source time and node hints are
+time. Downstream age checks measure that join time, so inventory facts may be
+up to the observation age plus the deadline-bounded read latency old at
+authorization. The inventory carries its publisher's source time and node hints are
 observed per request, so requiring the inventory to be observed after every
 hint denied current inventories; reading it after the hints, its revision
 fence, and its age bound prevent stale health, schedulability, or assignment

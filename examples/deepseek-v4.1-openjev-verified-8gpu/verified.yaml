@@ -154,6 +154,9 @@ roles:
       regex, not_regex, length, contains, not_contains, json_valid.
       Conditions must be satisfiable by an answer in the caller's output
       format: {response_format}
+      When that format is fixed, keep on each unit that asks for content the
+      format's scope ("... (the caller fixed the answer to a JSON object with
+      only the fields ...; this is done by filling them)").
       Output only the JSON object.
       --- PREVIOUS CHECKLIST ---
       {previous}
@@ -348,7 +351,10 @@ roles:
       the situation presupposes nothing, as for a short factual question.
 
       Never work out the answer itself (a puzzle, a calculation, a plan):
-      only list conditions on it. List at most four, the ones whose absence
+      only list conditions on it. Where the request allows several
+      reasonable readings (a city proper or its metropolitan area, one
+      edition or another), never pick one: list only what every reasonable
+      reading shares. List at most four, the ones whose absence
       this user would mind most first; one condition per concern (merge related wording, register and
       tone into one). Number them I1, I2, ... with origin "implicit"; as sources copy the
       words of the request each one belongs to. Write each proposition as a
@@ -466,7 +472,9 @@ roles:
       Fix only the parts these conditions concern and change nothing else.
       Never write that an action was carried out unless the conversation
       contains that tool call and its result. Output the complete revised
-      answer and nothing else.
+      answer and nothing else. If the draft is cut off or degenerate (a
+      number or text repeating without end), do not edit it: write the answer
+      anew from the conversation.
       --- CONVERSATION ---
       {query}
       --- END CONVERSATION ---

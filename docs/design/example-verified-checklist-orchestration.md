@@ -261,6 +261,24 @@ rejected); free-text requests unchanged. A shorter scope ("within the
 caller's fixed JSON fields") did not work (0.03-0.07). Structured gate: two
 runs, 4/4 guaranteed.
 
+Amendment (2026-10-02, owner option A): six in-process runs per request
+(live L1 / OpenJev, every exchange logged) showed three further causes.
+(1) A grammar-constrained draft can degenerate (an integer repeating zeros
+to max_tokens); repairing that 93,582-character draft thought to max_tokens
+and returned nothing (3/3). The repair prompt now rewrites a cut-off or
+degenerate draft from the conversation (3/3 valid). (2) An implicit
+condition picked one reading the request leaves open ("a city proper, not
+its metropolitan area"), so repair rewrote a correct Tokyo population; the
+implicit extractor now lists only what every reasonable reading shares
+(Japan request 3/4 -> 6/6 guaranteed). (3) Re-extraction dropped the format
+scope; the refine prompt keeps it. Known limit: OpenJev's reading of
+"describe it" against three fixed fields still swings with the
+extractor's wording (necessity and sufficiency 0.02-0.98), so the European
+capital request is guaranteed in 2-5 of 6 runs; a separate format unit and
+three-sample reads did not steady it. Also seen once: the state builder
+listed a JSON field as an "action" claim, failing G2.
+
+
 Defect found by the requirements gate (2026-10-02): on a puzzle request
 ("a 9-digit lockscreen pattern ..."), the implicit extractor tried to solve
 the puzzle, thought until max_tokens (32,768) and returned cut-off JSON; the

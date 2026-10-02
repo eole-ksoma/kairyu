@@ -799,14 +799,17 @@ class AggregatingRunnerCachePlacementBindingCacheReader:
         inventory = RunnerCachePlacementBindingInventory.model_validate(inventory.model_dump())
         candidate_ids = tuple(candidate.placement_id for candidate in inventory.candidates)
         hints = tuple(response.placement_hint for response in responses)
+        # The inventory carries its publisher's source time while node evidence is
+        # observed per request, so evidence is normally newer. Join at the latest
+        # observation, require every hint to be live then, and bound the
+        # inventory's own age separately because the joined snapshot hides it.
+        joined_at = max((inventory.observed_at, *(hint.observed_at for hint in hints)))
+        inventory_age = (joined_at - inventory.observed_at).total_seconds()
         if (
             candidate_ids != expected_placements
             or inventory.cache_revision < original.snapshot.cache_revision
-            or any(
-                hint.observed_at > inventory.observed_at
-                or inventory.observed_at >= hint.valid_until
-                for hint in hints
-            )
+            or inventory_age > decision.policy.max_observation_age_seconds
+            or any(joined_at >= hint.valid_until for hint in hints)
         ):
             raise RunnerCachePlacementBindingAuthorizationDeniedError(
                 "current placement inventory does not cover live node evidence"
@@ -816,7 +819,7 @@ class AggregatingRunnerCachePlacementBindingCacheReader:
             inventory.candidates,
             snapshot_id=inventory.snapshot_id,
             cache_revision=inventory.cache_revision,
-            observed_at=inventory.observed_at,
+            observed_at=joined_at,
             model_class=binding.model_class,
             model_id=binding.model_id,
             model_revision=binding.model_revision,

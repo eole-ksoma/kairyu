@@ -25,7 +25,7 @@ decision, target, quota, and cache backend readers with a second binding read as
 a replacement fence. D3.13 exposes path-free, owner-scoped live pre-stage and
 cache-index evidence from the authenticated node agent. D3.14 adds the strict
 authenticated controller client and bounded fan-out aggregator, joining those
-node responses only to scheduler placement facts observed afterward.
+node responses only to scheduler placement facts read afterward.
 D3.15 adds deadline-bounded PostgreSQL current-binding and exact durable-decision
 readers. D3.16 adds deadline-bounded Kubernetes target, Kueue quota, and
 controller-owned placement-inventory readers. D3.17 adds a lifecycle-owned,
@@ -622,11 +622,16 @@ and joined shutdown prevent slow-drip responses or partial failure from leaving
 background workers and connections. The aggregator then
 reads `RunnerCachePlacementBindingInventory` from an injected controller-owned
 scheduler adapter. Inventory must be canonical, cover exactly the bound
-placements, have a non-regressing cache revision, and be observed no earlier
-than every node hint while all hints remain live. Only then does the aggregator
-rebuild the prewarm snapshot and plan. This ordering prevents stale health,
-schedulability, or assignment values from the original decision from being
-presented as current facts. Readiness covers every configured node and the
+placements, have a non-regressing cache revision, and be read after every node
+hint. Review amendment (PR #615): the join time is the latest of the inventory
+source time and every hint observation; every hint must still be live then, and
+the inventory source time may be at most the policy observation age older.
+Only then does the aggregator rebuild the prewarm snapshot and plan at the join
+time. The inventory carries its publisher's source time and node hints are
+observed per request, so requiring the inventory to be observed after every
+hint denied current inventories; reading it after the hints, its revision
+fence, and its age bound prevent stale health, schedulability, or assignment
+values from the original decision from being presented as current facts. Readiness covers every configured node and the
 inventory backend under the same deadline budget. The hosting runtime owns and
 closes the adopted client before process shutdown.
 

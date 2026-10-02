@@ -1281,7 +1281,23 @@ def test_live_cache_reader_aggregates_node_evidence_then_current_inventory() -> 
     assert state.pin_evidence == (response.pin_evidence,)
 
 
-def test_live_cache_reader_rejects_inventory_observed_before_node_evidence() -> None:
+@pytest.mark.parametrize(
+    ("inventory_observed_at", "is_allowed"),
+    [
+        (LIVE - timedelta(seconds=1), True),
+        (LIVE - timedelta(seconds=31), False),
+        (LIVE + timedelta(minutes=5), False),
+    ],
+    ids=[
+        "published-before-node-evidence",
+        "older-than-observation-age",
+        "after-node-hint-expiry",
+    ],
+)
+def test_live_cache_reader_joins_published_inventory_while_node_hints_are_live(
+    inventory_observed_at: datetime,
+    is_allowed: bool,
+) -> None:
     decision = _decision()
     command = _prestage_command(decision)
     binding = _binding(decision, command_id=command.command_id)
@@ -1297,12 +1313,12 @@ def test_live_cache_reader_rejects_inventory_observed_before_node_evidence() -> 
         def readiness(self, **_kwargs):
             return None
 
-    class StaleInventoryReader:
+    class PublishedInventoryReader:
         def read_inventory(self, *_args, **_kwargs):
             return RunnerCachePlacementBindingInventory(
-                snapshot_id="stale-cache",
+                snapshot_id="published-cache",
                 cache_revision=2,
-                observed_at=LIVE - timedelta(seconds=1),
+                observed_at=inventory_observed_at,
                 candidates=(
                     ModelCachePlacementCandidate(
                         placement_id="placement-a",
@@ -1319,20 +1335,30 @@ def test_live_cache_reader_rejects_inventory_observed_before_node_evidence() -> 
 
     reader = AggregatingRunnerCachePlacementBindingCacheReader(
         evidence=EvidenceReader(),
-        inventory=StaleInventoryReader(),
+        inventory=PublishedInventoryReader(),
         monotonic_clock=lambda: 10.0,
     )
 
-    with pytest.raises(
-        RunnerCachePlacementBindingAuthorizationDeniedError,
-        match="inventory",
-    ):
-        reader.read_cache(
-            binding,
-            decision,
-            deadline_monotonic=20.0,
-            backend_timeout_s=2.0,
-        )
+    if not is_allowed:
+        with pytest.raises(
+            RunnerCachePlacementBindingAuthorizationDeniedError,
+            match="inventory",
+        ):
+            reader.read_cache(
+                binding,
+                decision,
+                deadline_monotonic=20.0,
+                backend_timeout_s=2.0,
+            )
+        return
+    state = reader.read_cache(
+        binding,
+        decision,
+        deadline_monotonic=20.0,
+        backend_timeout_s=2.0,
+    )
+    assert state.prewarm_plan.runner_start_placement_ids == ("placement-a",)
+    assert state.prewarm_plan.snapshot.observed_at == response.placement_hint.observed_at
 
 
 def test_node_endpoint_rejects_non_https_and_non_origin_urls() -> None:

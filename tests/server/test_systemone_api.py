@@ -17,7 +17,7 @@ from starlette.routing import Route
 from kairyu.deploy.builder import build_app_from_spec
 from kairyu.deploy.spec import DeploymentSpec
 from kairyu.engine.mock import MockBackend
-from kairyu.engine.systemone import HTTPSystemOneBackend
+from kairyu.engine.systemone import HTTPSystemOneBackend, SystemOneUnavailableError
 from kairyu.entrypoints.server.app import create_app
 from kairyu.entrypoints.server.settings import ServerSettings
 from kairyu.entrypoints.server.systemone_service import SystemOneModel
@@ -295,3 +295,35 @@ async def test_each_model_keeps_its_own_body_limit():
     assert response.status_code == 413
     assert response.json()["detail"]["error_type"] == "api_usage_error"
     assert calls == []
+
+
+async def test_replicas_take_the_less_busy_one_and_move_once_on_failure():
+    hits: list[str] = []
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        hits.append(request.url.host)
+        if request.url.host == "jev-0":
+            return httpx.Response(529, json={"detail": "overloaded"})
+        return httpx.Response(200, json={"answers": {}, "usage": {"input_tokens": 1}})
+
+    backend = HTTPSystemOneBackend(
+        base_urls=("http://jev-0", "http://jev-1"),
+        upstream_model="openjev-0.1",
+        transport=httpx.MockTransport(upstream),
+    )
+    reply = await backend.decide({"state": "s", "questions": {}})
+    assert reply.status == 200
+    assert hits == ["jev-0", "jev-1"]
+
+
+async def test_all_replicas_down_is_unavailable():
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused", request=request)
+
+    backend = HTTPSystemOneBackend(
+        base_urls=("http://jev-0", "http://jev-1"),
+        upstream_model="openjev-0.1",
+        transport=httpx.MockTransport(upstream),
+    )
+    with pytest.raises(SystemOneUnavailableError):
+        await backend.decide({"state": "s", "questions": {}})

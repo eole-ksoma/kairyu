@@ -327,7 +327,10 @@ class SystemOneSection(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    base_url: str = Field(min_length=1)
+    base_url: str | None = Field(default=None, min_length=1)
+    # Several upstream replicas of one model (m11 D8 replica amendment); the
+    # request goes to the least busy one and moves once on failure.
+    base_urls: tuple[str, ...] = ()
     upstream_model: str = Field(min_length=1)
     aliases: frozenset[str] = frozenset()
     description: str | None = None
@@ -342,6 +345,12 @@ class SystemOneSection(BaseModel):
 
     @model_validator(mode="after")
     def _validate(self) -> SystemOneSection:
+        if (self.base_url is None) == (not self.base_urls):
+            raise ValueError("systemone requires exactly one of base_url or base_urls")
+        if any(not url.strip() for url in self.base_urls) or len(
+            set(self.base_urls)
+        ) != len(self.base_urls):
+            raise ValueError("systemone base_urls must be distinct non-empty URLs")
         if self.max_queue and not self.queue_wait_s:
             raise ValueError("systemone max_queue requires queue_wait_s > 0")
         if any(not alias.strip() for alias in self.aliases):

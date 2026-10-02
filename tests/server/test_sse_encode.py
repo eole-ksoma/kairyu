@@ -25,7 +25,9 @@ from kairyu.entrypoints.server.sse_encode import (
 )
 from kairyu.sse import escape_json_line_separators
 
-_CHAT_EXTENSIONS = frozenset({"kairyu_trace", "kairyu_trace_v2", "kairyu_route"})
+_CHAT_EXTENSIONS = frozenset(
+    {"kairyu_trace", "kairyu_trace_v2", "kairyu_route", "kairyu_verification"}
+)
 _CONTENT_CASES = (
     "",
     "token",

@@ -638,6 +638,7 @@ def build_app_from_spec(
             name=name,
             backend=HTTPSystemOneBackend(
                 base_url=section.base_url,
+                base_urls=section.base_urls,
                 upstream_model=section.upstream_model,
                 api_key_env=section.api_key_env,
                 timeout_s=section.timeout_s,
@@ -840,6 +841,9 @@ def build_app_from_spec(
             orchestrator_spec,
             engine_refs=engines,
             executor_refs=execution_backends,
+            systemone_refs={
+                name: model.backend for name, model in systemone_models.items()
+            },
         )
 
     orchestrator: Orchestrator | None = None

@@ -61,7 +61,7 @@ def test_parallel_tool_fields_preserve_existing_public_positional_abi():
     assert request.trace_requested is True
     assert request.parallel_tool_calls is None
 
-    assert list(inspect.signature(Conductor).parameters)[-8:] == [
+    assert list(inspect.signature(Conductor).parameters)[-9:] == [
         "final_parallel_tool_calls",
         "final_tool_call_protocol",
         "expose_intermediate_outputs",
@@ -70,6 +70,7 @@ def test_parallel_tool_fields_preserve_existing_public_positional_abi():
         "execution_workers",
         "reasoning_effort",
         "public_output_floor",
+        "decision_workers",
     ]
     assert list(inspect.signature(run_moa).parameters)[-3:] == [
         "final_parallel_tool_calls",

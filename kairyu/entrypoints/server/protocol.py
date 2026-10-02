@@ -427,6 +427,10 @@ class ChatCompletionResponse(BaseModel):
     # Actual route uses the same schema as route preview. It is populated only
     # for traced orchestrated responses.
     kairyu_route: RouteDecisionPayload | None = None
+    # Checklist verification of an orchestrated answer: guarantee flag, the
+    # reason when unguaranteed, and each requirement's probability. Present
+    # whenever the serving DAG verifies its final unit with a checklist.
+    kairyu_verification: dict[str, object] | None = None
 
 
 class ChunkToolCall(BaseModel):
@@ -468,6 +472,8 @@ class ChatCompletionChunk(BaseModel):
     kairyu_trace: list[str] | None = None
     kairyu_trace_v2: KairyuTraceV2 | None = None
     kairyu_route: RouteDecisionPayload | None = None
+    # Terminal-chunk checklist verification (see ChatCompletionResponse).
+    kairyu_verification: dict[str, object] | None = None
 
 
 class CompletionRequest(BaseModel):

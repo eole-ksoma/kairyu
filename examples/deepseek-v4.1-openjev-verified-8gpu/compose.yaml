@@ -1,0 +1,276 @@
+name: kairyu-deepseek-v4-1-openjev-verified-8gpu
+x-openjev: &openjev
+  # OpenJev (DiffusionGemma 26B-A4B NVFP4) read only through System One:
+  # each `noul` question returns the probability of yes. The published image
+  # is used unchanged; chat is never called, so no think-first overlay.
+  image: ${OPENJEV_IMAGE}
+  ipc: host
+  environment:
+    OPENJEV_MODEL: /models/diffusiongemma-26b-a4b-it-nvfp4
+    OPENJEV_CANVAS: ${OPENJEV_CANVAS}
+    OPENJEV_MAX_NUM_SEQS: ${OPENJEV_MAX_NUM_SEQS}
+    OPENJEV_MAX_MODEL_LEN: ${OPENJEV_MAX_MODEL_LEN}
+    OPENJEV_GPU_UTIL: ${OPENJEV_GPU_UTIL}
+    OPENJEV_MAX_INFLIGHT: ${OPENJEV_MAX_INFLIGHT}
+    OPENJEV_MAX_QUEUE: ${OPENJEV_MAX_QUEUE}
+    HF_HOME: /models/.cache
+    HF_HUB_OFFLINE: '1'
+    HF_HUB_DISABLE_TELEMETRY: '1'
+    VLLM_NO_USAGE_STATS: '1'
+    PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    XDG_CACHE_HOME: /root/.cache
+    TORCHINDUCTOR_CACHE_DIR: /root/.cache/torchinductor
+    TRITON_CACHE_DIR: /root/.cache/triton
+  healthcheck:
+    test:
+    - CMD
+    - curl
+    - -sf
+    - http://127.0.0.1:8080/health
+    interval: 5s
+    timeout: 3s
+    retries: 1440
+    start_period: 30s
+  restart: unless-stopped
+  cpuset: ${OPENJEV_CPUSET}
+services:
+  # One DeepSeek-V4.1-Flash replica on GPUs 0-5 with the six-GPU example's L1
+  # (DP6 / EP6, SM120 overlay, Engram on the host, DSpark 5). Unlike that
+  # example there is no server-wide thinking default: each L2 role decides
+  # (the V4.1 encoder ORs `thinking` into every request otherwise).
+  deepseek:
+    image: ${DEEPSEEK_VLLM_IMAGE}
+    ipc: host
+    environment:
+      HF_HOME: /models/.cache
+      HF_HUB_OFFLINE: '1'
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      VLLM_NO_USAGE_STATS: '1'
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      SAFETENSORS_FAST_GPU: '1'
+      XDG_CACHE_HOME: /root/.cache
+      TORCHINDUCTOR_CACHE_DIR: /root/.cache/torchinductor
+      TRITON_CACHE_DIR: /root/.cache/triton
+      TILELANG_CACHE_DIR: /root/.cache/tilelang
+      TILELANG_TMP_DIR: /root/.cache/tilelang/tmp
+      VLLM_ENGINE_READY_TIMEOUT_S: '3600'
+      VLLM_USE_RUST_FRONTEND: '0'
+    command:
+    - /models/deepseek-v4.1-flash
+    - --served-model-name
+    - deepseek-v4.1-flash
+    - --max-model-len
+    - '1048576'
+    - --trust-remote-code
+    - --tokenizer-mode
+    - deepseek_v41
+    - --tensor-parallel-size
+    - '1'
+    - --data-parallel-size
+    - '6'
+    - --data-parallel-backend
+    - mp
+    - --enable-expert-parallel
+    - --moe-backend
+    - marlin
+    - --engram-config
+    - '{"cpu_offload":true}'
+    - --attention-config
+    - '{"backend":"FLASHINFER_MLA_SPARSE_DSV41","indexer_kv_dtype":"mxfp4"}'
+    - --kv-cache-dtype
+    - fp8
+    - --block-size
+    - '64'
+    - --enable-prefix-caching
+    - --gpu-memory-utilization
+    - '0.92'
+    - --max-num-seqs
+    - '128'
+    - --max-num-batched-tokens
+    - '4096'
+    - --speculative-config
+    - '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":false}'
+    - --reasoning-parser
+    - deepseek_v41
+    - --enable-auto-tool-choice
+    - --tool-call-parser
+    - deepseek_v41
+    - --override-generation-config
+    - '{"temperature":1.0,"top_p":0.95}'
+    - --limit-mm-per-prompt
+    - '{"image":8}'
+    - --disable-uvicorn-access-log
+    healthcheck:
+      test:
+      - CMD
+      - python3
+      - -c
+      - import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/health",
+        timeout=2)
+      interval: 5s
+      timeout: 3s
+      retries: 1440
+      start_period: 30s
+    restart: unless-stopped
+    cpuset: ${DEEPSEEK_CPUSET}
+    # Loopback only: the launcher's L1 probes and the paired direct rows.
+    ports:
+    - 127.0.0.1:${DEEPSEEK_L1_PORT:-8014}:8000
+    volumes:
+    - type: bind
+      source: ${DEEPSEEK_MODEL_STORAGE_PATH}
+      target: /models
+      read_only: true
+    - type: bind
+      source: ${DEEPSEEK_CACHE_PATH}
+      target: /root/.cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+          - driver: nvidia
+            device_ids:
+            - '0'
+            - '1'
+            - '2'
+            - '3'
+            - '4'
+            - '5'
+            capabilities:
+            - gpu
+  openjev-0:
+    <<: *openjev
+    # Loopback only: launcher probes and calibration read this replica directly.
+    ports:
+    - 127.0.0.1:${OPENJEV_0_PORT:-8015}:8080
+    volumes:
+    - type: bind
+      source: ${OPENJEV_MODEL_STORAGE_PATH}
+      target: /models
+      read_only: true
+    - type: bind
+      source: ${OPENJEV_CACHE_PATH_0}
+      target: /root/.cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+          - driver: nvidia
+            device_ids:
+            - '6'
+            capabilities:
+            - gpu
+  openjev-1:
+    <<: *openjev
+    # Loopback only: launcher probes and calibration read this replica directly.
+    ports:
+    - 127.0.0.1:${OPENJEV_1_PORT:-8016}:8080
+    volumes:
+    - type: bind
+      source: ${OPENJEV_MODEL_STORAGE_PATH}
+      target: /models
+      read_only: true
+    - type: bind
+      source: ${OPENJEV_CACHE_PATH_1}
+      target: /root/.cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+          - driver: nvidia
+            device_ids:
+            - '7'
+            capabilities:
+            - gpu
+  kairyu:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      args:
+        KAIRYU_VISION: '1'
+    image: ${KAIRYU_IMAGE:-local/kairyu:deepseek-v41-openjev-verified-example}
+    command:
+    - /etc/kairyu/kairyu.yaml
+    environment:
+      KAIRYU_CONTAINER_IMAGE_DIGEST: ${KAIRYU_IMAGE_ID:-local-build}
+    volumes:
+    - type: bind
+      source: ${PLACEMENT_LOG_PATH}
+      target: /var/lib/kairyu/placement
+    - ./kairyu.yaml:/etc/kairyu/kairyu.yaml:ro
+    - ./verified.yaml:/etc/kairyu/verified.yaml:ro
+    - ./verified-always.yaml:/etc/kairyu/verified-always.yaml:ro
+    depends_on:
+      deepseek:
+        condition: service_healthy
+      openjev-0:
+        condition: service_healthy
+      openjev-1:
+        condition: service_healthy
+    ports:
+    - 127.0.0.1:${API_PORT:-8013}:8000
+    healthcheck:
+      test:
+      - CMD
+      - python3
+      - -c
+      - import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/readyz",
+        timeout=2)
+      interval: 5s
+      timeout: 3s
+      retries: 120
+    restart: unless-stopped
+  # Open WebUI: both public models (kairyu-verified routes per request,
+  # kairyu-verified-always always verifies). The guarantee shows in the
+  # folded internal-work section ("Verification").
+  chat-ui:
+    image: ${OPEN_WEBUI_IMAGE}
+    environment:
+      OPENAI_API_BASE_URL: http://kairyu:8000/v1
+      OPENAI_API_KEY: sk-local-kairyu
+      DEFAULT_MODELS: kairyu-verified
+      DEFAULT_MODEL_PARAMS: '{"max_tokens":65536,"stream_response":true}'
+      ENABLE_PERSISTENT_CONFIG: 'false'
+      RESET_CONFIG_ON_START: 'true'
+      ENABLE_SIGNUP: 'false'
+      ENABLE_LOGIN_FORM: 'false'
+      WEBUI_AUTH: 'false'
+      WEBUI_URL: ${WEBUI_URL:-http://localhost:3012}
+      WEBUI_ADMIN_NAME: ${WEBUI_ADMIN_NAME:-Kairyu Admin}
+      ENABLE_OLLAMA_API: 'false'
+      ENABLE_EVALUATION_ARENA_MODELS: 'false'
+      RAG_EMBEDDING_ENGINE: ''
+    volumes:
+    - type: bind
+      source: ${WEBUI_STORAGE_PATH}
+      target: /app/backend/data
+    depends_on:
+      kairyu:
+        condition: service_healthy
+    ports:
+    - ${CHAT_UI_BIND_ADDRESS:-0.0.0.0}:${CHAT_UI_PORT:-3012}:8080
+    restart: unless-stopped
+  # The answer page: a static chat page that shows each answer's guarantee
+  # flag and requirement probabilities, with Kairyu's API on the same origin.
+  playground:
+    image: ${PLAYGROUND_IMAGE}
+    volumes:
+    - ./playground/index.html:/usr/share/nginx/html/index.html:ro
+    - ./playground/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      kairyu:
+        condition: service_healthy
+    ports:
+    - ${PLAYGROUND_BIND_ADDRESS:-0.0.0.0}:${PLAYGROUND_PORT:-3013}:8080
+    healthcheck:
+      test:
+      - CMD
+      - wget
+      - -q
+      - -O
+      - /dev/null
+      - http://127.0.0.1:8080/
+      interval: 5s
+      timeout: 3s
+      retries: 60
+    restart: unless-stopped

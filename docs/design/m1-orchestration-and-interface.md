@@ -169,6 +169,109 @@ YAML loader produces pydantic-validated `OrchestratorSpec` (agent pool, role DAG
 The `@role` decorator API constructs identical spec objects in Python. One schema, two
 front-ends; the Conductor consumes only the spec.
 
+### D8. Checklist verifiers: deterministic checks and System One probabilities (2026-10-01)
+
+Status: accepted by the owner (2026-10-01, framework scope for the
+checklist-verified example); CPU tests in `tests/unit/test_conductor_checklist.py`,
+`tests/unit/test_checks.py`, `tests/server/test_orchestration_usage_trace.py`;
+GPU evidence in `examples/deepseek-v4.1-openjev-verified-8gpu/MEASUREMENTS.md`.
+
+A verifier may declare a `checklist:` instead of a generation prompt. It judges
+its target attempt without generating: deterministic checks
+(`kairyu/orchestration/checks.py`) run first and FAIL the attempt without a
+model call; generation roles that the verifier depends on and that depend on
+the target (for example a claim extractor) run inline on every attempt; then
+`noul` questions go to a System One backend (m11 D8) named by a
+`systemone_ref` worker. Each checklist item gets a probability `p` (a check is
+1 or 0; questions sharing an item id aggregate by minimum) and passes at
+`p >= threshold`. The verdict text keeps the D4 verifier contract (first line
+PASS/FAIL, one feedback line per failing item), so the refine loop and budget
+accounting are unchanged. Supporting mechanisms:
+
+- **Jev request shape (owned by Kairyu).** The checklist never sends
+  free-form prompt text to System One. The `state` is a JSON object built
+  from declared sections: `query` becomes the request's role-tagged messages
+  (unwrapped from Kairyu's L2 transcript, shared delimiters in
+  `orchestration/request.py`), role outputs that are JSON are embedded as JSON
+  values, and long text is cut with a marker. Each question is a `noul`
+  whose `instructions` is an object — by default `{question: "Does <subject>
+  satisfy the requirement below?", requirement, ...context}` with
+  `criteria.true/false` for full versus partial or missing satisfaction, or
+  an explicit `ask` with its own criteria. This matches how Jev servers read
+  a request (a system prompt listing `Question qN` with its yes/no meanings,
+  the state as the user turn, one label token per question), keeps each
+  question self-contained, and keeps judged material from posing as
+  instructions to the judge.
+- **Items from JSON.** Checks and questions can be expanded per item of an
+  upstream role's JSON list (`foreach`), or per pair of items sharing a value
+  (`pairs_sharing`), with str.format templates.
+- **Internal grammar.** `sampling.response_format` gives an internal role a
+  grammar, or `inherit` applies the caller's `response_format` to it too. The
+  final unit still carries only the caller's intent.
+- **Seeded target and refinement prompt.** `seed_from` publishes an upstream
+  role's output as attempt 0 without a model call; `refine_prompt` renders a
+  refinement from `{previous}` and `{feedback}` instead of the appended
+  default. `checklist.max_refinements` bounds one verifier below
+  `budget.max_refine_depth`.
+- **Outcomes.** On exhaustion, `on_exhausted: latest_checks_passed` publishes
+  the newest attempt whose deterministic checks passed. When the checklist
+  cannot be judged (System One down or overloaded, a source list missing, the
+  state too large, no budget), `on_unavailable: publish_unverified` publishes
+  `unverified_from` (or the attempt) instead of failing the unit; once one
+  checklist of a run is unjudgeable, later checklists report unverified too.
+  The default stays the D4/#496 contract (an unjudged final unit is an error).
+- **Curation.** `curate` drops, merges and pads the target's JSON list from
+  the final probabilities, so downstream roles read the edited list.
+- **Response.** A checklist on the selected final unit publishes
+  `kairyu_verification: {guaranteed, reason, threshold, attempts,
+  requirements: [{id, proposition, sources, kind, group, p, passed}]}` on the
+  chat response (the terminal chunk when streaming), without a trace opt-in.
+
+Why (framework boundary): (1) System One is a served Kairyu API (m11 D8), but
+the L2 DSL could only branch on generated PASS/FAIL text — `engine_ref`
+resolves engines and pools only, logprobs are stripped from internal stages,
+and a failed verifier fails the answer. (2) The executor contract (ECO-D3) is
+Python/pytest-shaped and still needs a generation verifier to decide. (3) Any
+DSL that wants calibrated probability gates, cheap deterministic pre-checks,
+or a verified answer with an honest "unverified" flag needs the same
+mechanism, independent of the example. (4) The mechanism knows checks,
+questions, thresholds and outcomes; which requirements exist, their wording,
+thresholds, repair prompts and curation policy stay in the example's YAML.
+
+### D9. System One profile judge (2026-10-01)
+
+Status: accepted by the owner (2026-10-01); CPU tests in
+`tests/unit/test_profile_judge_systemone.py`; GPU evidence in
+`examples/deepseek-v4.1-openjev-verified-8gpu/MEASUREMENTS.md` (`routing`).
+
+A `profile_judge` whose `worker` is a `systemone_ref` worker routes by System
+One probabilities instead of a generated label. Kairyu sends the
+role-tagged conversation (each message cut to `max_message_chars`, plus
+tool/image flags) as the state and one `choice` question whose criteria are
+the choices' criteria. `prefer: {label, min_probability}` selects that
+label whenever its probability reaches the floor (an accuracy-first
+policy), otherwise the most probable route wins. Timeouts, transport
+failures, non-200 replies and malformed answers apply `fallback`. The judge
+event records `p_<LABEL>` per route, and admission bounds the read by its
+body size (System One bills at most its input without `think`).
+
+Why (framework boundary): (1) the LLM judge reads only a generated label
+string; (2) `ProfileJudge` workers were generation engines only, so a
+calibrated System One classifier could not route; (3) any DSL can route
+on Jev-style probabilities with this; (4) the labels, criteria and floor
+stay in the example.
+
+Additions in the same change: generation trace events record their
+`reasoning_effort`; checklist items carry report `tags`; a final-unit
+checklist appends a "Verification" section to exposed internal work; an
+upstream checklist that ends without PASS is judged again on its curated
+output and failures in its `guarantee_groups` block the run's guarantee
+(`requirements_unconfirmed`); curation merges only `merge_only_where`
+items; `items_in_sources` can restrict evidence to `message_roles`; a
+seeded final unit republishes its seed's completion metadata and refuses
+`n > 1`; a failed System One read cancels its siblings and completed reads
+keep their usage (PR #616 review).
+
 ## 3. Out of scope for M1 (deferred with reasons)
 
 - Custom scheduler / KV manager / CUDA graphs / spec decode / quantized load — M2/M3.

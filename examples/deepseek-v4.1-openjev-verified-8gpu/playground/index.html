@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Verified Answers</title>
+<style>
+  :root { --bg:#f7f7f5; --panel:#fff; --ink:#1d1d1b; --muted:#6b6b66; --line:#e3e2dd;
+          --ok:#1f7a4d; --okbg:#e6f4ec; --no:#9a5b00; --nobg:#fbf0de; --bad:#b3261e; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#161615; --panel:#1f1f1d; --ink:#ecebe6;
+          --muted:#a19f97; --line:#34332f; --ok:#5fd09a; --okbg:#173527; --no:#f0b45a;
+          --nobg:#3a2b12; --bad:#ff8a80; } }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:15px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif; }
+  main { max-width:920px; margin:0 auto; padding:24px 16px 64px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:var(--muted); margin:0 0 20px; }
+  textarea { width:100%; min-height:120px; padding:12px; border:1px solid var(--line);
+             border-radius:8px; background:var(--panel); color:var(--ink); font:inherit; }
+  .row { display:flex; gap:12px; align-items:center; margin:10px 0 24px; flex-wrap:wrap; }
+  button { padding:9px 18px; border:0; border-radius:8px; background:var(--ink); color:var(--bg);
+           font:inherit; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:wait; }
+  select { padding:8px; border-radius:8px; border:1px solid var(--line); background:var(--panel);
+           color:var(--ink); font:inherit; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+          padding:16px; margin-bottom:16px; }
+  .answer { white-space:pre-wrap; overflow-wrap:anywhere; }
+  .badge { display:inline-block; padding:3px 10px; border-radius:999px; font-weight:600; }
+  .badge.ok { background:var(--okbg); color:var(--ok); }
+  .badge.no { background:var(--nobg); color:var(--no); }
+  table { width:100%; border-collapse:collapse; margin-top:12px; font-size:14px; }
+  th, td { text-align:left; padding:6px 8px; border-top:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:500; }
+  td.p { font-variant-numeric:tabular-nums; white-space:nowrap; }
+  .fail { color:var(--bad); }
+  .advisory { color:var(--muted); }
+  details pre { white-space:pre-wrap; overflow-wrap:anywhere; font-size:13px; color:var(--muted); }
+  .err { color:var(--bad); }
+  .table-wrap { overflow-x:auto; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Verified Answers</h1>
+  <p class="sub">Every request takes the verified path (model kairyu-verified-always). DeepSeek-V4.1 writes the answer; OpenJev scores every requirement; Kairyu
+    publishes it with a guarantee flag only when every requirement passes.</p>
+  <textarea id="prompt" placeholder="Ask anything. Paste material (documents, tool output) into the request."></textarea>
+  <div class="row">
+    <button id="send">Send</button>
+    <label>Reasoning effort
+      <select id="effort"><option value="">default</option><option>low</option>
+        <option>high</option><option>max</option></select></label>
+    <span id="status" class="sub" style="margin:0"></span>
+  </div>
+  <div id="out"></div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const REASONS = {
+  refinement_limit: "Repair limit reached: the latest version that passed the deterministic checks",
+  judge_unavailable: "The judge (OpenJev) was unavailable: the unverified draft",
+  checklist_unavailable: "The checklist could not be built or judged: the unverified draft",
+  requirements_unconfirmed: "The requirement checklist could not be confirmed sufficient: no guarantee",
+  budget: "The orchestration budget ran out: the unverified draft",
+};
+function render(body, seconds) {
+  const message = body.choices?.[0]?.message || {};
+  const v = body.kairyu_verification;
+  let html = '<div class="card">';
+  if (v) {
+    html += v.guaranteed
+      ? '<span class="badge ok">Guaranteed</span>'
+      : '<span class="badge no">Not guaranteed</span>';
+    html += ` <span class="sub">${v.attempts} attempt(s) · threshold ${v.threshold} · ${seconds.toFixed(1)} s</span>`;
+    if (!v.guaranteed) html += `<p class="sub">${esc(REASONS[v.reason] || v.reason)}</p>`;
+  }
+  html += `<div class="answer" style="margin-top:12px">${esc(message.content || "")}</div></div>`;
+  if (v && v.requirements?.length) {
+    html += '<div class="card"><strong>Requirements</strong><div class="table-wrap"><table><tr><th>ID</th><th>Requirement</th><th>Kind</th><th>Units</th><th>p</th></tr>';
+    for (const r of v.requirements) {
+      // Advisory items (uncalibrated G1) are shown with their p but never gate the guarantee.
+      const advisory = r.tags?.guarantee === "advisory";
+      const mark = advisory ? "advisory" : r.passed ? "✓" : "✗";
+      html += `<tr class="${r.passed ? "" : "fail"}${advisory ? " advisory" : ""}"><td>${esc(r.id)}</td><td>${esc(r.proposition)}</td>`
+        + `<td>${esc(r.kind)}</td><td>${esc((r.sources || []).join(", "))}</td>`
+        + `<td class="p">${r.judged === false ? "not judged" : `${Number(r.p).toFixed(3)} ${mark}`}</td></tr>`;
+    }
+    html += "</table></div></div>";
+  }
+  if (message.reasoning_content) {
+    html += `<div class="card"><details><summary>Internal stages</summary><pre>${esc(message.reasoning_content)}</pre></details></div>`;
+  }
+  $("out").innerHTML = html;
+}
+$("send").onclick = async () => {
+  const content = $("prompt").value.trim();
+  if (!content) return;
+  $("send").disabled = true;
+  $("status").textContent = "Answering and verifying…";
+  const started = performance.now();
+  const payload = { model: "kairyu-verified-always", messages: [{ role: "user", content }], max_tokens: 32768 };
+  if ($("effort").value) payload.reasoning_effort = $("effort").value;
+  try {
+    const response = await fetch("/v1/chat/completions", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+    });
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.error?.message || response.status);
+    render(body, (performance.now() - started) / 1000);
+    $("status").textContent = "";
+  } catch (error) {
+    $("out").innerHTML = `<div class="card err">${esc(error.message)}</div>`;
+    $("status").textContent = "";
+  } finally {
+    $("send").disabled = false;
+  }
+};
+</script>
+</body>
+</html>

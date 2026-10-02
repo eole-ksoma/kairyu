@@ -1,0 +1,736 @@
+# Checklist-verified answers (VCO-D1..D9, docs/design/example-verified-checklist-orchestration.md).
+# Model kairyu-verified: Jev routes each request to this DAG (VERIFIED) or to
+# deepseek_think (one thinking DeepSeek answer); the DAG below is identical
+# to verified-always.yaml (a CPU test keeps them in sync).
+#
+#   wave 1  extract (DeepSeek, JSON)  --verified by-->  requirements_check (OpenJev + checks)
+#           generator (DeepSeek, sees only the conversation)
+#   wave 2  answer = generator's draft --verified by--> checklist (checks, state_builder, OpenJev)
+#           a FAIL is repaired by DeepSeek (answer's refine_prompt), at most twice
+#
+# DeepSeek writes; OpenJev only returns probabilities through System One; the
+# Validator (deterministic checks), the Conductor (every p >= threshold), the
+# requirement-list edits and every transition are Kairyu L2 code.
+workers:
+  - name: deepseek
+    engine_ref: deepseek-v4.1-flash
+  - name: jev
+    systemone_ref: openjev-0.1
+
+roles:
+  # Requirement extraction: instruction units, then a checklist that covers
+  # every unit exactly once. The grammar keeps the list within the judge's
+  # question budget (32 requirements, 48 units).
+  - name: extract
+    worker: deepseek
+    # Every DeepSeek role thinks at the caller's effort (default high, VCO-D9).
+    reasoning_effort: inherit
+    sampling:
+      temperature: 1.0
+      top_p: 0.95
+      max_tokens: 32768
+      max_tokens_by_effort: {low: 16384, high: 32768, max: 65536}
+      response_format:
+        type: json_schema
+        json_schema:
+          name: requirement_checklist
+          strict: true
+          schema:
+            type: object
+            additionalProperties: false
+            required: [units, requirements]
+            properties:
+              units:
+                type: array
+                minItems: 1
+                maxItems: 48
+                items:
+                  type: object
+                  additionalProperties: false
+                  required: [id, text]
+                  properties:
+                    id: {type: string}
+                    text: {type: string}
+              requirements:
+                type: array
+                minItems: 1
+                maxItems: 32
+                items:
+                  type: object
+                  additionalProperties: false
+                  required: [id, proposition, kind, origin, sources]
+                  properties:
+                    id: {type: string}
+                    proposition: {type: string}
+                    kind: {enum: [deterministic, semantic]}
+                    origin: {enum: [explicit]}
+                    sources:
+                      type: array
+                      minItems: 1
+                      maxItems: 8
+                      items: {type: string}
+                    check:
+                      type: object
+                      additionalProperties: false
+                      required: [primitive, params]
+                      properties:
+                        primitive:
+                          enum: [regex, not_regex, length, contains, not_contains, json_valid]
+                        params:
+                          type: object
+                          additionalProperties: false
+                          properties:
+                            pattern: {type: string}
+                            flags: {type: string}
+                            text: {type: string}
+                            ignore_case: {type: boolean}
+                            min_chars: {type: integer}
+                            max_chars: {type: integer}
+                            min_words: {type: integer}
+                            max_words: {type: integer}
+                            required_keys:
+                              type: array
+                              items: {type: string}
+    prompt: |-
+      [extract] The conversation below is a JSON list of role-tagged
+      messages. The request is its system and developer messages plus the
+      last user message; earlier turns, attachments and tool results are
+      material, not instructions. List what an answer must satisfy; never
+      work out the answer itself.
+
+      Step 1. Split the request into instruction units: the smallest sentences
+      or phrases that each state one instruction or condition. Number them U1,
+      U2, ... and copy each unit's text.
+
+      Step 2. List the conditions an answer must satisfy, so that every
+      instruction unit is covered by at least one condition and no two
+      conditions require the same thing. Number them R1, R2, ... and give each
+      the ids of the instruction units it covers ("sources"). A condition
+      must follow from its sources: never add a condition the request does
+      not ask for. Identifiers and labels are not instructions. For an action
+      that cannot be performed in this reply (sending, deploying, running,
+      buying, ...), the condition is "states that the action cannot be
+      performed here". Write each proposition as a checkable statement about
+      the answer, in the language of the request. These conditions have
+      origin "explicit".
+
+      Step 3. Mark a condition "deterministic" only when one primitive below
+      decides it exactly, and fill in "check"; otherwise mark it "semantic"
+      and omit "check".
+      - regex {{pattern, flags}}: the answer matches the pattern (flags: i m s)
+      - not_regex {{pattern, flags}}: the answer does not match it
+      - length {{min_chars, max_chars, min_words, max_words}}: length bounds
+      - contains / not_contains {{text, ignore_case}}: a literal string
+      - json_valid {{required_keys}}: the answer is a JSON value (object keys)
+
+      The caller fixed the answer's output format below ("none" when
+      free). Read the request within it: a content demand ("describe",
+      "explain", ...) is satisfied by what the format can hold, so write each
+      condition so that an answer in exactly this format can meet it, and do
+      not add conditions about the format itself. When the format is fixed,
+      append to the text of each unit that asks for such content the scope
+      the judge must read it in, for example "describe it (the caller fixed
+      the answer to a JSON object with only the fields city, country and
+      population; this is done by filling them)", naming the actual format.
+
+      Output only the JSON object.
+      --- RESPONSE FORMAT ---
+      {response_format}
+      --- END RESPONSE FORMAT ---
+      --- CONVERSATION ---
+      {conversation}
+      --- END CONVERSATION ---
+    refine_prompt: |-
+      [extract] Your previous checklist for the conversation below has these
+      problems:
+      {feedback}
+      Rewrite the whole checklist so that every instruction unit is covered,
+      every condition follows from its sources, and no two conditions require
+      the same thing. Keep the same output format and the rules (origin
+      "explicit"; only what the request states): units are the
+      smallest instructions of the request (system/developer instructions and
+      the latest user message), conditions are checkable statements in the
+      request's language, "deterministic" only with one of the primitives
+      regex, not_regex, length, contains, not_contains, json_valid.
+      Conditions must be satisfiable by an answer in the caller's output
+      format: {response_format}
+      When that format is fixed, keep on each unit that asks for content the
+      format's scope ("... (the caller fixed the answer to a JSON object with
+      only the fields ...; this is done by filling them)").
+      Output only the JSON object.
+      --- PREVIOUS CHECKLIST ---
+      {previous}
+      --- END PREVIOUS CHECKLIST ---
+      --- CONVERSATION ---
+      {conversation}
+      --- END CONVERSATION ---
+
+  # Requirement confirmation: necessity, sufficiency and exclusivity of the
+  # checklist. A coverage gap or an unmerged duplicate re-extracts once;
+  # afterwards low-necessity conditions are dropped, likely duplicates merged
+  # and uncovered units padded with a generic condition.
+  - name: requirements_check
+    worker: jev
+    role_type: verifier
+    verifies: extract
+    depends_on: [extract]
+    checklist:
+      checks:
+        - id: S0
+          group: sufficiency
+          proposition: the checklist is a JSON object with units and requirements
+          primitive: json_valid
+          params: {required_keys: [units, requirements]}
+        - id: S1
+          group: sufficiency
+          proposition: every instruction unit is cited by at least one condition
+          primitive: coverage
+          params: {units_path: units, items_path: requirements, key: sources}
+      # Kairyu turns each question into a Jev noul question (instructions
+      # object + yes/no criteria) and the state into a JSON object.
+      subject: the checklist
+      questions:
+        - id: "{item[id]}"
+          group: necessity
+          proposition: "{item[proposition]}"
+          sources_key: sources
+          # Never fails the verdict; curation drops it below drop_below.
+          threshold: 0.0
+          foreach: {role: extract, path: requirements, where: {origin: explicit}}
+          ask: Does the request ask for this condition?
+          criteria_true: >-
+            The request's instruction units {item[sources]} ask for this condition
+          criteria_false: >-
+            The condition adds something those instruction units do not ask for
+          context:
+            condition: "{item[id]}: {item[proposition]}"
+            instruction_units: "{item[sources]}"
+        - id: "{item[id]}"
+          group: sufficiency
+          proposition: "instruction unit {item[id]} is fully covered: {item[text]}"
+          threshold: 0.5
+          foreach: {role: extract, path: units}
+          ask: Does the checklist fully cover this instruction unit?
+          criteria_true: >-
+            Any answer that meets every condition citing {item[id]} also fully
+            meets this instruction unit
+          criteria_false: >-
+            Some part of this instruction unit is required by no condition
+            citing {item[id]}
+          context:
+            instruction_unit: "{item[id]}: {item[text]}"
+        - id: "{a[id]}+{b[id]}"
+          group: exclusivity
+          proposition: "{a[id]} and {b[id]} do not require the same thing"
+          sources_key: sources
+          expect: "no"
+          threshold: 0.5
+          foreach: {role: extract, path: requirements, pairs_sharing: sources}
+          ask: Do these two conditions require the same thing?
+          criteria_true: The two conditions require the same thing; one makes the other redundant
+          criteria_false: The two conditions require different things
+          context:
+            condition_a: "{a[id]}: {a[proposition]}"
+            condition_b: "{b[id]}: {b[proposition]}"
+      state:
+        - {key: conversation, source: query, max_chars: 20000}
+        - {key: checklist, source: extract}
+      threshold: 0.5
+      max_state_chars: 160000
+      max_refinements: 1
+      on_exhausted: last
+      on_unavailable: publish_unverified
+      # After curation the checklist is judged again; an instruction unit
+      # still not covered blocks the guarantee (requirements_unconfirmed).
+      # Unmerged deterministic duplicates are both checked exactly: harmless.
+      guarantee_groups: [sufficiency]
+      feedback_header: "Problems:"
+      feedback_item: "- [{id}] {proposition} ({group}; p={p}){detail}"
+      curate:
+        items_path: requirements
+        drop_group: necessity
+        drop_below: 0.5
+        merge_group: exclusivity
+        merge_below: 0.5
+        # A deterministic condition keeps its own exact check: never merged.
+        merge_only_where: {kind: semantic}
+        units_path: units
+        pad:
+          id: "P_{unit[id]}"
+          kind: semantic
+          origin: explicit
+          proposition: "the answer responds to this part of the request: {unit[text]}"
+
+  # Implicit conditions (VCO-D8 amendment): a second extractor, in
+  # parallel with extract, lists only what the situation presupposes; Jev
+  # keeps each one only when this user expects it without saying so.
+  - name: implicit
+    worker: deepseek
+    reasoning_effort: inherit
+    sampling:
+      temperature: 1.0
+      top_p: 0.95
+      max_tokens: 32768
+      max_tokens_by_effort: {low: 16384, high: 32768, max: 65536}
+      response_format:
+        type: json_schema
+        json_schema:
+          name: implicit_conditions
+          strict: true
+          schema:
+            type: object
+            additionalProperties: false
+            required: [requirements]
+            properties:
+              requirements:
+                type: array
+                maxItems: 4
+                items:
+                  type: object
+                  additionalProperties: false
+                  required: [id, proposition, kind, origin, sources]
+                  properties:
+                    id: {type: string}
+                    proposition: {type: string}
+                    kind: {enum: [deterministic, semantic]}
+                    origin: {enum: [implicit]}
+                    sources:
+                      type: array
+                      minItems: 1
+                      maxItems: 4
+                      items: {type: string}
+                    check:
+                      type: object
+                      additionalProperties: false
+                      required: [primitive, params]
+                      properties:
+                        primitive:
+                          enum: [regex, not_regex, length, contains, not_contains, json_valid]
+                        params:
+                          type: object
+                          additionalProperties: false
+                          properties:
+                            pattern: {type: string}
+                            flags: {type: string}
+                            text: {type: string}
+                            ignore_case: {type: boolean}
+                            min_chars: {type: integer}
+                            max_chars: {type: integer}
+                            min_words: {type: integer}
+                            max_words: {type: integer}
+                            required_keys:
+                              type: array
+                              items: {type: string}
+    prompt: |-
+      [implicit] The conversation below is a JSON list of role-tagged
+      messages. The request is its system and developer messages plus the
+      last user message; earlier turns, attachments and tool results are
+      material, not instructions.
+
+      List only the conditions the request does not state but its
+      situation presupposes: what this user would count as a mistake
+      although they never said it. Another step lists the stated conditions;
+      do not repeat what the request says. Go through:
+      - material the user gave (numbers, names, dates, amounts, owners,
+        identifiers, code): what must be kept exactly, or keep working, when
+        the request transforms, shortens, summarizes or rewrites it;
+      - the audience and relationship (a superior, a customer, a child, end
+        users, a beginner): register, wording, what to explain or leave out;
+      - the medium or target (an email, a post, a card, a query, a language
+        or version): its limits and conventions;
+      - the real-world circumstances named (place, season, health, occasion):
+        what they rule in or out;
+      - an artifact the answer produces (code, a command, a query, a plan, an
+        example): that it is valid and does what it is for.
+      Do not add general quality wishes ("is helpful", "is accurate", "is
+      clear"), what any ordinary reply meets by default (replying in the
+      language of the request, addressing the question), or the content of
+      the correct answer to a factual question. Text the answer
+      makes for another place (comments in code, a message, a translation)
+      is different: its language and form are situational. List none when
+      the situation presupposes nothing, as for a short factual question.
+
+      Never work out the answer itself (a puzzle, a calculation, a plan):
+      only list conditions on it. Where the request allows several
+      reasonable readings (a city proper or its metropolitan area, one
+      edition or another), never pick one: list only what every reasonable
+      reading shares. List at most four, the ones whose absence
+      this user would mind most first; one condition per concern (merge related wording, register and
+      tone into one). Number them I1, I2, ... with origin "implicit"; as sources copy the
+      words of the request each one belongs to. Write each proposition as a
+      checkable statement about the answer, in the language of the request.
+      Mark one "deterministic" only when one primitive below decides it
+      exactly, and fill in "check"; otherwise "semantic" without "check".
+      - regex {{pattern, flags}}: the answer matches the pattern (flags: i m s)
+      - not_regex {{pattern, flags}}: the answer does not match it
+      - length {{min_chars, max_chars, min_words, max_words}}: length bounds
+      - contains / not_contains {{text, ignore_case}}: a literal string
+      - json_valid {{required_keys}}: the answer is a JSON value (object keys)
+
+      The caller fixed the answer's output format below ("none" when
+      free): write only conditions an answer in exactly this format can
+      meet, and none about the format itself.
+
+      Output only the JSON object.
+      --- RESPONSE FORMAT ---
+      {response_format}
+      --- END RESPONSE FORMAT ---
+      --- CONVERSATION ---
+      {conversation}
+      --- END CONVERSATION ---
+    refine_prompt: |-
+      [implicit] Your previous list of implicit conditions for the
+      conversation below was not usable:
+      {feedback}
+      Write it again, shorter: at most four conditions on the answer, never
+      the answer itself, in the same JSON format. Output only the JSON
+      object.
+      --- RESPONSE FORMAT ---
+      {response_format}
+      --- END RESPONSE FORMAT ---
+      --- CONVERSATION ---
+      {conversation}
+      --- END CONVERSATION ---
+
+  - name: implicit_check
+    worker: jev
+    role_type: verifier
+    verifies: implicit
+    depends_on: [implicit]
+    checklist:
+      checks:
+        - id: S0
+          group: validity
+          proposition: the implicit conditions are a JSON object with requirements
+          primitive: json_valid
+          params: {required_keys: [requirements]}
+      subject: the checklist
+      questions:
+        - id: "{item[id]}"
+          group: necessity
+          proposition: "{item[proposition]}"
+          sources_key: sources
+          # Never fails the verdict; curation drops it below drop_below.
+          threshold: 0.0
+          foreach: {role: implicit, path: requirements}
+          ask: >-
+            In this situation, does the user expect the answer to meet this
+            condition even though they did not say it?
+          criteria_true: >-
+            Any competent answer to this request is expected to meet it; the
+            user would see an answer that misses it as wrong
+          criteria_false: >-
+            It is an extra preference the user did not ask for and would not miss
+          context:
+            condition: "{item[id]}: {item[proposition]}"
+            request_words: "{item[sources]}"
+      state:
+        - {key: conversation, source: query, max_chars: 20000}
+        - {key: implicit_conditions, source: implicit}
+      threshold: 0.5
+      max_state_chars: 160000
+      # A list cut off before its JSON closes (S0) is written once more; the
+      # final checklist cannot read a broken list.
+      max_refinements: 1
+      on_exhausted: last
+      on_unavailable: publish_unverified
+      # Dropping an unexpected condition never blocks the guarantee.
+      guarantee_groups: []
+      curate:
+        items_path: requirements
+        drop_group: necessity
+        drop_below: 0.5
+
+  # The draft: the conversation only, never the checklist, so an extraction
+  # mistake cannot shape the answer. A caller response_format constrains it.
+  - name: generator
+    worker: deepseek
+    reasoning_effort: inherit
+    sampling:
+      temperature: 1.0
+      top_p: 0.95
+      max_tokens: 32768
+      max_tokens_by_effort: {low: 16384, high: 32768, max: 65536}
+      response_format: inherit
+    prompt: "{query}"
+
+  # The published answer: attempt 0 is the generator's draft unchanged; a
+  # FAIL is repaired here (DeepSeek) on the failing items only.
+  - name: answer
+    worker: deepseek
+    depends_on: [generator, extract, implicit]
+    seed_from: generator
+    reasoning_effort: inherit
+    sampling:
+      temperature: 1.0
+      top_p: 0.95
+      max_tokens: 32768
+      max_tokens_by_effort: {low: 16384, high: 32768, max: 65536}
+    refine_prompt: |-
+      [repair] The draft answer below does not meet these conditions:
+      {feedback}
+      Fix only the parts these conditions concern and change nothing else.
+      Never write that an action was carried out unless the conversation
+      contains that tool call and its result. Output the complete revised
+      answer and nothing else. If the draft is cut off or degenerate (a
+      number or text repeating without end), do not edit it: write the answer
+      anew from the conversation.
+      --- CONVERSATION ---
+      {query}
+      --- END CONVERSATION ---
+      --- DRAFT ANSWER ---
+      {previous}
+      --- END DRAFT ANSWER ---
+
+  # State builder: every claim of the current attempt, one sentence each, with
+  # the verbatim material that supports it. Re-run on every attempt.
+  - name: state_builder
+    worker: deepseek
+    depends_on: [answer]
+    reasoning_effort: inherit
+    sampling:
+      temperature: 1.0
+      top_p: 0.95
+      max_tokens: 16384
+      max_tokens_by_effort: {low: 16384, high: 32768, max: 65536}
+      response_format:
+        type: json_schema
+        json_schema:
+          name: claims
+          strict: true
+          schema:
+            type: object
+            additionalProperties: false
+            required: [claims]
+            properties:
+              claims:
+                type: array
+                maxItems: 24
+                items:
+                  type: object
+                  additionalProperties: false
+                  required: [id, text, basis, evidence]
+                  properties:
+                    id: {type: string}
+                    text: {type: string}
+                    basis: {enum: [source, action]}
+                    evidence: {type: string}
+    prompt: |-
+      [state_builder] List the claims of the ANSWER that the checks need,
+      one sentence each (at most 24; merge trivial repetitions):
+      - basis "source": a claim that relies on the conversation's material
+        (messages, attachments, tool results);
+      - basis "action": a claim that something was done (sent, run, changed,
+        checked).
+      Leave out every other claim (reasoning, calculations, general
+      knowledge). For each claim, as evidence copy the supporting text from
+      the conversation verbatim (at most 400 characters; empty if there is
+      none). Output only the JSON object; an empty list when there is none.
+      --- CONVERSATION ---
+      {conversation}
+      --- END CONVERSATION ---
+      --- ANSWER ---
+      {answer}
+      --- END ANSWER ---
+
+  # Validator + OpenJev + Conductor on each attempt of the answer.
+  - name: checklist
+    worker: jev
+    role_type: verifier
+    verifies: answer
+    depends_on: [answer, extract, implicit, state_builder]
+    checklist:
+      checks:
+        # Validator: the extracted deterministic conditions.
+        - id: "{item[id]}"
+          proposition: "{item[proposition]}"
+          foreach: {role: extract, path: requirements, where: {kind: deterministic}}
+          primitive_key: check.primitive
+          params_key: check.params
+          sources_key: sources
+          semantic_fallback: true
+          tags: {origin: "{item[origin]}"}
+        - id: "{item[id]}"
+          proposition: "{item[proposition]}"
+          foreach: {role: implicit, path: requirements, where: {kind: deterministic}}
+          primitive_key: check.primitive
+          params_key: check.params
+          sources_key: sources
+          semantic_fallback: true
+          tags: {origin: "{item[origin]}"}
+        # Request-independent invariants.
+        - id: G3
+          tags: {origin: common}
+          proposition: every quotation in the answer appears in the conversation
+          primitive: quotes_in_sources
+          params: {min_chars: 8}
+        - id: G1-excerpts
+          tags: {origin: common}
+          proposition: material-based claims quote the material verbatim
+          stage: post
+          primitive: items_in_sources
+          params:
+            role: state_builder
+            path: claims
+            where: {basis: source}
+            key: evidence
+            min_chars: 1
+        - id: G2
+          tags: {origin: common}
+          proposition: no execution claim without a matching tool result
+          stage: post
+          primitive: items_in_sources
+          params:
+            role: state_builder
+            path: claims
+            where: {basis: action}
+            key: evidence
+            min_chars: 1
+            # An execution claim is proven only by a tool result, never by an
+            # earlier user or assistant statement.
+            message_roles: [tool]
+      subject: the answer
+      questions:
+        # Requirement form: Kairyu asks whether the answer satisfies it.
+        - id: "{item[id]}"
+          proposition: "{item[proposition]}"
+          sources_key: sources
+          foreach: {role: extract, path: requirements, where: {kind: semantic}}
+          tags: {origin: "{item[origin]}"}
+          context:
+            instruction_units: "{item[sources]}"
+        - id: "{item[id]}"
+          proposition: "{item[proposition]}"
+          sources_key: sources
+          foreach: {role: implicit, path: requirements, where: {kind: semantic}}
+          tags: {origin: "{item[origin]}"}
+          context:
+            request_words: "{item[sources]}"
+        # G1-source: advisory. OpenJev's per-claim p is reported but never
+        # blocks the guarantee (threshold 0): on human labels (RAGTruth,
+        # PRM800K, FEVER; calibrate_g1.py) no threshold kept accepted answers'
+        # violation rate <= alpha (VCO-D11). Grounding is guaranteed by the
+        # deterministic G1-excerpts, G2 and G3. The state builder lists only
+        # source and action claims (VCO-D12); the two G1-source questions are
+        # one item: p is their minimum.
+        - id: G1-source
+          tags: {origin: common, guarantee: advisory}
+          proposition: (advisory, uncalibrated) every material-based claim in the answer is grounded
+          foreach: {role: state_builder, path: claims, where: {basis: source}}
+          threshold: 0.0
+          ask: Is this claim of the answer supported?
+          criteria_true: >-
+            Its evidence states it (source or action claim), it follows correctly
+            from its evidence (computation), or it is well-established knowledge
+            (general)
+          criteria_false: The claim is not supported in that way
+          context:
+            claim: "{item[text]}"
+            basis: "{item[basis]}"
+            evidence: "{item[evidence]}"
+        - id: G1-source
+          tags: {origin: common, guarantee: advisory}
+          proposition: (advisory, uncalibrated) every material-based claim in the answer is grounded
+          foreach: {role: state_builder, path: claims, where: {basis: action}}
+          threshold: 0.0
+          ask: Is this claim of the answer supported?
+          criteria_true: >-
+            Its evidence states it (source or action claim), it follows correctly
+            from its evidence (computation), or it is well-established knowledge
+            (general)
+          criteria_false: The claim is not supported in that way
+          context:
+            claim: "{item[text]}"
+            basis: "{item[basis]}"
+            evidence: "{item[evidence]}"
+      state:
+        - {key: conversation, source: query, max_chars: 20000}
+        - {key: checklist, source: extract}
+        - {key: implicit_conditions, source: implicit}
+        - {key: answer, source: answer}
+        - {key: claims, source: state_builder}
+      # tau_hi: InFoBench expert labels, alpha = 0.10 at 95 % confidence
+      # (calibrate.py; calibration upper bound 0.0995, held-out 0.0866).
+      threshold: 0.9966
+      max_state_chars: 160000
+      max_refinements: 2
+      on_exhausted: latest_checks_passed
+      on_unavailable: publish_unverified
+      unverified_from: generator
+      feedback_header: "Unmet conditions:"
+      feedback_item: "- [{id}] {proposition} (instruction units: {sources}; p={p}){detail}"
+
+# Jev route judge (VCO-D7, m1 D9): one System One choice over the whole
+# conversation. Accuracy first: VERIFIED wins whenever its probability reaches
+# min_probability (tau_route, MEASUREMENTS.md); a judge that cannot answer
+# routes to deepseek_think, since the verified DAG would be unjudgeable too.
+profile_judge:
+  worker: jev
+  timeout_seconds: 10.0
+  fallback: deepseek_think
+  max_message_chars: 4000
+  question: >-
+    Which route should answer the latest user request in this conversation?
+    The verified route checks the answer against every requirement before
+    replying and is slower; the think route answers directly.
+  prefer: {label: VERIFIED, min_probability: 0.3}
+  choices:
+    - profile: deepseek_think
+      label: THINK
+      criteria: >-
+        everyday requests where a careful direct answer is enough: greetings
+        and chit-chat, short factual questions, rewording, translation or
+        formatting of short text, simple explanations and brainstorming, with
+        no sign that an error would be costly
+    - profile: primary
+      label: VERIFIED
+      criteria: >-
+        requests that need an answer as accurate as possible: difficult or
+        highly specialised questions; requests with many separate
+        requirements or constraints; conversations where earlier answers were
+        corrected or criticised, so another mistake is not acceptable; a user
+        who is frustrated, impatient or under pressure; high-stakes domains
+        (medical, legal, financial, safety, security); explicit demands for
+        correctness, verification, sources or exact numbers; answers that
+        will be published, sent, signed, executed or used for a decision;
+        long multi-part deliverables with exact format or length rules
+
+profiles:
+  - name: deepseek_think
+    roles:
+      - name: deepseek_think_answer
+        worker: deepseek
+        role_type: publisher
+        reasoning_effort: inherit
+        sampling: {temperature: 1.0, top_p: 0.95, max_tokens: 262144}
+        prompt: |-
+          [deepseek_think_answer] Write the complete final answer to the request
+          below, in exactly the reply format the conversation demands: if it
+          requires a specific structure (for example a JSON envelope with fixed
+          fields), produce precisely that structure and nothing else; if it asks
+          for an exact, fixed, or trivially short output, write exactly that
+          output. If the conversation context ends with a tool result, answer
+          the user's request using that result directly. If the conversation
+          requires calling an external tool or function next, emit exactly that
+          call in the format the conversation specifies. Output only the answer
+          itself and do not describe any internal pipeline.
+          --- REQUEST ---
+          {query}
+          --- END REQUEST ---
+
+# Every request reaches the judge (zero markers always meets the
+# multi-agent rule), so no request skips routing.
+router:
+  kind: rules
+  thresholds: {multi_step_markers: 0}
+moa_samples: 0
+default_reasoning_effort: high
+internal_max_tokens: 65536
+expose_intermediate_outputs: true
+budget:
+  # Worst case 20 steps: extract x2, requirements_check x3 (with the
+  # post-curation recheck), implicit x2, implicit_check x3, generator, and
+  # answer / state_builder / checklist x3 each. A step budget below that
+  # publishes an unverified answer (reason: budget).
+  max_steps: 24
+  max_refine_depth: 2

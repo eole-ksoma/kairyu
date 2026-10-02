@@ -25,13 +25,7 @@ from kairyu.deploy.spec import (
     _UniqueKeySafeLoader,
     load_deployment_spec,
 )
-from kairyu.dsl.loader import (
-    _role_executor as _loader_role_executor,
-)
-from kairyu.dsl.loader import (
-    _role_sampling as _loader_role_sampling,
-)
-from kairyu.dsl.loader import load_spec
+from kairyu.dsl.loader import load_spec, role_spec
 from kairyu.dsl.spec import OrchestratorSpec, RoleNodeSpec
 from kairyu.engine.config_validation import validate_backend_options
 from kairyu.engine.core.quant_config import (
@@ -52,7 +46,7 @@ from kairyu.models.config import (
     validate_tensor_parallel_config,
 )
 from kairyu.models.generation import parse_generation_defaults
-from kairyu.orchestration.conductor import Conductor, RoleSpec
+from kairyu.orchestration.conductor import Conductor
 
 CheckClass = Literal["schema", "filesystem"]
 CheckStatus = Literal["passed", "failed", "skipped", "indeterminate", "not_run"]
@@ -885,7 +879,12 @@ def _validate_orchestrator_topology(
     if not spec.roles:
         return findings
     generation_workers = {
-        worker.name for worker in spec.workers if worker.executor_ref is None
+        worker.name
+        for worker in spec.workers
+        if worker.executor_ref is None and worker.systemone_ref is None
+    }
+    decision_workers = {
+        worker.name for worker in spec.workers if worker.systemone_ref is not None
     }
     execution_workers = {
         worker.name for worker in spec.workers if worker.executor_ref is not None
@@ -895,24 +894,7 @@ def _validate_orchestrator_topology(
         profiles += ((f"profiles.{profile.name}", profile.roles),)
     for field_name, node_specs in profiles:
         roles = tuple(
-            RoleSpec(
-                name=role.name,
-                worker=role.worker,
-                prompt=role.prompt,
-                role_type=role.role_type,
-                depends_on=role.depends_on,
-                verifies=role.verifies,
-                sampling=_loader_role_sampling(role),
-                executor=_loader_role_executor(role),
-                prompt_suffix=role.prompt_suffix,
-                prompt_headless=role.prompt_headless,
-                reasoning_closed=role.reasoning_closed,
-                reasoning_effort=role.reasoning_effort,
-                reasoning_close_tag=role.reasoning_close_tag,
-                reasoning_continuation=role.reasoning_continuation,
-                reasoning_open_tag=role.reasoning_open_tag,
-                requires=role.requires,
-            )
+            role_spec(role)
             for role in node_specs
         )
         try:
@@ -920,6 +902,7 @@ def _validate_orchestrator_topology(
                 roles,
                 {name: object() for name in generation_workers},
                 execution_workers={name: object() for name in execution_workers},
+                decision_workers={name: object() for name in decision_workers},
             )
             final_unit = conductor._selected_final_unit().name
             for role in roles:
@@ -962,6 +945,7 @@ def _validate_orchestrator(
     checked_models: set[tuple[str, str, str, str]],
     deployment_engine_refs: frozenset[str],
     deployment_executor_refs: frozenset[str] = frozenset(),
+    deployment_systemone_refs: frozenset[str] = frozenset(),
 ) -> list[ValidationFinding]:
     if not path.is_file():
         return [
@@ -1002,6 +986,18 @@ def _validate_orchestrator(
                         check="schema",
                         code="schema.unknown_engine_ref",
                         message="engine_ref does not match an engines: or pools: name",
+                    )
+                )
+            continue
+        if worker.systemone_ref is not None:
+            if worker.systemone_ref not in deployment_systemone_refs:
+                findings.append(
+                    _finding(
+                        artifact=path,
+                        field=f"{worker_field}.systemone_ref",
+                        check="schema",
+                        code="schema.unknown_systemone_ref",
+                        message="systemone_ref does not match a systemone: name",
                     )
                 )
             continue
@@ -1259,6 +1255,9 @@ def validate_deployment(config: str | Path) -> ValidationReport:
     deployment_executor_refs = frozenset(
         name for name in _mapping(raw.get("executors")) if isinstance(name, str)
     )
+    deployment_systemone_refs = frozenset(
+        name for name in _mapping(raw.get("systemone")) if isinstance(name, str)
+    )
     for field, reference in _iter_orchestrator_references(raw):
         path = Path(reference)
         if not path.is_absolute():
@@ -1275,6 +1274,7 @@ def validate_deployment(config: str | Path) -> ValidationReport:
                 checked_models=checked_models,
                 deployment_engine_refs=deployment_engine_refs,
                 deployment_executor_refs=deployment_executor_refs,
+                deployment_systemone_refs=deployment_systemone_refs,
             )
         )
     template_findings = _validate_chat_templates(raw, config_path=config_path)

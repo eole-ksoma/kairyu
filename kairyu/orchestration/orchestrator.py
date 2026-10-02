@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from dataclasses import asdict, dataclass, replace
@@ -34,11 +35,13 @@ from kairyu.engine.prompt import (
 )
 from kairyu.models.generation import GenerationDefaults
 from kairyu.orchestration.budget import Budget, BudgetState
+from kairyu.orchestration.checklist import DecisionBackend, VerificationReport
 from kairyu.orchestration.conductor import (
     Conductor,
     ConductorStreamError,
     CostModel,
     RoleSpec,
+    final_unit_role,
     zero_cost,
 )
 from kairyu.orchestration.execution import ExecutionBackend, ExecutorDescriptor
@@ -46,6 +49,7 @@ from kairyu.orchestration.features import latest_user_view
 from kairyu.orchestration.moa import _build_moa_setup, _MoASetup
 from kairyu.orchestration.request import (
     OrchestrationRequest,
+    conversation_messages,
     default_orchestration_request,
 )
 from kairyu.orchestration.router import RouteDecision, Router, RuleRouter
@@ -139,6 +143,8 @@ class OrchestratorResult:
     # caller's request.
     public_prompt_tokens: int | None = None
     public_completion_tokens: int | None = None
+    # Checklist verification of the published answer (None without one).
+    verification: VerificationReport | None = None
 
 
 @dataclass(frozen=True)
@@ -212,10 +218,27 @@ class ProfileJudge:
     prompt_suffix: str = ""
     choices: tuple[ProfileChoice, ...] = ()
     fallback: str = "primary"
+    # System One judgment (m1 D9), used when ``worker`` is a System One
+    # decision worker: the route is read as one ``choice`` question over the
+    # conversation. ``question`` is its instructions; ``prefer_label`` wins
+    # whenever its probability reaches ``prefer_min_probability`` (else the
+    # most probable route); each message is cut to ``max_message_chars``.
+    question: str = ""
+    prefer_label: str | None = None
+    prefer_min_probability: float = 0.5
+    max_message_chars: int = 4000
 
     def __post_init__(self) -> None:
         if len(self.choices) < 2:
             raise ValueError("profile_judge requires at least two choices")
+        if self.prefer_label is not None and self.prefer_label not in {
+            choice.label for choice in self.choices
+        }:
+            raise ValueError("profile_judge prefer label must be one of its choices")
+        if not 0.0 <= self.prefer_min_probability <= 1.0:
+            raise ValueError("profile_judge prefer_min_probability must be in [0, 1]")
+        if self.max_message_chars < 1:
+            raise ValueError("profile_judge max_message_chars must be positive")
         labels = [choice.label for choice in self.choices]
         if len(set(labels)) != len(labels):
             raise ValueError("profile_judge choice labels must be unique")
@@ -382,6 +405,7 @@ class Orchestrator:
         profile_judge: ProfileJudge | None = None,
         default_reasoning_effort: str | None = None,
         public_output_floor: int | None = None,
+        decision_workers: Mapping[str, DecisionBackend] | None = None,
     ) -> None:
         if not engines:
             raise ValueError("Orchestrator requires at least one engine")
@@ -444,10 +468,16 @@ class Orchestrator:
         # Judgment is attached to the call at the serving boundary; profile
         # selection itself stays a pure function of the call.
         self._profile_judge = profile_judge
+        # System One (Jev wire API) backends read by checklist verifiers and
+        # by a System One profile judge.
+        self._decision_workers = dict(decision_workers or {})
         if profile_judge is not None:
             if self._extra_profiles is None:
                 raise ValueError("profile_judge requires at least one alternative profile")
-            if profile_judge.worker not in self._engines:
+            if (
+                profile_judge.worker not in self._engines
+                and profile_judge.worker not in self._decision_workers
+            ):
                 raise ValueError(
                     f"profile_judge references unknown worker {profile_judge.worker!r}"
                 )
@@ -506,6 +536,7 @@ class Orchestrator:
                     sampling_params=self._sampling_params,
                     execution_workers=self._execution_workers,
                     public_output_floor=self._profile_output_floor(profile_roles),
+                    decision_workers=self._decision_workers,
                 )
             if self._public_output_floor is not None and not any(
                 self._profile_output_floor(profile_roles) is not None
@@ -893,6 +924,9 @@ class Orchestrator:
         call = self._request(request)
         if not self.will_judge_role_profile(call):
             return call
+        assert self._profile_judge is not None
+        if self._profile_judge.worker in self._decision_workers:
+            return await self._judge_role_profile_systemone(call)
         judge_request = self._profile_judge_request(call)
         queued_at = utc_now_iso()
         assert self._profile_judge is not None
@@ -971,18 +1005,127 @@ class Orchestrator:
             role_profile_judge_event=event,
         )
 
+    def _systemone_judge_body(self, call: OrchestrationRequest) -> dict[str, object]:
+        """The Jev request for a route: the conversation and one choice question."""
+
+        judge = self._profile_judge
+        assert judge is not None
+        messages = conversation_messages(call.prompt)
+        if messages is None:
+            conversation: object = call.prompt[: judge.max_message_chars]
+        else:
+            conversation = [
+                {**message, "content": message["content"][: judge.max_message_chars]}
+                if isinstance(message, dict) and isinstance(message.get("content"), str)
+                else message
+                for message in messages
+            ]
+        offered = self._offered_choices(call)
+        return {
+            "model": "",
+            "state": {
+                "conversation": conversation,
+                "tool_calling": bool(call.tools or call.tools_in_prompt),
+                "image_attached": call.multimodal_prompt is not None,
+            },
+            "questions": {
+                "route": {
+                    "type": "choice",
+                    "instructions": judge.question
+                    or "Which route should answer the latest user request?",
+                    "criteria": {choice.label: choice.criteria for choice in offered},
+                }
+            },
+        }
+
+    async def _judge_role_profile_systemone(
+        self,
+        call: OrchestrationRequest,
+    ) -> OrchestrationRequest:
+        """Route by System One probabilities (m1 D9)."""
+
+        judge = self._profile_judge
+        assert judge is not None
+        offered = self._offered_choices(call)
+        backend = self._decision_workers[judge.worker]
+        queued_at = started_at = utc_now_iso()
+        probabilities: dict[str, float] | None = None
+        usage = None
+        failure = "backend_error"
+        try:
+            reply = await asyncio.wait_for(
+                backend.decide(self._systemone_judge_body(call)),
+                timeout=judge.timeout_seconds,
+            )
+            if reply.status == 200:
+                answer = json.loads(reply.body)["answers"]["route"]
+                raw = answer["probabilities"]
+                probabilities = {
+                    choice.label: float(raw[choice.label]) for choice in offered
+                }
+                usage = TraceUsage(
+                    prompt_tokens=reply.input_tokens or 0,
+                    completion_tokens=reply.output_tokens or 0,
+                    cached_tokens=0,
+                )
+            else:
+                failure = f"status_{reply.status}"
+        except (KeyError, TypeError, ValueError):
+            failure = "unparseable_verdict"
+        except Exception:
+            failure = "backend_error"
+        verdict = None
+        if probabilities is not None:
+            label = max(offered, key=lambda choice: probabilities[choice.label]).label
+            if (
+                judge.prefer_label is not None
+                and judge.prefer_label in probabilities
+                and probabilities[judge.prefer_label] >= judge.prefer_min_probability
+            ):
+                label = judge.prefer_label
+            verdict = next(choice.profile for choice in offered if choice.label == label)
+        event = TraceEvent(
+            node="profile_judge",
+            kind="judged" if verdict is not None else "fallback",
+            detail=(
+                f"profile: {verdict}"
+                if verdict is not None
+                else f"System One {failure}; fallback profile applies"
+            ),
+            operation="classification",
+            status="success" if verdict is not None else "failed",
+            role="profile_judge",
+            worker=judge.worker,
+            engine=judge.worker,
+            model=None,
+            timing=TraceTiming(
+                queued_at=queued_at,
+                started_at=started_at,
+                completed_at=utc_now_iso(),
+            ),
+            usage=usage,
+            metadata={
+                "verdict": verdict,
+                "offered": [choice.label for choice in offered],
+                "fallback": None if verdict is not None else failure,
+                **{
+                    f"p_{label}": round(value, 6)
+                    for label, value in (probabilities or {}).items()
+                },
+            },
+        )
+        if self._stage_observer is not None:
+            self._stage_observer(event)
+        return replace(
+            call,
+            role_profile_judgment=verdict,
+            role_profile_judge_event=event,
+        )
+
     def _conductor_final_role(self, roles: tuple[RoleSpec, ...]) -> RoleSpec:
-        units = [role for role in roles if role.role_type != "verifier"]
-        dependents = {dependency for role in units for dependency in role.depends_on}
-        terminal = [
-            role
-            for role in units
-            if role.name not in dependents and role.role_type not in {"head", "executor"}
-        ]
-        synthesizers = [role for role in terminal if role.role_type == "synthesizer"]
-        if not terminal:
-            raise ValueError("orchestration requires at least one terminal role")
-        return (synthesizers + terminal)[0]
+        # Exactly the Conductor's resolution (inline-bound roles excluded and
+        # dependencies on them remapped to their targets).
+        return final_unit_role(roles)
 
     def _conductor_head_role(self, roles: tuple[RoleSpec, ...]) -> RoleSpec | None:
         return next((role for role in roles if role.role_type == "head"), None)
@@ -1031,6 +1174,18 @@ class Orchestrator:
         call: OrchestrationRequest,
         decision: RouteDecision | None,
     ) -> None:
+        if decision is None or decision.target == "multi_agent":
+            final = self._conductor_final_role(self._roles_for(call))
+            params = call.sampling_params
+            if final.seed_from is not None and (
+                params.n != 1 or params.best_of not in (None, 1)
+            ):
+                # A seeded final unit publishes one upstream draft; it cannot
+                # honour n independent choices, so refuse instead of silently
+                # returning one.
+                raise ValueError(
+                    "this orchestration publishes one verified draft and does not support n > 1"
+                )
         if call.multimodal_prompt is not None:
             if self._moa_samples > 0 and (decision is None or decision.target == "multi_agent"):
                 raise ValueError("multimodal orchestration does not support MoA sampling")
@@ -1677,16 +1832,23 @@ class Orchestrator:
         call = self._request(request)
         if self.will_judge_role_profile(call):
             assert self._profile_judge is not None
-            judge_bound = backend_admission_upper_bound(
-                self._engines[self._profile_judge.worker],
-                self._profile_judge_request(call),
-            )
+            if self._profile_judge.worker in self._decision_workers:
+                # A System One read bills at most its input (no output without
+                # think), and input tokens never exceed the body's bytes.
+                judge_tokens = len(
+                    json.dumps(self._systemone_judge_body(call), ensure_ascii=False).encode()
+                )
+            else:
+                judge_tokens = backend_admission_upper_bound(
+                    self._engines[self._profile_judge.worker],
+                    self._profile_judge_request(call),
+                ).tokens
             profile_bounds = (
                 self.admission_upper_bound(replace(call, role_profile_judgment=profile))
                 for profile in self._profiles
             )
             return AdmissionUpperBound(
-                tokens=judge_bound.tokens + max(bound.tokens for bound in profile_bounds),
+                tokens=judge_tokens + max(bound.tokens for bound in profile_bounds),
                 refundable_on_exact_usage=False,
             )
         internal = self._internal_sampling_params(call)
@@ -1778,7 +1940,11 @@ class Orchestrator:
 
     @staticmethod
     def _generation_roles(roles: tuple[RoleSpec, ...]) -> tuple[RoleSpec, ...]:
-        return tuple(role for role in roles if role.role_type != "executor")
+        return tuple(
+            role
+            for role in roles
+            if role.role_type != "executor" and role.checklist is None
+        )
 
     def _conductor_workers(
         self,
@@ -1839,6 +2005,7 @@ class Orchestrator:
             execution_workers=self._execution_workers,
             reasoning_effort=self._effective_reasoning_effort(call),
             public_output_floor=self._profile_output_floor(roles),
+            decision_workers=self._decision_workers,
         )
 
     def _effective_reasoning_effort(self, call: OrchestrationRequest) -> str | None:
@@ -1861,7 +2028,9 @@ class Orchestrator:
                 model=descriptor.model,
             )
         for role in roles:
-            if role.role_type == "executor" and role.worker not in identities:
+            if (
+                role.role_type == "executor" or role.checklist is not None
+            ) and role.worker not in identities:
                 identities[role.worker] = WorkerTraceIdentity(engine=role.worker)
         return identities
 
@@ -2022,6 +2191,7 @@ class Orchestrator:
             reasoning_content: str | None = None,
             public_prompt_tokens: int | None = None,
             public_completion_tokens: int | None = None,
+            verification: VerificationReport | None = None,
         ) -> OrchestratorResult:
             return OrchestratorResult(
                 text=text,
@@ -2034,6 +2204,7 @@ class Orchestrator:
                 reasoning_content=reasoning_content,
                 public_prompt_tokens=public_prompt_tokens,
                 public_completion_tokens=public_completion_tokens,
+                verification=verification,
                 structured_trace=StructuredTrace(
                     request_id=request_id,
                     started_at=trace_started_at,
@@ -2318,6 +2489,7 @@ class Orchestrator:
                 cached_tokens=result.cached_tokens,
                 reasoning_content=result.reasoning_content,
                 public_completion_tokens=result.public_completion_tokens,
+                verification=result.verification,
             )
         try:
             engine_name = (
@@ -2528,6 +2700,7 @@ class Orchestrator:
             reasoning_content: str | None = None,
             public_prompt_tokens: int | None = None,
             public_completion_tokens: int | None = None,
+            verification: VerificationReport | None = None,
         ) -> OrchestratorResult:
             return OrchestratorResult(
                 text=text,
@@ -2540,6 +2713,7 @@ class Orchestrator:
                 reasoning_content=reasoning_content,
                 public_prompt_tokens=public_prompt_tokens,
                 public_completion_tokens=public_completion_tokens,
+                verification=verification,
                 structured_trace=StructuredTrace(
                     request_id=request_id,
                     started_at=trace_started_at,
@@ -3214,6 +3388,7 @@ class Orchestrator:
                 cached_tokens=conductor_result.cached_tokens,
                 reasoning_content=conductor_result.reasoning_content,
                 public_completion_tokens=conductor_result.public_completion_tokens,
+                verification=conductor_result.verification,
             ),
         )
 

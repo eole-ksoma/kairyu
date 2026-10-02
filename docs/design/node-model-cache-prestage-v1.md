@@ -73,7 +73,8 @@ Every `NodeModelPrestageCommand` includes:
 - target ID/revision, deployment, placement binding, and source cache revision;
 - exact placement/node/flavor/profile/compatibility identities;
 - model ID, model revision, and manifest digest;
-- a deterministic owner-scoped pin name;
+- a deterministic owner-scoped pin name,
+  `prestage/<deployment>/<placement>/<command generation>`;
 - controller election, holder, fencing token, and validation window; and
 - issued/expiry times wholly inside that leader lease.
 
@@ -229,14 +230,25 @@ D3 startup binding; they must be released and ensured again.
 
 Fill errors produce a bounded `failed` record and can retry the exact command
 under a new claim while it remains valid. A completion conflict never converts
-another claim. Pin and completion use one stable owner, so retry is idempotent
-even if a process stops between them.
+another claim. Pin and completion use one stable owner per command
+generation, so retry is idempotent even if a process stops between them.
 
 Release first commits the fresh release command as no longer desired and then
 removes only its named pin. Repeating release converges; active and rollback
 owners are untouched. A stop after the state change can leave a conservative
 extra pin, which the same release command removes on retry. It cannot expose an
 artifact to eviction before desired work is withdrawn.
+
+Review amendment (PR #615): the store and the cache index commit separately, so
+a successor ensure of the same placement could complete between a release's
+commit and its unpin. With one owner for every generation, that delayed unpin
+removed the successor's pin and exposed a ready artifact to eviction. The owner
+therefore names the ensure generation, and a release (which copies its ensure's
+owner) can remove only that generation's pin. Before pinning, an ensure removes
+its placement's lower-generation owners on the same artifact; the store admits
+it only after those generations were released, so this preserves the earlier
+crash-before-unpin convergence and turns a delayed unpin into a no-op that
+cannot advance the successor's cache record generation.
 
 ## Controller feedback
 
@@ -269,7 +281,8 @@ Runner start, the builder requires all of the following to agree exactly:
 - deployment, placement binding, placement/node, resource flavor, hardware
   profile, and compatibility approval;
 - model ID, revision, and lowercase manifest SHA-256;
-- a completed `ensure` record with the deterministic deployment owner pin; and
+- a completed `ensure` record with the deterministic owner pin of its command
+  generation; and
 - a node hint observed after that completion which still publishes the exact
   artifact as verified and pinned at binding time, with the same cache record
   generation captured by the completed pin.

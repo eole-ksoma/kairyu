@@ -218,7 +218,7 @@ def build_runner_cache_startup_binding(
 ) -> RunnerCacheStartupBinding:
     """Join ready plan slots to exact pin completions and later physical hints."""
 
-    from kairyu.runners.prestage import NodeModelPrestageRecord
+    from kairyu.runners.prestage import NodeModelPrestageRecord, prestage_pin_owner
 
     if not isinstance(plan, ScalingPrewarmPlan):
         raise TypeError("plan must be a ScalingPrewarmPlan")
@@ -271,7 +271,11 @@ def build_runner_cache_startup_binding(
                 "every Runner-start placement requires a pin record and node hint"
             )
         command = record.command
-        expected_pin_owner = f"prestage/{deployment_id}/{placement_id}"
+        expected_pin_owner = prestage_pin_owner(
+            deployment_id,
+            placement_id,
+            command.command_generation,
+        )
         if record.state is not ModelCachePlacementState.READY:
             raise RunnerCacheStartupBindingError("Runner-start pin record is not ready")
         if record.pin_record_generation is None:

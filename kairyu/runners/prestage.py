@@ -32,6 +32,19 @@ _MAX_SIGNED_BIGINT = 2**63 - 1
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
+def prestage_pin_owner(deployment_id: str, placement_id: str, command_generation: int) -> str:
+    """Return the cache pin owner of one ensure generation of one placement.
+
+    The generation keeps a delayed release from removing a successor's pin.
+    """
+
+    return f"{_pin_owner_prefix(deployment_id, placement_id)}{command_generation}"
+
+
+def _pin_owner_prefix(deployment_id: str, placement_id: str) -> str:
+    return f"prestage/{deployment_id}/{placement_id}/"
+
+
 class NodeModelPrestageError(RuntimeError):
     """Base class for fenced pre-stage failures."""
 
@@ -1012,6 +1025,7 @@ class NodeModelPrestageExecutor:
             result = self._agent.ensure_cached(envelope, trust_store, request)
             if result.manifest_digest != command.manifest_digest:
                 raise NodeModelPrestageConflictError("cache fill returned another artifact")
+            self._unpin_superseded_generations(command)
             pinned = self._index.pin(
                 command.manifest_digest,
                 owner=command.pin_owner,
@@ -1054,6 +1068,28 @@ class NodeModelPrestageExecutor:
         if cached is not None:
             self._index.unpin(command.manifest_digest, owner=command.pin_owner)
         return record
+
+    def _unpin_superseded_generations(self, command: NodeModelPrestageCommand) -> None:
+        """Remove this placement's earlier-generation pins on the same artifact.
+
+        The store admits a successor ensure only after the previous generation was
+        released, so its pin is no longer desired work. Removing it here keeps a
+        crash between that release's commit and its unpin from leaking the pin,
+        and turns that release's delayed unpin into a no-op.
+        """
+
+        cached = self._index.get(command.manifest_digest)
+        if cached is None:
+            return
+        prefix = _pin_owner_prefix(command.deployment_id, command.placement_id)
+        for owner in cached.pin_owners:
+            generation = owner.removeprefix(prefix)
+            if (
+                owner.startswith(prefix)
+                and generation.isdecimal()
+                and int(generation) < command.command_generation
+            ):
+                self._index.unpin(command.manifest_digest, owner=owner)
 
     @staticmethod
     def _validate_artifact_binding(
@@ -1151,7 +1187,7 @@ def _build_node_model_prestage_commands(
         )
         if not 1 <= generation <= _MAX_SIGNED_BIGINT:
             raise ValueError("command generation must be in [1, 2^63-1]")
-        pin_owner = f"prestage/{deployment_id}/{placement_id}"
+        pin_owner = prestage_pin_owner(deployment_id, placement_id, generation)
         _text(pin_owner, name="pin_owner")
         payload = {
             "schema_version": "kairyu-node-model-prestage-command-v1",

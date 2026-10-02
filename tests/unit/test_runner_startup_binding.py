@@ -178,7 +178,7 @@ def test_runner_start_commands_pin_ready_placements_without_refill_intent() -> N
 
     assert len(commands) == 1
     assert commands[0].placement_id == plan.runner_start_placement_ids[0]
-    assert commands[0].pin_owner == "prestage/model-serving/qwen/placement-a"
+    assert commands[0].pin_owner == "prestage/model-serving/qwen/placement-a/1"
     assert plan.cache_fill_placement_ids == ()
 
 

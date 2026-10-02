@@ -282,7 +282,7 @@ def _binding(decision: ScalingDecisionRecord, *, command_id: str) -> RunnerCache
         profile_id="h100-sxm-tp1",
         compatibility_approval_id="compat-qwen-h100",
         manifest_digest="a" * 64,
-        pin_owner="prestage/model-serving/qwen/placement-a",
+        pin_owner="prestage/model-serving/qwen/placement-a/1",
         prestage_command_id=command_id,
         prestage_command_generation=1,
         hint_index_revision=1,
@@ -552,7 +552,7 @@ def _live_state(
     pinned: bool = True,
     hint_index_revision: int = 2,
     evidence_observed_at: datetime | None = None,
-    pin_owners: tuple[str, ...] = ("prestage/model-serving/qwen/placement-a",),
+    pin_owners: tuple[str, ...] = ("prestage/model-serving/qwen/placement-a/1",),
 ) -> RunnerCachePlacementBindingLiveState:
     record, hint = _live_cache_evidence(
         decision,

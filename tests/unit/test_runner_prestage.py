@@ -25,11 +25,13 @@ from kairyu.artifacts import (
     ModelArtifactTokenizer,
     ModelArtifactTrustStore,
     NodeModelCacheAgent,
+    NodeModelCacheCapacityPolicy,
     NodeModelCacheIndex,
     NodeModelCachePlacementHintPublisher,
     SignedModelArtifactManifest,
     TrustedModelSigner,
     model_file_tree_digest,
+    plan_node_model_cache_eviction,
     sign_model_artifact_manifest,
 )
 from kairyu.runners import (
@@ -242,7 +244,7 @@ def test_builds_exact_deterministic_command_per_absent_placement() -> None:
     assert tuple(command.node_id for command in first) == ("gpu-node-00", "gpu-node-01")
     assert first[0].command_generation == 20
     assert first[0].authority.fencing_token == 4
-    assert first[0].pin_owner == "prestage/production/prestage-test/placement-00"
+    assert first[0].pin_owner == "prestage/production/prestage-test/placement-00/20"
 
 
 def test_command_builder_requires_exact_generation_allocation() -> None:
@@ -1294,3 +1296,63 @@ def test_runner_start_verification_keeps_prestage_binding_evidence_live(
     assert evidence.read(live_request).pin_evidence.record_generation == (
         record.pin_record_generation
     )
+
+
+def test_stale_release_unpin_cannot_remove_successor_pin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    envelope, trust_store, request = _artifact()
+    executor, index, store = _executor(tmp_path, Source())
+    first = _commands(envelope.manifest_digest)[0]
+    executor.execute(
+        first,
+        claim_id="a" * 64,
+        envelope=envelope,
+        trust_store=trust_store,
+        request=request,
+    )
+    release = build_node_model_prestage_release_command(
+        first,
+        authority=_authority(token=5),
+        decision_id="scale-decision-18",
+        decision_fingerprint="e" * 64,
+        target_revision=9,
+        command_generation=21,
+        issued_at=_NOW + timedelta(seconds=1),
+        ttl_seconds=60,
+    )
+    successor = _commands(
+        envelope.manifest_digest,
+        token=5,
+        generation_start=22,
+        target_revision=10,
+    )[0]
+    commit_release = store.release
+
+    def release_then_successor_completes(command, *, now):
+        record = commit_release(command, now=now)
+        executor.execute(
+            successor,
+            claim_id="b" * 64,
+            envelope=envelope,
+            trust_store=trust_store,
+            request=request,
+        )
+        return record
+
+    monkeypatch.setattr(store, "release", release_then_successor_completes)
+
+    executor.release(release)
+
+    record = store.list_records()[0]
+    cached = index.get(envelope.manifest_digest)
+    assert record.state is ModelCachePlacementState.READY
+    assert record.command.command_generation == 22
+    assert cached.pin_owners == (successor.pin_owner,)
+    assert cached.generation == record.pin_record_generation
+    plan = plan_node_model_cache_eviction(
+        index.snapshot(),
+        NodeModelCacheCapacityPolicy(high_watermark_bytes=1, low_watermark_bytes=0),
+    )
+    assert plan.victims == ()

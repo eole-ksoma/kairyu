@@ -111,6 +111,11 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
 
+### 2026-10-02 — [amendment] Runner and model-cache authority review fixes (PR #615)
+- What: cache `touch()` keeps the residency generation; the live cache reader joins node evidence to the published inventory at the latest observation (hints live, inventory within the observation age); pre-stage pin owners name the ensure generation and an ensure drops lower-generation owners; actuation reauthorizes the leader after its last callback and rechecks evidence age before PATCH; Deployment claims accept the one-step generation advance.
+- Why: owner review reproduced five defects with CPU/HTTP mocks: a successful Runner-start verification invalidated its own binding, every current inventory was denied, a delayed release removed a successor's pin, an expired lease could still PATCH, and every first Deployment claim failed.
+- Refs: D3.1, D3.14 in `docs/design/node-model-cache-prestage-v1.md`; `docs/design/node-model-cache-index-v1.md`; `docs/design/runner-state-v1.md`; PR #615
+
 ### 2026-10-02 — [design] Verified-answers example: two-stage extraction, slimmer state builder (VCO-D8 am. 2, VCO-D12)
 - What: stated and implicit conditions come from two parallel extractors (implicit: at most four, Jev-kept); the state builder lists only source/action claims (G1-computation/general removed); step budget 16 -> 24 (worst case 18 published `reason: budget`). InFoBench c8 p50 492 -> 297 s. The requirements gate no longer reuses answers from another build; the implicit gate's judge thinks.
 - Why: one combined extractor lost stated conditions (gold recall 0.867) and re-extraction dropped implicit ones (gate recall 0.525-0.675); owner latency target p50 <= 3 min (not yet met).

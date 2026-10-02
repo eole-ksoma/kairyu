@@ -97,7 +97,7 @@ Result (alpha = 0.10, 95 % confidence): **tau_hi = 0.9966**.
 Held-out answers: 54 / 125 pass every requirement; 10 of them carry at least
 one labelled violation.
 
-## Per-claim G1 calibration (2026-10-02, VCO-D11)
+## Per-claim G1 calibration (2026-10-02, VCO-D11; computation and general removed by VCO-D12)
 
 `./verify.sh calibrate-g1`: 600 human-labelled answers per claim kind, the
 production state builder (DeepSeek, high effort, claims grammar) and the
@@ -124,6 +124,32 @@ Cost: 1,800 state-builder calls, 10,557 / 8,404 / 422 median output tokens
 flight, 74 tok/s per request, 2,370-2,500 tok/s DeepSeek generation, DSpark
 acceptance 57-61 %; about 85 minutes in all. 12 state-builder outputs (0.7 %)
 were truncated JSON (runaway newlines) and are excluded.
+
+## Two-stage extraction and latency (2026-10-02, VCO-D8 amendment 2, VCO-D12)
+
+Implicit conditions, extraction plus OpenJev only (no answer generation;
+dev set of 12 + 4 controls written before tuning; the gate's 20 + 10):
+
+| Configuration | gate-set recall | dev-set recall | controls (implicit kept) | implicit kept per request |
+|---|---:|---:|---:|---:|
+| one prompt, situational guidance | 0.875 | 0.917-0.958 | 0.0 | 2.2 |
+| two-stage | 0.900-0.925 | 0.917-0.958 | 0.0-0.2 | 4.7 |
+| two-stage, at most four | 0.925-0.950 | 1.000 | 0.0-0.4 | 2.6-2.75 |
+
+Full-DAG implicit gate runs before the split: recall 0.525 (first run),
+0.600, 0.675; re-extraction dropped implicit conditions. The InFoBench
+requirements gate on the one-prompt build: gold recall 0.867, p50 471 s
+(stated conditions 4.5 per request vs 5.1 without implicit ones).
+
+Latency, 8 InFoBench requests at c8 with traces (seconds; mean per call):
+
+| Configuration | p50 / max | extract | implicit | answer | state builder | guaranteed |
+|---|---|---:|---:|---:|---:|---:|
+| two-stage | 492 / 587 | 88 | 112 | 34 | 92 (10,491 tok) | 1 / 8 (3 `budget`) |
+| + state builder lists source / action claims | 355 / 455 | 82 | 125 | 31 | 43 (4,914 tok) | 2 / 8 (1 `budget`) |
+| + step budget 24 | 297 / 432 | 89 | 110 | 23 | 44 (5,109 tok) | 3 / 8 |
+
+The fastest guaranteed request took 166 s (one attempt).
 
 ## GPU gates on the final code (2026-10-01, `5b455dd8` plus the G3/report fixes)
 

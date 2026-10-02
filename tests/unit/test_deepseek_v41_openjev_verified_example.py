@@ -61,7 +61,12 @@ def _text(body: dict) -> str:
 
 
 def _deepseek(
-    seen: list[dict], *, draft: str, checklist: dict | None = None, draft_finish: str = "stop"
+    seen: list[dict],
+    *,
+    draft: str,
+    checklist: dict | None = None,
+    implicit: list[dict] | None = None,
+    draft_finish: str = "stop",
 ):
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
@@ -69,9 +74,20 @@ def _deepseek(
         text = _text(body)
         if text.startswith("[extract]"):
             answer = json.dumps(checklist or CHECKLIST)
+        elif text.startswith("[implicit]"):
+            answer = json.dumps({"requirements": implicit or []})
         elif text.startswith("[state_builder]"):
             answer = json.dumps(
-                {"claims": [{"id": "c1", "text": "Paris", "basis": "general", "evidence": ""}]}
+                {
+                    "claims": [
+                        {
+                            "id": "c1",
+                            "text": "The answer names the capital of France",
+                            "basis": "source",
+                            "evidence": "Name the capital of France",
+                        }
+                    ]
+                }
             )
         elif text.startswith("[repair]"):
             answer = "Paris"
@@ -106,6 +122,7 @@ def _openjev(
     needs: str | None = None,
     unneeded: str | None = None,
     claim: float = 0.9999,
+    unmet: str | None = None,
 ):
     def answer(question: dict, state: dict) -> dict:
         text = json.dumps(question)
@@ -124,6 +141,8 @@ def _openjev(
             return {"noul": 0.4}
         if "Is this claim of the answer supported?" in text:
             return {"noul": claim}
+        if unmet is not None and unmet in text and "satisfy the requirement" in text:
+            return {"noul": 0.0}
         return {"noul": 0.9999}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -150,12 +169,14 @@ def _orchestrator(
     route: str = "VERIFIED",
     implicit: float = 0.9999,
     checklist: dict | None = None,
+    implicit_conditions: list[dict] | None = None,
     jev_down: bool = False,
     sufficiency: float = 0.9999,
     needs: str | None = None,
     unneeded: str | None = None,
     draft_finish: str = "stop",
     claim: float = 0.9999,
+    unmet: str | None = None,
 ):
     deployment = load_deployment_spec(
         (EXAMPLE / "kairyu.yaml").read_text(), resolve_credentials=False
@@ -164,7 +185,13 @@ def _orchestrator(
         name: OpenAICompatBackend(
             **pool.replicas[0].options,
             transport=httpx.MockTransport(
-                _deepseek(seen, draft=draft, checklist=checklist, draft_finish=draft_finish)
+                _deepseek(
+                    seen,
+                    draft=draft,
+                    checklist=checklist,
+                    implicit=implicit_conditions,
+                    draft_finish=draft_finish,
+                )
             ),
         )
         for name, pool in deployment.pools.items()
@@ -183,6 +210,7 @@ def _orchestrator(
                     needs=needs,
                     unneeded=unneeded,
                     claim=claim,
+                    unmet=unmet,
                 )
             ),
         )
@@ -229,7 +257,7 @@ async def test_a_one_word_draft_is_published_with_a_guarantee() -> None:
     assert {item["id"] for item in report["requirements"]} == {
         "R1",
         "R2",
-        "G1-general",
+        "G1-source",
         "G1-excerpts",
         "G2",
         "G3",
@@ -270,7 +298,7 @@ async def test_uncalibrated_claim_support_is_reported_but_never_blocks_the_guara
 
     report = result.verification.as_dict()
     assert report["guaranteed"] is True and result.verification.attempts == 1
-    g1 = next(item for item in report["requirements"] if item["id"] == "G1-general")
+    g1 = next(item for item in report["requirements"] if item["id"] == "G1-source")
     assert g1["p"] == pytest.approx(0.2) and g1["tags"]["guarantee"] == "advisory"
     assert not any(_text(body).startswith("[repair]") for body in seen)
 
@@ -367,23 +395,21 @@ async def test_an_unavailable_jev_routes_to_the_think_answer() -> None:
 async def test_implicit_requirements_stay_only_when_jev_finds_them_expected(
     p_expected, kept
 ) -> None:
-    checklist = {
-        **CHECKLIST,
-        "requirements": [
-            *CHECKLIST["requirements"],
-            {
-                "id": "R3",
-                "proposition": "the answer is in English",
-                "kind": "semantic",
-                "origin": "implicit",
-                "sources": ["U1"],
-            },
-        ],
-    }
+    # A second extractor lists situational conditions (VCO-D8 amendment);
+    # the stated checklist stays the extractor's alone.
+    implicit_conditions = [
+        {
+            "id": "I1",
+            "proposition": "the answer is a proper noun",
+            "kind": "semantic",
+            "origin": "implicit",
+            "sources": ["Name the capital of France"],
+        }
+    ]
     seen: list[dict] = []
     reads: list[dict] = []
     orchestrator = _orchestrator(
-        seen, reads, draft="Paris", implicit=p_expected, checklist=checklist
+        seen, reads, draft="Paris", implicit=p_expected, implicit_conditions=implicit_conditions
     )
 
     result = await orchestrator.run(_call("Name the capital of France in one word."))
@@ -395,9 +421,10 @@ async def test_implicit_requirements_stay_only_when_jev_finds_them_expected(
         if "did not say it" in json.dumps(question)
     ]
     assert len(implicit_questions) == 1
-    assert "R3: the answer is in English" in json.dumps(implicit_questions[0])
+    assert "I1: the answer is a proper noun" in json.dumps(implicit_questions[0])
     judged = {item.id for item in result.verification.items}
-    assert ("R3" in judged) is kept
+    assert ("I1" in judged) is kept
+    assert result.verification.guaranteed
 
 
 async def test_an_unconfirmed_requirement_set_never_yields_a_guarantee() -> None:
@@ -411,6 +438,54 @@ async def test_an_unconfirmed_requirement_set_never_yields_a_guarantee() -> None
     assert result.text == "Paris"
     assert result.verification.guaranteed is False
     assert result.verification.reason == "requirements_unconfirmed"
+
+
+async def test_the_longest_path_fits_the_step_budget() -> None:
+    # A re-extraction plus two failed repairs used to exhaust max_steps and
+    # publish the answer unverified (reason: budget) once the implicit
+    # extractor and its check joined the DAG.
+    checklist = {
+        **CHECKLIST,
+        "requirements": [
+            *CHECKLIST["requirements"],
+            {
+                "id": "R3",
+                "proposition": "explains the history of the city",
+                "kind": "semantic",
+                "origin": "explicit",
+                "sources": ["U1"],
+            },
+        ],
+    }
+    implicit_conditions = [
+        {
+            "id": "I1",
+            "proposition": "the answer is a proper noun",
+            "kind": "semantic",
+            "origin": "implicit",
+            "sources": ["Name the capital of France"],
+        }
+    ]
+    seen: list[dict] = []
+    orchestrator = _orchestrator(
+        seen,
+        [],
+        draft="Paris",
+        checklist=checklist,
+        implicit_conditions=implicit_conditions,
+        # Jev drops the implicit condition, so its curated list is re-judged.
+        implicit=0.05,
+        needs="never-covered",
+        # Every attempt passes the checks, runs the state builder and then
+        # fails one semantic requirement: the longest repair path.
+        unmet="explains the history of the city",
+    )
+
+    result = await orchestrator.run(_call("Name the capital of France in one word."))
+
+    assert sum(_text(body).startswith("[extract]") for body in seen) == 2
+    assert result.verification.attempts == 3
+    assert result.verification.reason != "budget"
 
 
 async def test_duplicate_deterministic_conditions_keep_their_own_checks() -> None:

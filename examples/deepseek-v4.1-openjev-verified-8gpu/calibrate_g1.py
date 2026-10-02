@@ -1,28 +1,22 @@
 #!/usr/bin/env python3
-"""Calibrate the per-kind G1 thresholds on human-labelled answers.
+"""Calibrate the G1-source threshold on human-labelled answers.
 
-G1 asks, per claim the state builder lists, whether the claim is supported;
-each claim kind is its own requirement with its own threshold:
-
-- G1-source (source and action claims): RAGTruth, RAG answers with human
-  hallucination spans; an answer is violated when it has any span.
-- G1-computation: PRM800K phase 2, MATH solutions with human step ratings;
-  an answer (the solution up to the first labelled error) is violated when a
-  step is rated -1. Solutions with a neutral (0) step are left out.
-- G1-general: FEVER, crowd-written Wikipedia claims; REFUTES is violated,
-  SUPPORTS is not, NOT ENOUGH INFO is left out.
+G1-source asks, per source or action claim the state builder lists, whether
+the claim is supported. RAGTruth (RAG answers with human hallucination
+spans) labels an answer violated when it has any span.
 
 Every answer runs this example's production path: the state builder (same
 prompt, grammar and high effort) lists the claims, and OpenJev reads the
-production G1 questions through Kairyu's ChecklistRun. For each kind, tau is
-the smallest threshold whose accepted answers (p of that requirement >= tau)
-have a one-sided 95 % Clopper-Pearson upper bound on the violation rate <=
-alpha on the calibration half; the held-out half (split by problem, source
-document or Wikipedia page) is reported unchanged and is the gate.
+production G1 questions through Kairyu's ChecklistRun. tau is the smallest
+threshold whose accepted answers (p >= tau) have a one-sided 95 %
+Clopper-Pearson upper bound on the violation rate <= alpha on the
+calibration half; the held-out half (split by source document) is reported
+unchanged and is the gate.
 
-Result (2026-10-02, VCO-D11): no kind reaches alpha = 0.10 on held-out
-labels, so the G1 questions are advisory (threshold 0) in verified.yaml; the
-gate passes only if a future judge or wording makes every kind calibratable.
+Result (2026-10-02, VCO-D11): no threshold reaches alpha = 0.10, so G1-source
+is advisory (threshold 0) in verified.yaml. The computation and general
+kinds (PRM800K, FEVER) failed too and left the configuration with VCO-D12;
+their measurement is in MEASUREMENTS.md.
 
 Usage: ./verify.sh calibrate-g1   (after ./run.sh up)
 """
@@ -49,6 +43,7 @@ sys.path.insert(0, str(HERE))
 import calibrate  # noqa: E402
 import control  # noqa: E402
 
+import verification  # noqa: E402
 from kairyu.dsl.loader import load_spec, role_spec  # noqa: E402
 from kairyu.engine.systemone import HTTPSystemOneBackend  # noqa: E402
 from kairyu.orchestration.checklist import ChecklistConfig, ChecklistRun  # noqa: E402
@@ -65,18 +60,9 @@ SOURCES = {
         f"{_RAGTRUTH}/source_info.jsonl",
         "0dffc26ea9f3c1c3d7c7e8336b56ef1646e3cec876edffcca3c9c624d12d578b",
     ),
-    "prm800k-phase2_test.jsonl": (
-        "https://media.githubusercontent.com/media/openai/prm800k/"
-        "7ecc794703b2877f63226f2477a49b34f9b25163/prm800k/data/phase2_test.jsonl",
-        "6b172efa884ac8341a946dd82e06947c135b7254109fb3f7aa907c715d98aaad",
-    ),
-    "fever-shared_task_dev.jsonl": (
-        "https://fever.ai/download/fever/shared_task_dev.jsonl",
-        "e89865bfe1b4dd054e03dd57d7241a6fde24862905f31117cf0cd719f7c78df7",
-    ),
 }
 # requirement id -> the dataset that calibrates it
-KINDS = {"G1-source": "ragtruth", "G1-computation": "prm800k", "G1-general": "fever"}
+KINDS = {"G1-source": "ragtruth"}
 PER_DATASET = 600
 
 
@@ -118,80 +104,15 @@ def ragtruth(directory: Path) -> list[dict]:
     return rows
 
 
-def prm800k(directory: Path) -> list[dict]:
-    rows = []
-    for index, row in enumerate(_jsonl(directory / "prm800k-phase2_test.jsonl")):
-        label = row["label"]
-        if row["is_quality_control_question"] or row["is_initial_screening_question"]:
-            continue
-        if label["finish_reason"] not in ("solution", "found_error"):
-            continue
-        # The solution as generated: the chosen completion of each step; the
-        # step where the labeller found the error has none, and its first
-        # completion is the generated step.
-        steps = [step["completions"][step["chosen_completion"] or 0] for step in label["steps"]]
-        ratings = [step["rating"] for step in steps]
-        if 0 in ratings or None in ratings:
-            continue
-        rows.append(
-            {
-                "id": f"prm800k-{index}",
-                "group": row["question"]["problem"],
-                "request": row["question"]["problem"],
-                "answer": "\n\n".join(step["text"] for step in steps),
-                "violated": -1 in ratings,
-            }
-        )
-    return rows
-
-
-_WIKI = {"-LRB-": "(", "-RRB-": ")", "-LSB-": "[", "-RSB-": "]", "-COLON-": ":", "_": " "}
-
-
-def _title(page: str) -> str:
-    for token, text in _WIKI.items():
-        page = page.replace(token, text)
-    return page
-
-
-def fever(directory: Path) -> list[dict]:
-    rows = []
-    for row in _jsonl(directory / "fever-shared_task_dev.jsonl"):
-        if row["label"] not in ("SUPPORTS", "REFUTES"):
-            continue
-        pages = [entry[2] for group in row["evidence"] for entry in group if entry[2]]
-        if not pages:
-            continue
-        title = _title(pages[0])
-        rows.append(
-            {
-                "id": f"fever-{row['id']}",
-                "group": title,
-                "request": f"Tell me one fact about {title}.",
-                "answer": row["claim"],
-                "violated": row["label"] == "REFUTES",
-            }
-        )
-    return rows
-
-
-def select(rows: list[dict], seed: int, *, balance: bool) -> list[dict]:
+def select(rows: list[dict], seed: int) -> list[dict]:
     """PER_DATASET answers, at most one per group where the data allows."""
 
-    rng = random.Random(seed)
-    rng.shuffle(rows)
-    pools = [[row for row in rows if row["violated"] is flag] for flag in (True, False)]
-    if not balance:
-        pools = [rows]
-    quota = PER_DATASET // len(pools)
-    chosen = []
-    for pool in pools:
-        seen: set[str] = set()
-        first = [row for row in pool if not (row["group"] in seen or seen.add(row["group"]))]
-        taken = {row["id"] for row in first}
-        rest = [row for row in pool if row["id"] not in taken]
-        chosen.extend((first + rest)[:quota])
-    return chosen
+    random.Random(seed).shuffle(rows)
+    seen: set[str] = set()
+    first = [row for row in rows if not (row["group"] in seen or seen.add(row["group"]))]
+    taken = {row["id"] for row in first}
+    rest = [row for row in rows if row["id"] not in taken]
+    return (first + rest)[:PER_DATASET]
 
 
 def split(rows: list[dict], seed: int) -> dict[str, list[dict]]:
@@ -329,18 +250,12 @@ def main() -> None:
     alpha, confidence = float(settings["alpha"]), float(settings["confidence"])
     directory = control.environment_storage() / "calibration" / "g1"
     download(directory)
-    samples = []
-    for dataset, loader, balance in (
-        ("ragtruth", ragtruth, False),
-        ("prm800k", prm800k, True),
-        ("fever", fever, False),
-    ):
-        for row in select(loader(directory), seed, balance=balance):
-            samples.append({**row, "dataset": dataset})
+    samples = [{**row, "dataset": "ragtruth"} for row in select(ragtruth(directory), seed)]
     env = control._compose_env()
     l1_url = f"http://127.0.0.1:{env['DEEPSEEK_L1_PORT']}"
     builder = calibrate._roles()["state_builder"]
-    cache = directory / "judged.jsonl"
+    # Claims depend on the state builder prompt: one cache per configuration.
+    cache = directory / f"judged-{verification._build_key()}.jsonl"
     done = {}
     if cache.is_file():
         for row in _jsonl(cache):

@@ -52,10 +52,13 @@ curl -s http://127.0.0.1:8013/v1/chat/completions -H 'Content-Type: application/
 `kairyu_verification`:
 
 - `guaranteed: true` — every requirement passed; `requirements[]` lists each
-  one with `p`, its source instruction units and kind. Items tagged
-  `guarantee: advisory` (G1-source, G1-computation, G1-general: OpenJev's
-  per-claim support) are shown with their `p` but never block the flag:
-  they failed calibration on human labels (VCO-D11).
+  one with `p`, its source instruction units and kind. Stated conditions
+  carry `origin: explicit`; conditions the situation presupposes (from a
+  second extractor, kept only when OpenJev judges them expected) carry
+  `origin: implicit`. Items tagged `guarantee: advisory` (G1-source:
+  OpenJev's support of each material-based claim) are shown with their `p`
+  but never block the flag: they failed calibration on human labels
+  (VCO-D11).
 - `guaranteed: false` with `reason`:
   - `refinement_limit`: two repairs did not pass; the newest version that
     passed the deterministic checks is returned.
@@ -76,7 +79,11 @@ requirement table; internal stages are folded below the answer.
 - Tool-calling turns are not this example's surface (tools are context only).
 - Only τ_hi is calibrated (InFoBench, α = 0.10); the 0.5 thresholds of the
   requirement confirmation are defaults.
-- Claim-level groundedness is advisory: `./verify.sh calibrate-g1` found no
-  threshold meeting α = 0.10 on RAGTruth, PRM800K or FEVER (MEASUREMENTS.md),
-  so a guaranteed answer can still contain an unsupported claim that the
-  deterministic checks (G1-excerpts, G2, G3) do not catch.
+- Claim-level groundedness is advisory: no threshold met α = 0.10 on
+  RAGTruth, PRM800K or FEVER (MEASUREMENTS.md), so a guaranteed answer can
+  still contain an unsupported claim that the deterministic checks
+  (G1-excerpts, G2, G3) do not catch. Reasoning and general-knowledge claims
+  are not listed at all (VCO-D12).
+- Latency: p50 about 5 minutes on long InFoBench requests (target 3
+  minutes, VCO-D12); a request that passes on the first attempt takes about
+  2-3 minutes.

@@ -170,6 +170,18 @@ chat mode it marked "every price is kept" uncovered next to three
 conditions keeping each price (thinking judge 0.900 vs 0.825 on the same
 lists).
 
+Amendment 2 (2026-10-02, owner decision): extraction is two-stage. With
+both kinds in one prompt the extractor wrote fewer stated conditions (4.5
+vs 5.1 per InFoBench request) and InFoBench gold recall fell to 0.867. Now
+`extract` lists stated conditions only (origin `explicit`), and a separate
+`implicit` role, in parallel with it (no dependency, so no added latency),
+lists at most four situational conditions with the request words they
+belong to; `implicit_check` asks Jev per condition and curation drops it
+below 0.5 without blocking the guarantee. The final checklist reads both.
+Extraction plus Jev, measured without the full DAG: implicit-set recall
+0.925-0.950, dev set 1.000, controls 0.0-0.4 (the planets question listed
+the correct answer's content; that is now excluded).
+
 ### VCO-D9 — One effort for every DeepSeek step (2026-10-01)
 
 Owner requirement: whatever the route, every DeepSeek role (extract,
@@ -208,12 +220,28 @@ while G1 accepts well-established knowledge; OpenJev does not detect
 arithmetic and reasoning errors; OpenJev is confident on false facts.
 
 Owner decision (option A): the per-claim G1 questions stay, split by kind,
-with threshold 0 and tag `guarantee: advisory`. Their p is reported in
+with threshold 0 and tag `guarantee: advisory` (since VCO-D12 only
+G1-source remains). Their p is reported in
 `kairyu_verification`, the Verification section and the answer page, but
 they neither repair nor block the guarantee. The guarantee covers the
 calibrated requirements (tau_hi) and the deterministic G1-excerpts, G2 and
 G3. Also observed: 12 of 1,800 state-builder outputs were truncated JSON
 (runaway newlines), which serving reports as `checklist_unavailable`.
+
+### VCO-D12 — Latency target and the slimmer state builder (2026-10-02)
+
+Owner target: p50 <= 3 minutes on long InFoBench requests (every DeepSeek
+step keeps the caller's effort, repairs stay at most two). Traced breakdown
+(8 InFoBench requests, c8): the state builder took 92 s and 10,491 output
+tokens per attempt, listing every claim although only source and action
+claims feed a guarantee (G1-excerpts, G2); computation and general claims fed
+only advisory, uncalibrated questions (VCO-D11). It now lists source and
+action claims only; G1-computation and G1-general are gone. The step budget
+(16) was below the two-stage worst case (18) and published answers
+unverified (`reason: budget`); it is 24. Result: p50 492 s -> 297 s, state
+builder 44 s / 5,109 tokens, guaranteed 1/8 -> 3/8. The floor is extraction
+(implicit 110 s in parallel with extract 89 s) plus one attempt (answer and
+state builder, about 70 s); repairs add about 70 s each.
 
 ## Limitations
 

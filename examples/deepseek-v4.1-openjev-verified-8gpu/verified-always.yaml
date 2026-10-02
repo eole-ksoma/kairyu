@@ -61,7 +61,7 @@ roles:
                     id: {type: string}
                     proposition: {type: string}
                     kind: {enum: [deterministic, semantic]}
-                    origin: {enum: [explicit, implicit]}
+                    origin: {enum: [explicit]}
                     sources:
                       type: array
                       minItems: 1
@@ -111,28 +111,7 @@ roles:
       the answer, in the language of the request. These conditions have
       origin "explicit".
 
-      Step 3. Add the conditions the request does not state but its
-      situation presupposes, with origin "implicit": what this user would
-      count as a mistake although they never said it. Go through:
-      - material the user gave (numbers, names, dates, amounts, owners,
-        identifiers, code): what must be kept exactly, or keep working, when
-        the request transforms, shortens, summarizes or rewrites it;
-      - the audience and relationship (a superior, a customer, a child, end
-        users, a beginner): register, wording, what to explain or leave out;
-      - the medium or target (an email, a post, a card, a query, a language
-        or version): its limits and conventions;
-      - the real-world circumstances named (place, season, health, occasion):
-        what they rule in or out;
-      - an artifact the answer produces (code, a command, a query, a plan, an
-        example): that it is valid and does what it is for.
-      Give each the instruction units it belongs to as sources. Do not
-      restate an explicit condition, do not add general quality wishes ("is
-      helpful", "is accurate", "is clear"), and do not add what any ordinary
-      reply meets by default (answering in the language of the request,
-      addressing the question). Add none when the situation presupposes
-      nothing, as for a short factual question.
-
-      Step 4. Mark a condition "deterministic" only when one primitive below
+      Step 3. Mark a condition "deterministic" only when one primitive below
       decides it exactly, and fill in "check"; otherwise mark it "semantic"
       and omit "check".
       - regex {{pattern, flags}}: the answer matches the pattern (flags: i m s)
@@ -161,20 +140,11 @@ roles:
       Rewrite the whole checklist so that every instruction unit is covered,
       every condition follows from its sources, and no two conditions require
       the same thing. Keep the same output format and the rules (origin
-      "explicit" for stated conditions, "implicit" for what the situation
-      presupposes): units are the
+      "explicit"; only what the request states): units are the
       smallest instructions of the request (system/developer instructions and
       the latest user message), conditions are checkable statements in the
       request's language, "deterministic" only with one of the primitives
       regex, not_regex, length, contains, not_contains, json_valid.
-      Keep every implicit condition of the previous checklist that the
-      problems do not name. Implicit conditions cover what this user would
-      count as a mistake although they never said it: material the user gave
-      that must be kept exactly or keep working; the audience's register and
-      wording; the medium's limits and conventions; real-world circumstances
-      named; that a produced artifact is valid and does what it is for. Never
-      add what any ordinary reply meets by default (answering in the
-      language of the request, addressing the question).
       Conditions must be satisfiable by an answer in the caller's output
       format: {response_format}
       Output only the JSON object.
@@ -222,25 +192,6 @@ roles:
             The request's instruction units {item[sources]} ask for this condition
           criteria_false: >-
             The condition adds something those instruction units do not ask for
-          context:
-            condition: "{item[id]}: {item[proposition]}"
-            instruction_units: "{item[sources]}"
-        # Implicit conditions stay only when Jev judges that this user, in
-        # this situation, expects them without saying so (VCO-D8).
-        - id: "{item[id]}"
-          group: necessity
-          proposition: "{item[proposition]}"
-          sources_key: sources
-          threshold: 0.0
-          foreach: {role: extract, path: requirements, where: {origin: implicit}}
-          ask: >-
-            In this situation, does the user expect the answer to meet this
-            condition even though they did not say it?
-          criteria_true: >-
-            Any competent answer to this request is expected to meet it; the
-            user would see an answer that misses it as wrong
-          criteria_false: >-
-            It is an extra preference the user did not ask for and would not miss
           context:
             condition: "{item[id]}: {item[proposition]}"
             instruction_units: "{item[sources]}"
@@ -300,6 +251,167 @@ roles:
           origin: explicit
           proposition: "the answer responds to this part of the request: {unit[text]}"
 
+  # Implicit conditions (VCO-D8 amendment): a second extractor, in
+  # parallel with extract, lists only what the situation presupposes; Jev
+  # keeps each one only when this user expects it without saying so.
+  - name: implicit
+    worker: deepseek
+    reasoning_effort: inherit
+    sampling:
+      temperature: 1.0
+      top_p: 0.95
+      max_tokens: 32768
+      max_tokens_by_effort: {low: 16384, high: 32768, max: 65536}
+      response_format:
+        type: json_schema
+        json_schema:
+          name: implicit_conditions
+          strict: true
+          schema:
+            type: object
+            additionalProperties: false
+            required: [requirements]
+            properties:
+              requirements:
+                type: array
+                maxItems: 4
+                items:
+                  type: object
+                  additionalProperties: false
+                  required: [id, proposition, kind, origin, sources]
+                  properties:
+                    id: {type: string}
+                    proposition: {type: string}
+                    kind: {enum: [deterministic, semantic]}
+                    origin: {enum: [implicit]}
+                    sources:
+                      type: array
+                      minItems: 1
+                      maxItems: 4
+                      items: {type: string}
+                    check:
+                      type: object
+                      additionalProperties: false
+                      required: [primitive, params]
+                      properties:
+                        primitive:
+                          enum: [regex, not_regex, length, contains, not_contains, json_valid]
+                        params:
+                          type: object
+                          additionalProperties: false
+                          properties:
+                            pattern: {type: string}
+                            flags: {type: string}
+                            text: {type: string}
+                            ignore_case: {type: boolean}
+                            min_chars: {type: integer}
+                            max_chars: {type: integer}
+                            min_words: {type: integer}
+                            max_words: {type: integer}
+                            required_keys:
+                              type: array
+                              items: {type: string}
+    prompt: |-
+      [implicit] The conversation below is a JSON list of role-tagged
+      messages. The request is its system and developer messages plus the
+      last user message; earlier turns, attachments and tool results are
+      material, not instructions.
+
+      List only the conditions the request does not state but its
+      situation presupposes: what this user would count as a mistake
+      although they never said it. Another step lists the stated conditions;
+      do not repeat what the request says. Go through:
+      - material the user gave (numbers, names, dates, amounts, owners,
+        identifiers, code): what must be kept exactly, or keep working, when
+        the request transforms, shortens, summarizes or rewrites it;
+      - the audience and relationship (a superior, a customer, a child, end
+        users, a beginner): register, wording, what to explain or leave out;
+      - the medium or target (an email, a post, a card, a query, a language
+        or version): its limits and conventions;
+      - the real-world circumstances named (place, season, health, occasion):
+        what they rule in or out;
+      - an artifact the answer produces (code, a command, a query, a plan, an
+        example): that it is valid and does what it is for.
+      Do not add general quality wishes ("is helpful", "is accurate", "is
+      clear"), what any ordinary reply meets by default (replying in the
+      language of the request, addressing the question), or the content of
+      the correct answer to a factual question. Text the answer
+      makes for another place (comments in code, a message, a translation)
+      is different: its language and form are situational. List none when
+      the situation presupposes nothing, as for a short factual question.
+
+      List at most four, the ones whose absence this user would mind most
+      first; one condition per concern (merge related wording, register and
+      tone into one). Number them I1, I2, ... with origin "implicit"; as sources copy the
+      words of the request each one belongs to. Write each proposition as a
+      checkable statement about the answer, in the language of the request.
+      Mark one "deterministic" only when one primitive below decides it
+      exactly, and fill in "check"; otherwise "semantic" without "check".
+      - regex {{pattern, flags}}: the answer matches the pattern (flags: i m s)
+      - not_regex {{pattern, flags}}: the answer does not match it
+      - length {{min_chars, max_chars, min_words, max_words}}: length bounds
+      - contains / not_contains {{text, ignore_case}}: a literal string
+      - json_valid {{required_keys}}: the answer is a JSON value (object keys)
+
+      The caller fixed the answer's output format below ("none" when
+      free): write only conditions an answer in exactly this format can
+      meet, and none about the format itself.
+
+      Output only the JSON object.
+      --- RESPONSE FORMAT ---
+      {response_format}
+      --- END RESPONSE FORMAT ---
+      --- CONVERSATION ---
+      {conversation}
+      --- END CONVERSATION ---
+
+  - name: implicit_check
+    worker: jev
+    role_type: verifier
+    verifies: implicit
+    depends_on: [implicit]
+    checklist:
+      checks:
+        - id: S0
+          group: validity
+          proposition: the implicit conditions are a JSON object with requirements
+          primitive: json_valid
+          params: {required_keys: [requirements]}
+      subject: the checklist
+      questions:
+        - id: "{item[id]}"
+          group: necessity
+          proposition: "{item[proposition]}"
+          sources_key: sources
+          # Never fails the verdict; curation drops it below drop_below.
+          threshold: 0.0
+          foreach: {role: implicit, path: requirements}
+          ask: >-
+            In this situation, does the user expect the answer to meet this
+            condition even though they did not say it?
+          criteria_true: >-
+            Any competent answer to this request is expected to meet it; the
+            user would see an answer that misses it as wrong
+          criteria_false: >-
+            It is an extra preference the user did not ask for and would not miss
+          context:
+            condition: "{item[id]}: {item[proposition]}"
+            request_words: "{item[sources]}"
+      state:
+        - {key: conversation, source: query, max_chars: 20000}
+        - {key: implicit_conditions, source: implicit}
+      threshold: 0.5
+      max_state_chars: 160000
+      max_refinements: 0
+      on_exhausted: last
+      on_unavailable: publish_unverified
+      # Dropping an unexpected condition never blocks the guarantee.
+      guarantee_groups: []
+      curate:
+        items_path: requirements
+        drop_group: necessity
+        drop_below: 0.5
+
   # The draft: the conversation only, never the checklist, so an extraction
   # mistake cannot shape the answer. A caller response_format constrains it.
   - name: generator
@@ -317,7 +429,7 @@ roles:
   # FAIL is repaired here (DeepSeek) on the failing items only.
   - name: answer
     worker: deepseek
-    depends_on: [generator, extract]
+    depends_on: [generator, extract, implicit]
     seed_from: generator
     reasoning_effort: inherit
     sampling:
@@ -362,7 +474,7 @@ roles:
             properties:
               claims:
                 type: array
-                maxItems: 48
+                maxItems: 24
                 items:
                   type: object
                   additionalProperties: false
@@ -370,20 +482,19 @@ roles:
                   properties:
                     id: {type: string}
                     text: {type: string}
-                    basis: {enum: [source, action, computation, general]}
+                    basis: {enum: [source, action]}
                     evidence: {type: string}
     prompt: |-
-      [state_builder] List every factual claim the ANSWER makes, one sentence
-      each (at most 48; merge trivial repetitions). For each claim give:
-      - basis "source" when it relies on the conversation's material
-        (messages, attachments, tool results); "action" when it says something
-        was done (sent, run, changed, checked); "computation" when it is
-        derived by calculation or reasoning; "general" when it is general
-        knowledge;
-      - evidence: for "source" and "action", copy the supporting text from the
-        conversation verbatim (at most 400 characters; empty if there is none);
-        for "computation", the derivation; for "general", empty.
-      Output only the JSON object.
+      [state_builder] List the claims of the ANSWER that the checks need,
+      one sentence each (at most 24; merge trivial repetitions):
+      - basis "source": a claim that relies on the conversation's material
+        (messages, attachments, tool results);
+      - basis "action": a claim that something was done (sent, run, changed,
+        checked).
+      Leave out every other claim (reasoning, calculations, general
+      knowledge). For each claim, as evidence copy the supporting text from
+      the conversation verbatim (at most 400 characters; empty if there is
+      none). Output only the JSON object; an empty list when there is none.
       --- CONVERSATION ---
       {conversation}
       --- END CONVERSATION ---
@@ -396,13 +507,21 @@ roles:
     worker: jev
     role_type: verifier
     verifies: answer
-    depends_on: [answer, extract, state_builder]
+    depends_on: [answer, extract, implicit, state_builder]
     checklist:
       checks:
         # Validator: the extracted deterministic conditions.
         - id: "{item[id]}"
           proposition: "{item[proposition]}"
           foreach: {role: extract, path: requirements, where: {kind: deterministic}}
+          primitive_key: check.primitive
+          params_key: check.params
+          sources_key: sources
+          semantic_fallback: true
+          tags: {origin: "{item[origin]}"}
+        - id: "{item[id]}"
+          proposition: "{item[proposition]}"
+          foreach: {role: implicit, path: requirements, where: {kind: deterministic}}
           primitive_key: check.primitive
           params_key: check.params
           sources_key: sources
@@ -449,12 +568,20 @@ roles:
           tags: {origin: "{item[origin]}"}
           context:
             instruction_units: "{item[sources]}"
-        # G1 per claim kind: advisory. OpenJev's per-claim p is reported but
-        # never blocks the guarantee (threshold 0): on human labels (RAGTruth,
+        - id: "{item[id]}"
+          proposition: "{item[proposition]}"
+          sources_key: sources
+          foreach: {role: implicit, path: requirements, where: {kind: semantic}}
+          tags: {origin: "{item[origin]}"}
+          context:
+            request_words: "{item[sources]}"
+        # G1-source: advisory. OpenJev's per-claim p is reported but never
+        # blocks the guarantee (threshold 0): on human labels (RAGTruth,
         # PRM800K, FEVER; calibrate_g1.py) no threshold kept accepted answers'
         # violation rate <= alpha (VCO-D11). Grounding is guaranteed by the
-        # deterministic G1-excerpts, G2 and G3. The two G1-source questions
-        # are one item: p is their minimum.
+        # deterministic G1-excerpts, G2 and G3. The state builder lists only
+        # source and action claims (VCO-D12); the two G1-source questions are
+        # one item: p is their minimum.
         - id: G1-source
           tags: {origin: common, guarantee: advisory}
           proposition: (advisory, uncalibrated) every material-based claim in the answer is grounded
@@ -485,39 +612,10 @@ roles:
             claim: "{item[text]}"
             basis: "{item[basis]}"
             evidence: "{item[evidence]}"
-        - id: G1-computation
-          tags: {origin: common, guarantee: advisory}
-          proposition: (advisory, uncalibrated) every derived claim in the answer is correct
-          foreach: {role: state_builder, path: claims, where: {basis: computation}}
-          threshold: 0.0
-          ask: Is this claim of the answer supported?
-          criteria_true: >-
-            Its evidence states it (source or action claim), it follows correctly
-            from its evidence (computation), or it is well-established knowledge
-            (general)
-          criteria_false: The claim is not supported in that way
-          context:
-            claim: "{item[text]}"
-            basis: "{item[basis]}"
-            evidence: "{item[evidence]}"
-        - id: G1-general
-          tags: {origin: common, guarantee: advisory}
-          proposition: (advisory, uncalibrated) every general-knowledge claim in the answer is true
-          foreach: {role: state_builder, path: claims, where: {basis: general}}
-          threshold: 0.0
-          ask: Is this claim of the answer supported?
-          criteria_true: >-
-            Its evidence states it (source or action claim), it follows correctly
-            from its evidence (computation), or it is well-established knowledge
-            (general)
-          criteria_false: The claim is not supported in that way
-          context:
-            claim: "{item[text]}"
-            basis: "{item[basis]}"
-            evidence: "{item[evidence]}"
       state:
         - {key: conversation, source: query, max_chars: 20000}
         - {key: checklist, source: extract}
+        - {key: implicit_conditions, source: implicit}
         - {key: answer, source: answer}
         - {key: claims, source: state_builder}
       # tau_hi: InFoBench expert labels, alpha = 0.10 at 95 % confidence
@@ -541,5 +639,9 @@ default_reasoning_effort: high
 internal_max_tokens: 65536
 expose_intermediate_outputs: true
 budget:
-  max_steps: 16
+  # Worst case 18 steps: extract x2, requirements_check x3 (with the
+  # post-curation recheck), implicit, implicit_check x2, generator, and
+  # answer / state_builder / checklist x3 each. A step budget below that
+  # publishes an unverified answer (reason: budget).
+  max_steps: 24
   max_refine_depth: 2

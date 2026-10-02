@@ -275,7 +275,7 @@ def test_cache_agent_records_fill_and_hit_in_durable_index(tmp_path: Path):
     assert hit.verification_source == "filled"
     assert hit.verified_at_ns == 200
     assert hit.last_access_at_ns == 300
-    assert hit.generation == filled.generation + 1
+    assert hit.generation == filled.generation
 
 
 def test_interrupted_fill_does_not_create_residency_record(tmp_path: Path):

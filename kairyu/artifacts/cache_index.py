@@ -244,7 +244,10 @@ class NodeModelCacheIndex:
         file_count: int,
         verification_source: Literal["filled", "published_marker"],
     ) -> NodeModelCacheRecord:
-        """Insert verified residency or touch an identical existing identity."""
+        """Insert verified residency or touch an identical existing identity.
+
+        The row generation advances only when verification state changes.
+        """
 
         digest = self._validate_digest(manifest_digest)
         model_id = self._validate_text(model_id, name="model_id", max_length=255)
@@ -326,12 +329,7 @@ class NodeModelCacheIndex:
                     elif source == "published_marker" and verification_source == "filled":
                         source = "filled"
                     last_access = max(row["last_access_at_ns"], now)
-                    changed = (
-                        last_access != row["last_access_at_ns"]
-                        or source != row["verification_source"]
-                        or verified != row["verified"]
-                    )
-                    if changed:
+                    if source != row["verification_source"] or verified != row["verified"]:
                         connection.execute(
                             """
                             UPDATE cache_entries
@@ -348,6 +346,17 @@ class NodeModelCacheIndex:
                                 verification_failure,
                                 digest,
                             ),
+                        )
+                    elif last_access != row["last_access_at_ns"]:
+                        # A plain hit is access recency, like touch(): it advances
+                        # only the index revision and keeps the residency generation
+                        # that completed pre-stage and startup bindings pin.
+                        connection.execute(
+                            """
+                            UPDATE cache_entries SET last_access_at_ns = ?
+                            WHERE manifest_digest = ?
+                            """,
+                            (last_access, digest),
                         )
                 return self._get_required(connection, digest)
         except sqlite3.Error as exc:

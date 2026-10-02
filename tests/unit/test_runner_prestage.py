@@ -1227,10 +1227,7 @@ class _NoAuditSink:
         raise AssertionError(f"unexpected cache audit event: {event}")
 
 
-def test_runner_start_verification_keeps_prestage_binding_evidence_live(
-    tmp_path: Path,
-) -> None:
-    envelope, trust_store, request = _artifact()
+def _ticking_node(tmp_path: Path):
     ticks = iter(range(1, 1_000))
     root = tmp_path / "cache"
     index = NodeModelCacheIndex(
@@ -1247,6 +1244,45 @@ def test_runner_start_verification_keeps_prestage_binding_evidence_live(
         store=store,
         clock=lambda: _NOW + timedelta(seconds=2),
     )
+    return executor, agent, index, store
+
+
+def _read_live_evidence(store, index, command, record):
+    evidence = LocalNodeModelCacheLiveEvidenceSource(
+        node_id="gpu-node-00",
+        store=store,
+        index=index,
+        hint_ttl_seconds=30,
+        clock=lambda: _NOW + timedelta(seconds=3),
+    )
+    return evidence.read(
+        NodeModelCacheLiveEvidenceRequest(
+            placement=RunnerCacheStartupPlacement(
+                placement_id=command.placement_id,
+                node_name=command.node_id,
+                resource_flavor=command.resource_flavor,
+                profile_id=command.profile_id,
+                compatibility_approval_id=command.compatibility_approval_id,
+                manifest_digest=command.manifest_digest,
+                pin_owner=command.pin_owner,
+                prestage_command_id=command.command_id,
+                prestage_command_generation=command.command_generation,
+                hint_index_revision=1,
+                resident_record_generation=record.pin_record_generation,
+                hint_observed_at=_NOW,
+                hint_valid_until=_NOW + timedelta(minutes=1),
+            ),
+            model_id=command.model_id,
+            model_revision=command.model_revision,
+        )
+    )
+
+
+def test_runner_start_verification_keeps_prestage_binding_evidence_live(
+    tmp_path: Path,
+) -> None:
+    envelope, trust_store, request = _artifact()
+    executor, agent, index, store = _ticking_node(tmp_path)
     command = _commands(envelope.manifest_digest)[0]
     record = executor.execute(
         command,
@@ -1255,33 +1291,7 @@ def test_runner_start_verification_keeps_prestage_binding_evidence_live(
         trust_store=trust_store,
         request=request,
     )
-    evidence = LocalNodeModelCacheLiveEvidenceSource(
-        node_id="gpu-node-00",
-        store=store,
-        index=index,
-        hint_ttl_seconds=30,
-        clock=lambda: _NOW + timedelta(seconds=3),
-    )
-    live_request = NodeModelCacheLiveEvidenceRequest(
-        placement=RunnerCacheStartupPlacement(
-            placement_id=command.placement_id,
-            node_name=command.node_id,
-            resource_flavor=command.resource_flavor,
-            profile_id=command.profile_id,
-            compatibility_approval_id=command.compatibility_approval_id,
-            manifest_digest=command.manifest_digest,
-            pin_owner=command.pin_owner,
-            prestage_command_id=command.command_id,
-            prestage_command_generation=command.command_generation,
-            hint_index_revision=1,
-            resident_record_generation=record.pin_record_generation,
-            hint_observed_at=_NOW,
-            hint_valid_until=_NOW + timedelta(minutes=1),
-        ),
-        model_id=command.model_id,
-        model_revision=command.model_revision,
-    )
-    evidence.read(live_request)
+    _read_live_evidence(store, index, command, record)
     accessed_before = index.get(command.manifest_digest).last_access_at_ns
 
     decision = agent.verify_for_runner_start(
@@ -1293,7 +1303,48 @@ def test_runner_start_verification_keeps_prestage_binding_evidence_live(
 
     assert decision.runner_start_allowed is True
     assert index.get(command.manifest_digest).last_access_at_ns > accessed_before
-    assert evidence.read(live_request).pin_evidence.record_generation == (
+    assert _read_live_evidence(store, index, command, record).pin_evidence.record_generation == (
+        record.pin_record_generation
+    )
+
+
+def test_in_flight_duplicate_ensure_keeps_completed_prestage_evidence_live(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    envelope, trust_store, request = _artifact()
+    executor, agent, index, store = _ticking_node(tmp_path)
+    command = _commands(envelope.manifest_digest)[0]
+    fill = agent.ensure_cached
+    completed = []
+
+    def duplicate_completes_while_this_request_waits(*args, **kwargs):
+        if not completed:
+            completed.append(None)
+            completed[0] = executor.execute(
+                command,
+                claim_id="a" * 64,
+                envelope=envelope,
+                trust_store=trust_store,
+                request=request,
+            )
+        return fill(*args, **kwargs)
+
+    monkeypatch.setattr(agent, "ensure_cached", duplicate_completes_while_this_request_waits)
+
+    with pytest.raises(NodeModelPrestageConflictError, match="stale"):
+        executor.execute(
+            command,
+            claim_id="a" * 64,
+            envelope=envelope,
+            trust_store=trust_store,
+            request=request,
+        )
+
+    record = completed[0]
+    assert record.state is ModelCachePlacementState.READY
+    assert store.list_records() == (record,)
+    assert _read_live_evidence(store, index, command, record).pin_evidence.record_generation == (
         record.pin_record_generation
     )
 

@@ -98,7 +98,11 @@ revision but not the row generation. The row generation is the residency,
 verification, and pin lineage that pre-stage completion and startup bindings
 pin (D3.1); a successful Runner-start verification must not invalidate the
 binding it serves. Eviction stays fenced by the global revision, which every
-last-access change still advances.
+last-access change still advances. Re-review amendment: the same holds for an
+identical `record_verified()` hit; only a change of verified state or
+verification source advances the generation, so an in-flight duplicate ensure
+that reaches the cache after its twin completed cannot invalidate that
+completion.
 
 ## Owner-scoped pins
 

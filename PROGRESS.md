@@ -111,6 +111,11 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
 
+### 2026-10-02 — [amendment] Cache hits keep the residency generation (PR #615 re-review)
+- What: an identical `record_verified()` cache hit now advances only last access and the index revision, like `touch()`; the row generation moves only with verified state or verification source.
+- Why: owner re-review: a duplicate in-flight ensure of one command/claim reached the cache after its twin completed and invalidated that READY pre-stage's live evidence, although its own completion was rejected as stale.
+- Refs: `docs/design/node-model-cache-index-v1.md`; D3.1 in `docs/design/node-model-cache-prestage-v1.md`; PR #615
+
 ### 2026-10-02 — [amendment] Runner and model-cache authority review fixes (PR #615)
 - What: cache `touch()` keeps the residency generation; the live cache reader joins node evidence to the published inventory at the latest observation (hints live, inventory within the observation age); pre-stage pin owners name the ensure generation and an ensure drops lower-generation owners; actuation reauthorizes the leader after its last callback and rechecks evidence age before PATCH; Deployment claims accept the one-step generation advance.
 - Why: owner review reproduced five defects with CPU/HTTP mocks: a successful Runner-start verification invalidated its own binding, every current inventory was denied, a delayed release removed a successor's pin, an expired lease could still PATCH, and every first Deployment claim failed.

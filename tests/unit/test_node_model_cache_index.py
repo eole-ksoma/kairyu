@@ -254,6 +254,7 @@ def test_identical_record_touches_without_downgrading_fill_evidence(tmp_path: Pa
     clock = MutableClock(100)
     index = _index(tmp_path, clock=clock)
     first = _record(index)
+    revision = index.snapshot().revision
     clock.value = 200
 
     touched = _record(index, verification_source="published_marker")
@@ -261,7 +262,8 @@ def test_identical_record_touches_without_downgrading_fill_evidence(tmp_path: Pa
     assert touched.verified_at_ns == first.verified_at_ns
     assert touched.last_access_at_ns == 200
     assert touched.verification_source == "filled"
-    assert touched.generation == first.generation + 1
+    assert touched.generation == first.generation
+    assert index.snapshot().revision > revision
 
 
 def test_clock_regression_does_not_move_last_access_or_generation_backward(tmp_path: Path):

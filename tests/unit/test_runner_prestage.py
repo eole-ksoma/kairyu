@@ -1308,45 +1308,68 @@ def test_runner_start_verification_keeps_prestage_binding_evidence_live(
     )
 
 
-def test_in_flight_duplicate_ensure_keeps_completed_prestage_evidence_live(
+@pytest.mark.parametrize(
+    "is_superseded",
+    [False, True],
+    ids=["twin-completed", "twin-released-and-succeeded"],
+)
+def test_in_flight_duplicate_ensure_keeps_current_prestage_evidence_live(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    is_superseded: bool,
 ) -> None:
     envelope, trust_store, request = _artifact()
     executor, agent, index, store = _ticking_node(tmp_path)
     command = _commands(envelope.manifest_digest)[0]
+    successor = _commands(
+        envelope.manifest_digest,
+        token=5,
+        generation_start=22,
+        target_revision=10,
+    )[0]
     fill = agent.ensure_cached
-    completed = []
+    current = []
 
-    def duplicate_completes_while_this_request_waits(*args, **kwargs):
-        if not completed:
-            completed.append(None)
-            completed[0] = executor.execute(
-                command,
-                claim_id="a" * 64,
-                envelope=envelope,
-                trust_store=trust_store,
-                request=request,
-            )
-        return fill(*args, **kwargs)
-
-    monkeypatch.setattr(agent, "ensure_cached", duplicate_completes_while_this_request_waits)
-
-    with pytest.raises(NodeModelPrestageConflictError, match="stale"):
-        executor.execute(
-            command,
-            claim_id="a" * 64,
+    def run(ensure):
+        return executor.execute(
+            ensure,
+            claim_id=("a" if ensure is command else "b") * 64,
             envelope=envelope,
             trust_store=trust_store,
             request=request,
         )
 
-    record = completed[0]
+    def others_progress_while_this_request_waits(*args, **kwargs):
+        if not current:
+            current.append(None)
+            current[0] = run(command)
+            if is_superseded:
+                executor.release(
+                    build_node_model_prestage_release_command(
+                        command,
+                        authority=_authority(token=5),
+                        decision_id="scale-decision-18",
+                        decision_fingerprint="e" * 64,
+                        target_revision=9,
+                        command_generation=21,
+                        issued_at=_NOW + timedelta(seconds=1),
+                        ttl_seconds=60,
+                    )
+                )
+                current[0] = run(successor)
+        return fill(*args, **kwargs)
+
+    monkeypatch.setattr(agent, "ensure_cached", others_progress_while_this_request_waits)
+
+    with pytest.raises(NodeModelPrestageConflictError, match="stale"):
+        run(command)
+
+    record = current[0]
     assert record.state is ModelCachePlacementState.READY
     assert store.list_records() == (record,)
-    assert _read_live_evidence(store, index, command, record).pin_evidence.record_generation == (
-        record.pin_record_generation
-    )
+    assert index.get(envelope.manifest_digest).pin_owners == (record.command.pin_owner,)
+    evidence = _read_live_evidence(store, index, record.command, record)
+    assert evidence.pin_evidence.record_generation == record.pin_record_generation
 
 
 def test_stale_release_unpin_cannot_remove_successor_pin(
@@ -1379,11 +1402,18 @@ def test_stale_release_unpin_cannot_remove_successor_pin(
         generation_start=22,
         target_revision=10,
     )[0]
+    other_executor = NodeModelPrestageExecutor(
+        node_id="gpu-node-00",
+        agent=NodeModelCacheAgent(tmp_path / "cache", Source(), index=index, chunk_size_bytes=4),
+        index=index,
+        store=store,
+        clock=lambda: _NOW + timedelta(seconds=2),
+    )
     commit_release = store.release
 
     def release_then_successor_completes(command, *, now):
         record = commit_release(command, now=now)
-        executor.execute(
+        other_executor.execute(
             successor,
             claim_id="b" * 64,
             envelope=envelope,

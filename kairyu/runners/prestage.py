@@ -969,7 +969,12 @@ class InMemoryNodeModelPrestageStore:
 
 
 class NodeModelPrestageExecutor:
-    """Execute one fenced command through verified fill and owner-scoped pinning."""
+    """Execute one fenced command through verified fill and owner-scoped pinning.
+
+    The runtime builds one executor per node, and it serializes every cache-pin
+    mutation with the store transition that authorizes it, so a stale in-flight
+    ensure cannot pin after a release or successor ensure has moved the placement.
+    """
 
     def __init__(
         self,
@@ -983,21 +988,22 @@ class NodeModelPrestageExecutor:
         self._node_id = _text(node_id, name="node_id", max_length=253)
         if index.node_id != self._node_id:
             raise ValueError("cache index belongs to another node")
-        if not isinstance(store, NodeModelPrestageStore):
-            raise TypeError("store must implement NodeModelPrestageStore")
+        if not isinstance(store, NodeModelPrestageLookupStore):
+            raise TypeError("store must implement NodeModelPrestageLookupStore")
         if store.node_id != self._node_id:
             raise ValueError("pre-stage store belongs to another node")
         self._agent = agent
         self._index = index
         self._store = store
         self._clock = clock
+        self._pin_lock = threading.Lock()
 
     @property
     def node_id(self) -> str:
         return self._node_id
 
     @property
-    def store(self) -> NodeModelPrestageStore:
+    def store(self) -> NodeModelPrestageLookupStore:
         return self._store
 
     def execute(
@@ -1025,20 +1031,22 @@ class NodeModelPrestageExecutor:
             result = self._agent.ensure_cached(envelope, trust_store, request)
             if result.manifest_digest != command.manifest_digest:
                 raise NodeModelPrestageConflictError("cache fill returned another artifact")
-            self._unpin_superseded_generations(command)
-            pinned = self._index.pin(
-                command.manifest_digest,
-                owner=command.pin_owner,
-                reason=f"prestage:{command.command_id}",
-            )
-            self._validate_pinned(command, pinned, fill_result=result)
-            return self._store.complete(
-                command,
-                claim_id=claim_id,
-                fill_result=result,
-                pin_record_generation=pinned.generation,
-                now=_aware(self._clock(), name="executor clock"),
-            )
+            with self._pin_lock:
+                self._require_current_claim(command, claim_id=claim_id)
+                self._unpin_superseded_generations(command)
+                pinned = self._index.pin(
+                    command.manifest_digest,
+                    owner=command.pin_owner,
+                    reason=f"prestage:{command.command_id}",
+                )
+                self._validate_pinned(command, pinned, fill_result=result)
+                return self._store.complete(
+                    command,
+                    claim_id=claim_id,
+                    fill_result=result,
+                    pin_record_generation=pinned.generation,
+                    now=_aware(self._clock(), name="executor clock"),
+                )
         except Exception as exc:
             failure = f"{type(exc).__name__}: {exc}"[:1024]
             try:
@@ -1060,14 +1068,32 @@ class NodeModelPrestageExecutor:
             raise NodeModelPrestageConflictError("release requires a fenced release command")
         if command.node_id != self._node_id:
             raise NodeModelPrestageConflictError("executor command targets another node")
-        cached = self._index.get(command.manifest_digest)
-        record = self._store.release(
-            command,
-            now=_aware(self._clock(), name="executor clock"),
-        )
-        if cached is not None:
-            self._index.unpin(command.manifest_digest, owner=command.pin_owner)
-        return record
+        with self._pin_lock:
+            cached = self._index.get(command.manifest_digest)
+            record = self._store.release(
+                command,
+                now=_aware(self._clock(), name="executor clock"),
+            )
+            if cached is not None:
+                self._index.unpin(command.manifest_digest, owner=command.pin_owner)
+            return record
+
+    def _require_current_claim(self, command: NodeModelPrestageCommand, *, claim_id: str) -> None:
+        """Refuse to pin unless this exact claim still owns the filling placement.
+
+        Callers hold the pin lock, which release and every other pin take too, so
+        no release or successor ensure can move the placement between this read
+        and the pin.
+        """
+
+        current = self._store.get_record(command.placement_id)
+        if (
+            current is None
+            or current.state is not ModelCachePlacementState.FILLING
+            or current.claim_id != claim_id
+            or current.command.model_dump() != command.model_dump()
+        ):
+            raise NodeModelPrestageConflictError("pre-stage completion claim is stale")
 
     def _unpin_superseded_generations(self, command: NodeModelPrestageCommand) -> None:
         """Remove this placement's earlier-generation pins on the same artifact.

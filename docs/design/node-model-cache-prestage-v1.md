@@ -251,6 +251,18 @@ same-artifact crash-before-unpin convergence (as before, a successor on another
 artifact can leave that older pin behind) and turns a delayed unpin into a
 no-op that cannot advance the successor's cache record generation.
 
+Second re-review amendment: an in-flight duplicate of an ensure (same command
+and claim) could resume after its twin completed, the placement was released,
+and a successor completed, then pin its released owner again and advance the
+successor's cache record generation; rejecting its stale completion afterward
+did not undo that pin. The executor therefore holds one pin lock across
+"confirm this exact claim still owns the filling placement, drop superseded
+owners, pin, complete" and across a release's "commit, unpin". The claim check
+reads the store's exact placement record, so the executor requires a lookup
+store. The runtime builds one executor per node, so that lock covers every pin
+mutation the node agent makes; generation-named owners still keep a delayed
+release from removing a successor's pin if two executors ever shared one index.
+
 ## Controller feedback
 
 `apply_node_model_prestage_records()` joins unique, exact-identity records into

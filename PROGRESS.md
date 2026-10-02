@@ -111,6 +111,11 @@ NVLink-HBM (H100-class) formal gates still need hardware. Evidence lives in
 Newest first; only the most recent entries are kept here (see the size budget
 in `.claude/rules/progress-log.md`).
 
+### 2026-10-02 — [amendment] Pre-stage pin mutations are serialized with claim currency (PR #615 second re-review)
+- What: `NodeModelPrestageExecutor` holds one pin lock across "check the exact claim still owns the filling placement, drop superseded owners, pin, complete" and a release's "commit, unpin"; the executor now requires a lookup store.
+- Why: owner re-review: a duplicate in-flight ensure resumed after release and a successor completed, re-pinned its released owner, and invalidated the successor's live evidence although its own completion was rejected as stale.
+- Refs: "Node execution and pins" in `docs/design/node-model-cache-prestage-v1.md`; PR #615
+
 ### 2026-10-02 — [amendment] Cache hits keep the residency generation (PR #615 re-review)
 - What: an identical `record_verified()` cache hit now advances only last access and the index revision, like `touch()`; the row generation moves only with verified state or verification source.
 - Why: owner re-review: a duplicate in-flight ensure of one command/claim reached the cache after its twin completed and invalidated that READY pre-stage's live evidence, although its own completion was rejected as stale.
